@@ -1,0 +1,50 @@
+Assist
+.claude
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+.env/          # folder (not the .env file — see below)
+
+# --- Environment variables ---
+.env
+*.env
+!.env.example  # explicitly keep the template
+
+# --- Flask / instance config ---
+instance/
+*.cfg
+
+# --- Distribution / packaging ---
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# --- Testing ---
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# --- IDEs ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Database ---
+*.db
+*.sqlite3

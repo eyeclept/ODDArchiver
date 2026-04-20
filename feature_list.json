@@ -1,0 +1,100 @@
+{
+  "features": [
+    {
+      "id": 0,
+      "name": "Project Scaffolding",
+      "description": "Package structure, pyproject.toml, init.sh, feature_list.json, progress.md",
+      "passes": true
+    },
+    {
+      "id": 1,
+      "name": "cli.py — Argument Parsing and Dispatch",
+      "description": "argparse for all six commands with correct flags, mutual exclusion, exit codes",
+      "passes": true
+    },
+    {
+      "id": 2,
+      "name": "disc.py — BurnBackend Interface",
+      "description": "BurnBackend ABC, DiscInfo dataclass, DiscBackend, ISOBackend, double-burn guard",
+      "passes": true
+    },
+    {
+      "id": 3,
+      "name": "manifest.py — Session Manifest Read/Write/Merge",
+      "description": "Manifest schema, atomic write, checksum validation, disc state replay, SUSPECT marking",
+      "passes": true
+    },
+    {
+      "id": 4,
+      "name": "delta.py — xdelta3 Wrapper",
+      "description": "compute_delta, apply_delta, threshold logic, per-file logging, ThreadPoolExecutor",
+      "passes": true
+    },
+    {
+      "id": 5,
+      "name": "session.py — Staging Directory Construction",
+      "description": "build_staging: scan, diff, cache/disc fallback, encrypt, space check, SIGINT cleanup",
+      "passes": false
+    },
+    {
+      "id": 6,
+      "name": "cache.py — Local Cache Management",
+      "description": "cache_get, cache_put, disc fallback, cache-miss logging, correctness independence",
+      "passes": false
+    },
+    {
+      "id": 7,
+      "name": "crypto.py — Encryption Layer",
+      "description": "CryptoBackend ABC, NullCrypto, PassphraseCrypto (Argon2id+ChaCha20), KeyfileCrypto (age)",
+      "passes": false
+    },
+    {
+      "id": 8,
+      "name": "restore.py — Reconstruct from Disc/ISO",
+      "description": "restore(): manifest replay, delta chain, decrypt, checksum verify, non-destructive default",
+      "passes": false
+    },
+    {
+      "id": 9,
+      "name": "verify.py — Integrity Checking",
+      "description": "fast/checksum/full levels, per-session status, post-burn auto-verify, exit 1 on error",
+      "passes": false
+    },
+    {
+      "id": 10,
+      "name": "CLI Commands — End-to-End Wiring",
+      "description": "init, sync, restore, history, verify, status wired to their handler modules",
+      "passes": false
+    },
+    {
+      "id": 11,
+      "name": "Configuration (config.toml)",
+      "description": "tomllib/tomli parse, all defaults, CLI flag overrides, optional config file",
+      "passes": false
+    },
+    {
+      "id": 12,
+      "name": "Logging",
+      "description": "Structured plaintext log, INFO/WARN/ERROR/SUSPECT levels, capacity thresholds, cron silence",
+      "passes": false
+    },
+    {
+      "id": 13,
+      "name": "Dry-Run Mode",
+      "description": "--dry-run: full pipeline minus burn/cache, rsync-style output, space report",
+      "passes": false
+    },
+    {
+      "id": 14,
+      "name": "Idempotency",
+      "description": "init on existing disc, sync no-change silence, interrupted burn recovery, staging rebuild",
+      "passes": false
+    },
+    {
+      "id": 15,
+      "name": "Tests",
+      "description": "Unit: delta, manifest, crypto. Integration: full cycle, dry-run, SIGINT, interrupted burn",
+      "passes": false
+    }
+  ]
+}
