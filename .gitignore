@@ -47,4 +47,5 @@ Thumbs.db
 
 # --- Database ---
 *.db
-*.sqlite3
+*.sqlite3cert.pem
+key.pem
