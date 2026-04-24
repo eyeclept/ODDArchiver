@@ -64,19 +64,19 @@
       "id": 10,
       "name": "CLI Commands — End-to-End Wiring",
       "description": "init, sync, restore, history, verify, status wired to their handler modules",
-      "passes": false
+      "passes": true
     },
     {
       "id": 11,
       "name": "Configuration (config.toml)",
       "description": "tomllib/tomli parse, all defaults, CLI flag overrides, optional config file",
-      "passes": false
+      "passes": true
     },
     {
       "id": 12,
       "name": "Logging",
       "description": "Structured plaintext log, INFO/WARN/ERROR/SUSPECT levels, capacity thresholds, cron silence",
-      "passes": false
+      "passes": true
     },
     {
       "id": 13,
