@@ -58,7 +58,7 @@
       "id": 9,
       "name": "verify.py — Integrity Checking",
       "description": "fast/checksum/full levels, per-session status, post-burn auto-verify, exit 1 on error",
-      "passes": false
+      "passes": true
     },
     {
       "id": 10,
