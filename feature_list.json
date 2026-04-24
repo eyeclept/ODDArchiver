@@ -40,19 +40,19 @@
       "id": 6,
       "name": "cache.py — Local Cache Management",
       "description": "cache_get, cache_put, disc fallback, cache-miss logging, correctness independence",
-      "passes": false
+      "passes": true
     },
     {
       "id": 7,
       "name": "crypto.py — Encryption Layer",
       "description": "CryptoBackend ABC, NullCrypto, PassphraseCrypto (Argon2id+ChaCha20), KeyfileCrypto (age)",
-      "passes": false
+      "passes": true
     },
     {
       "id": 8,
       "name": "restore.py — Reconstruct from Disc/ISO",
       "description": "restore(): manifest replay, delta chain, decrypt, checksum verify, non-destructive default",
-      "passes": false
+      "passes": true
     },
     {
       "id": 9,
