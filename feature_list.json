@@ -34,7 +34,7 @@
       "id": 5,
       "name": "session.py — Staging Directory Construction",
       "description": "build_staging: scan, diff, cache/disc fallback, encrypt, space check, SIGINT cleanup",
-      "passes": false
+      "passes": true
     },
     {
       "id": 6,
