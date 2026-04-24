@@ -89,12 +89,3 @@ A typical cron entry for daily incremental backup:
 - If the disc fills up, exit 1 with an error message; the next run re-tries
   after the disc is changed.
 
----
-
-## Done Criteria (Task 14)
-
-- `init` on an already-initialized disc/ISO exits 0 with warning; no second session.
-- `sync` with no source changes exits 0 silently; session count unchanged.
-- Interrupted burn (backend error) leaves cache unchanged.
-- Stale staging dir from a prior crash is detected, removed, and rebuilt cleanly.
-- `pytest tests/test_idempotency.py -v` exits 0.

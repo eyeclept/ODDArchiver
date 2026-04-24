@@ -28,7 +28,7 @@ Identity transform. `encrypt(b)` returns `b`; `decrypt(b)` returns `b`. Use for 
 
 The 16-byte salt is generated fresh per encrypt call. The Argon2id KDF derives a 32-byte key from the passphrase and salt. The 12-byte nonce is random per call.
 
-**Passphrase source:** CLI prompt (not yet wired) or environment variable `ODDARCHIVER_PASSPHRASE`.
+**Passphrase source:** environment variable `ODDARCHIVER_PASSPHRASE`, or interactive prompt (via `getpass`) if the variable is not set.
 
 ```
 export ODDARCHIVER_PASSPHRASE="correct horse battery staple"

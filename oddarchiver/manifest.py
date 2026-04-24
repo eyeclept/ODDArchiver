@@ -52,6 +52,7 @@ class Manifest:
     entries: list[ManifestEntry]
     deleted: list[str]
     manifest_checksum: str
+    drives: list[str] = field(default_factory=list)
     suspect: bool = field(default=False, compare=False)
 
 
@@ -111,6 +112,7 @@ def read_manifest(path: Path) -> Manifest:
         entries=entries,
         deleted=raw.get("deleted", []),
         manifest_checksum=stored_checksum,
+        drives=raw.get("drives", []),
         suspect=suspect,
     )
     if suspect:

@@ -101,6 +101,24 @@
       "name": "Bug Fixes",
       "description": "B1-B6: dry-run/test-iso coexistence, getpass, bytes passphrase, deletion-only sync, JSON parse SUSPECT",
       "passes": true
+    },
+    {
+      "id": 17,
+      "name": "Documentation Update and User Guide",
+      "description": "Audit all docs against implementation; create README.md and docs/GUIDE.md",
+      "passes": true
+    },
+    {
+      "id": 18,
+      "name": "Multi-Drive Redundancy",
+      "description": "--mirror flag on init/sync, dual-backend burn, drives field in manifest, mirror health in status",
+      "passes": true
+    },
+    {
+      "id": 19,
+      "name": "Test Quality Audit",
+      "description": "Shortcut audit of all test files; 12 new scenario tests in test_stress.py",
+      "passes": true
     }
   ]
 }

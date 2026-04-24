@@ -57,7 +57,7 @@ Sessions whose `manifest_checksum` fails validation are marked SUSPECT and skipp
 
 ## Exit codes
 
-The CLI layer (Task 10) will translate `failure_count > 0` to exit 1.
+The CLI layer translates `failure_count > 0` to exit 1. A successful restore exits 0.
 
 ## Example commands
 

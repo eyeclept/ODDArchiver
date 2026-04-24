@@ -91,10 +91,3 @@ sudo apt install xdelta3 genisoimage
 Tests that do not call these tools (unit tests for manifest, config, crypto,
 etc.) run without them.
 
----
-
-## Done Criteria (Task 15)
-
-- `pytest tests/ -v` exits 0 (118 tests, all pass).
-- Integration tests use `ISOBackend` only; no physical disc required.
-- `docs/testing.md` exists.

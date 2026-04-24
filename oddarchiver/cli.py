@@ -81,6 +81,7 @@ def _add_init(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--dry-run", action="store_true", dest="dry_run")
     p.add_argument("--disc-size", default=None, dest="disc_size", metavar="SIZE")
     p.add_argument("--prefill", metavar="SIZE")
+    p.add_argument("--mirror", metavar="PATH", help="Second drive or ISO to mirror each session to.")
     _add_dry_iso_mutex(p)
 
 
@@ -99,6 +100,7 @@ def _add_sync(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--no-cache", action="store_true", dest="no_cache")
     p.add_argument("--disc-size", default=None, dest="disc_size", metavar="SIZE")
     p.add_argument("--prefill", metavar="SIZE")
+    p.add_argument("--mirror", metavar="PATH", help="Second drive or ISO to mirror each session to.")
     _add_dry_iso_mutex(p)
 
 
@@ -217,6 +219,36 @@ def _make_backend(args: argparse.Namespace) -> "BurnBackend":
     return DiscBackend(getattr(args, "device", "/dev/sr0"))
 
 
+def _make_mirror_backend(args: argparse.Namespace) -> "BurnBackend | None":
+    """
+    Input:  args — parsed namespace with optional --mirror and backend flags
+    Output: BurnBackend for the mirror drive, or None if --mirror not given
+    Details:
+        Matches the primary backend type: ISOBackend when --test-iso is set,
+        DiscBackend otherwise.
+    """
+    mirror = getattr(args, "mirror", None)
+    if not mirror:
+        return None
+    if getattr(args, "test_iso", None):
+        size_str = getattr(args, "disc_size", None) or "25gb"
+        disc_size = parse_disc_size(size_str)
+        return ISOBackend(Path(mirror), disc_size=disc_size)
+    return DiscBackend(mirror)
+
+
+def _backend_id(backend: "BurnBackend") -> str:
+    """
+    Input:  backend — BurnBackend instance
+    Output: str — canonical identifier (ISO path or device path)
+    """
+    if isinstance(backend, ISOBackend):
+        return str(backend.iso_path)
+    if isinstance(backend, DiscBackend):
+        return backend.device
+    return "unknown"
+
+
 def _read_disc_manifests(backend: "BurnBackend") -> list[Manifest]:
     """
     Input:  backend — BurnBackend to read from
@@ -311,21 +343,30 @@ def _encryption_block(crypto: "CryptoBackend") -> dict:
     return {"mode": "none"}
 
 
-def _patch_manifest(staging: Path, session_n: int, label: str, encryption: dict) -> Manifest:
+def _patch_manifest(
+    staging: Path,
+    session_n: int,
+    label: str,
+    encryption: dict,
+    drives: list[str] | None = None,
+) -> Manifest:
     """
     Input:  staging    — staging root directory
             session_n  — session index
             label      — disc label to apply
             encryption — encryption block dict
+            drives     — list of drive/ISO identifiers that will hold this session
     Output: updated Manifest (also written to disc atomically)
     Details:
-        Reads the manifest written by build_staging, sets label and encryption,
-        then rewrites it atomically so the burnt manifest is complete.
+        Reads the manifest written by build_staging, sets label, encryption,
+        and drives, then rewrites it atomically so the burnt manifest is complete.
     """
     session_dir = staging / f"session_{session_n:03d}"
     manifest = read_manifest(session_dir / "manifest.json")
     manifest.label = label
     manifest.encryption = encryption
+    if drives is not None:
+        manifest.drives = drives
     write_manifest(session_dir, manifest)
     return manifest
 
@@ -514,6 +555,8 @@ def _run_init(args: argparse.Namespace) -> int:
         print("warning: disc already initialized; skipping init.", file=sys.stderr)
         return 0
 
+    mirror_backend = _make_mirror_backend(args)
+
     if getattr(args, "prefill", None):
         if isinstance(backend, ISOBackend):
             backend.prefill(parse_disc_size(args.prefill))
@@ -521,6 +564,10 @@ def _run_init(args: argparse.Namespace) -> int:
     crypto = _make_init_crypto(args)
     enc_block = _encryption_block(crypto)
     cache = CacheManager()
+
+    drives = [_backend_id(backend)]
+    if mirror_backend:
+        drives.append(_backend_id(mirror_backend))
 
     staging = session_mod.build_staging(
         session_n=0,
@@ -531,8 +578,15 @@ def _run_init(args: argparse.Namespace) -> int:
         crypto=crypto,
     )
     try:
-        manifest = _patch_manifest(staging, 0, args.label, enc_block)
+        manifest = _patch_manifest(staging, 0, args.label, enc_block, drives=drives)
         backend.init(staging, args.label, expected_session_count=0)
+        if mirror_backend:
+            try:
+                mirror_backend.init(staging, args.label, expected_session_count=0)
+            except Exception as exc:
+                _log.error("Mirror burn failed for session 0: %s", exc)
+                print(f"error: mirror burn failed: {exc}", file=sys.stderr)
+                return 1
         try:
             verify_mod.verify(backend, crypto, level="fast")
         except SystemExit:
@@ -566,6 +620,8 @@ def _run_sync(args: argparse.Namespace) -> int:
         print("error: disc not initialized; run 'init' first.", file=sys.stderr)
         return 1
 
+    mirror_backend = _make_mirror_backend(args)
+
     if getattr(args, "prefill", None):
         if isinstance(backend, ISOBackend):
             backend.prefill(parse_disc_size(args.prefill))
@@ -597,6 +653,10 @@ def _run_sync(args: argparse.Namespace) -> int:
     if not changed and not new_files and not deleted_files:
         return 0  # silent exit on no change
 
+    drives = [_backend_id(backend)]
+    if mirror_backend:
+        drives.append(_backend_id(mirror_backend))
+
     cache = CacheManager()
     staging = session_mod.build_staging(
         session_n=session_n,
@@ -607,8 +667,15 @@ def _run_sync(args: argparse.Namespace) -> int:
         crypto=crypto,
     )
     try:
-        manifest = _patch_manifest(staging, session_n, label, enc_block)
+        manifest = _patch_manifest(staging, session_n, label, enc_block, drives=drives)
         backend.append(staging, label, expected_session_count=session_n)
+        if mirror_backend:
+            try:
+                mirror_backend.append(staging, label, expected_session_count=session_n)
+            except Exception as exc:
+                _log.error("Mirror burn failed for session %d: %s", session_n, exc)
+                print(f"error: mirror burn failed: {exc}", file=sys.stderr)
+                return 1
         try:
             verify_mod.verify(backend, crypto, level="fast")
         except SystemExit:
@@ -693,6 +760,32 @@ def _run_verify(args: argparse.Namespace) -> int:
         return int(exc.code) if exc.code is not None else 1
 
 
+def _mirror_health(
+    manifests: list[Manifest], primary_id: str
+) -> list[tuple[int, str, bool]]:
+    """
+    Input:  manifests  — all session manifests
+            primary_id — identifier of the primary backend (excluded from results)
+    Output: list of (session_n, mirror_drive, accessible) for sessions with mirrors
+    Details:
+        For ISO paths (not starting with /dev/): checks file existence.
+        For device paths: reports True without probing (cannot mount inline).
+    """
+    results = []
+    for m in manifests:
+        if len(m.drives) < 2:
+            continue
+        for drive in m.drives:
+            if drive == primary_id:
+                continue
+            if drive.startswith("/dev/"):
+                accessible = True  # cannot probe device inline
+            else:
+                accessible = Path(drive).exists()
+            results.append((m.session, drive, accessible))
+    return results
+
+
 def _run_status(args: argparse.Namespace) -> int:
     """
     Input:  args — parsed status namespace
@@ -724,6 +817,15 @@ def _run_status(args: argparse.Namespace) -> int:
         for m in suspects:
             suspect(_log, "session_%03d: manifest checksum mismatch", m.session)
             print(f"  session_{m.session:03d}: manifest checksum mismatch")
+
+    mirror_rows = _mirror_health(manifests, _backend_id(backend))
+    if mirror_rows:
+        print("\nMirror health:")
+        for session_n, drive, accessible in mirror_rows:
+            status_str = "OK" if accessible else "MISSING"
+            if not accessible:
+                _log.error("session_%03d: mirror %s is MISSING", session_n, drive)
+            print(f"  session_{session_n:03d}: {drive} [{status_str}]")
 
     return 0
 

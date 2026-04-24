@@ -114,7 +114,7 @@ Prints: label, session count, used/remaining space, capacity warnings, SUSPECT m
 
 ## Mutual Exclusions
 
-`--dry-run` and `--test-iso` cannot be used together. The command exits 1 with an error message if both are supplied.
+`--dry-run` and `--test-iso` may be used together. `--test-iso` selects the ISO backend; `--dry-run` skips the actual write. They are orthogonal flags.
 
 ---
 
@@ -172,6 +172,6 @@ No disc written (dry run).
 
 If the session would not fit, `Space check:` shows `OVERAGE` with the shortfall, but the command still exits 0.
 
-### Mutual exclusion
+### Combining with `--test-iso`
 
-`--dry-run` and `--test-iso` cannot be used together (`--test-iso` implies a real write to an ISO file). Use `--dry-run` against a physical device, or against an existing ISO by omitting `--test-iso` and pointing `--device` at the ISO (not recommended; use `--test-iso` for test writes only).
+`--dry-run` and `--test-iso` may be used together. `--test-iso` selects the ISO backend; `--dry-run` prevents the actual write. Use this combination to preview what a sync would do against an ISO file without modifying it.

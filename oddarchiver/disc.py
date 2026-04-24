@@ -30,6 +30,7 @@ class DiscInfo:
     remaining_bytes: int
     used_bytes: int
     label: str
+    mirror_device: str = ""
 
 
 class BurnBackend(abc.ABC):

@@ -34,6 +34,8 @@ Requires Python 3.10+. The `[encrypt]` extra adds `argon2-cffi` and `pyage`.
 | `crypto.py` | Encryption layer: `NullCrypto`, `PassphraseCrypto`, `KeyfileCrypto` |
 | `restore.py` | Reconstruct source tree from disc/ISO at any historical session |
 | `verify.py` | Integrity checking at fast / checksum / full depth |
+| `config.py` | Configuration loading from `~/.config/oddarchiver/config.toml` |
+| `log.py` | Structured logging setup, custom SUSPECT level, capacity threshold checks |
 
 ---
 
@@ -52,6 +54,8 @@ oddarchiver/
     crypto.py
     restore.py
     verify.py
+    config.py
+    log.py
 tests/
     test_scaffolding.py
     test_cli.py
@@ -86,14 +90,4 @@ It installs the package in editable mode, installs test dependencies, imports al
 pytest tests/ -v
 ```
 
-Individual module tests:
-
-```sh
-pytest tests/test_scaffolding.py -v
-pytest tests/test_cli.py -v
-pytest tests/test_disc.py -v
-pytest tests/test_manifest.py -v
-pytest tests/test_delta.py -v
-```
-
-Tests use `ISOBackend` exclusively — no physical disc required.
+Tests use `ISOBackend` exclusively — no physical disc required. See [testing.md](testing.md) for the full test file inventory and fixture reference.
