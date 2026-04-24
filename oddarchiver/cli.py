@@ -370,6 +370,132 @@ def _fmt_bytes(n: int) -> str:
     return f"{n:.1f} TiB"
 
 
+def _run_dry_run(args: argparse.Namespace, is_init: bool = False) -> int:
+    """
+    Input:  args    — parsed namespace with source and backend flags
+            is_init — True when called from _run_init (no prior disc state)
+    Output: exit code (0 always unless disc read fails)
+    Details:
+        Scans source, diffs, computes delta sizes for changed files, prints
+        rsync-style report.  Space overage is reported but never causes exit 1.
+        No burn, no cache update, no manifest written to disc.
+    """
+    import hashlib
+    from oddarchiver.delta import delta_or_full
+    from oddarchiver.session import SPACE_SAFETY_MARGIN
+
+    backend = _make_backend(args)
+    disc_info = backend.mediainfo()
+
+    if is_init:
+        if disc_info.session_count > 0:
+            print("warning: disc already initialized; skipping init.", file=sys.stderr)
+            return 0
+        disc_state: dict[str, str] = {}
+        label = getattr(args, "label", "ARCHIVE")
+        session_n = 0
+        crypto = _make_init_crypto(args)
+    else:
+        if disc_info.session_count == 0:
+            print("error: disc not initialized; run 'init' first.", file=sys.stderr)
+            return 1
+        manifests = _read_disc_manifests(backend)
+        disc_state = build_disc_state(manifests)
+        label = manifests[0].label if manifests else "ARCHIVE"
+        session_n = disc_info.session_count
+        crypto = _crypto_for_disc(backend)
+
+    source = Path(args.source)
+    source_files = sorted(f for f in source.rglob("*") if f.is_file())
+    current_state = {
+        str(f.relative_to(source)): hashlib.sha256(f.read_bytes()).hexdigest()
+        for f in source_files
+    }
+    total_source_bytes = sum(f.stat().st_size for f in source_files)
+
+    changed = {p for p in current_state if p in disc_state and current_state[p] != disc_state[p]}
+    new_files = {p for p in current_state if p not in disc_state}
+    unchanged_count = len(current_state) - len(changed) - len(new_files)
+
+    print("DRY RUN -- no disc will be written")
+    print()
+    print(
+        f"Scanning source: {source} "
+        f"({len(current_state)} files, {_fmt_bytes(total_source_bytes)})"
+    )
+    print(f"Reading disc state: {label}, session {disc_info.session_count}")
+    print()
+
+    if not changed and not new_files:
+        print("No changes detected.")
+        return 0
+
+    print("Changes detected:")
+    cache = CacheManager()
+    total_session_bytes = 0
+    entry_count = 0
+
+    for rel_path in sorted(changed):
+        abs_path = source / rel_path
+        full_size = abs_path.stat().st_size
+        try:
+            encrypted_old = cache.get_with_fallback(rel_path, session_n - 1, backend)
+            old_bytes = crypto.decrypt(encrypted_old)
+            kind, blob = delta_or_full(old_bytes, abs_path)
+            blob_size = len(blob)
+            if kind == "delta":
+                reduction = 100.0 * (1.0 - blob_size / full_size) if full_size else 0.0
+                print(
+                    f"  [delta]  {rel_path:<40} "
+                    f"{_fmt_bytes(full_size)} \u2192 {_fmt_bytes(blob_size)} delta "
+                    f"({reduction:.1f}% reduction)"
+                )
+            else:
+                pct = 100.0 * blob_size / full_size if full_size else 0.0
+                print(
+                    f"  [full]   {rel_path:<40} "
+                    f"{_fmt_bytes(full_size)}  "
+                    f"(delta {pct:.0f}% of full -- storing full)"
+                )
+        except Exception:  # noqa: BLE001
+            blob_size = full_size
+            print(f"  [full]   {rel_path:<40} {_fmt_bytes(full_size)}  (changed)")
+        total_session_bytes += blob_size
+        entry_count += 1
+
+    for rel_path in sorted(new_files):
+        abs_path = source / rel_path
+        file_size = abs_path.stat().st_size
+        print(f"  [full]   {rel_path:<40} {_fmt_bytes(file_size)}  (new file)")
+        total_session_bytes += file_size
+        entry_count += 1
+
+    print()
+    print(f"  {entry_count} files to write, {unchanged_count} unchanged")
+    print()
+    print(f"Session size:        {_fmt_bytes(total_session_bytes)}")
+    print(f"Disc remaining:      {_fmt_bytes(disc_info.remaining_bytes)}")
+
+    limit = disc_info.remaining_bytes * SPACE_SAFETY_MARGIN
+    if disc_info.remaining_bytes > 0 and total_session_bytes < limit:
+        pct = 100.0 * total_session_bytes / disc_info.remaining_bytes
+        print(f"Space check:         OK (session is {pct:.2f}% of remaining)")
+    elif disc_info.remaining_bytes > 0:
+        pct = 100.0 * total_session_bytes / disc_info.remaining_bytes
+        print(
+            f"Space check:         OVERAGE "
+            f"({_fmt_bytes(total_session_bytes)} is {pct:.1f}% of remaining -- would not fit)"
+        )
+    else:
+        print("Space check:         OVERAGE (disc full)")
+
+    print()
+    print(f"Would burn as: session_{session_n:03d} on {label}")
+    print("No disc written (dry run).")
+
+    return 0
+
+
 def _run_init(args: argparse.Namespace) -> int:
     """
     Input:  args — parsed init namespace
@@ -378,6 +504,9 @@ def _run_init(args: argparse.Namespace) -> int:
         Builds session 0: scan source, build staging, burn, post-burn fast
         verify, update cache.  Exits 0 with warning if already initialized.
     """
+    if getattr(args, "dry_run", False):
+        return _run_dry_run(args, is_init=True)
+
     from oddarchiver import session as session_mod
     from oddarchiver import verify as verify_mod
 
@@ -427,6 +556,9 @@ def _run_sync(args: argparse.Namespace) -> int:
         Reads disc state, diffs source, exits 0 silently on no changes.
         Otherwise: build staging, burn, verify, update cache.
     """
+    if getattr(args, "dry_run", False):
+        return _run_dry_run(args, is_init=False)
+
     from oddarchiver import session as session_mod
     from oddarchiver import verify as verify_mod
 

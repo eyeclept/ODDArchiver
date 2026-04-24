@@ -82,7 +82,7 @@
       "id": 13,
       "name": "Dry-Run Mode",
       "description": "--dry-run: full pipeline minus burn/cache, rsync-style output, space report",
-      "passes": false
+      "passes": true
     },
     {
       "id": 14,

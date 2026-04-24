@@ -130,3 +130,48 @@ Prints: label, session count, used/remaining space, capacity warnings, SUSPECT m
 ## Dry-Run Mode
 
 `--dry-run` (available on `init` and `sync`) runs the full pipeline — source scan, diff, delta computation, space check — but skips the actual burn and cache update. Output mirrors rsync `-n` format: one line per file that would be written, followed by a summary. A space overage is reported but does not cause exit 1 in dry-run mode.
+
+### What dry-run does
+
+- Scans source and computes checksums
+- Diffs against disc or ISO state
+- Computes deltas and classifies each file (`delta` vs `full`, with sizes)
+- Checks disc space and reports whether the session would fit
+- Prints a detailed report
+
+### What dry-run does NOT do
+
+- Call `growisofs` or `genisoimage`
+- Write anything to disc or ISO
+- Update the cache or manifest on disc
+
+### Output format
+
+```
+$ oddarchiver sync ~/Documents/ToArchive --dry-run
+
+DRY RUN -- no disc will be written
+
+Scanning source: /home/user/Documents/ToArchive (42 files, 2.7 GiB)
+Reading disc state: ARCHIVE-01, session 4
+
+Changes detected:
+  [delta]  passwords.kdbx                           5.0 MiB → 4.1 KiB delta (99.9% reduction)
+  [full]   notes/new_note.md                        2.0 KiB  (new file)
+  [full]   report.pdf                               3.2 MiB  (delta 97% of full -- storing full)
+
+  3 files to write, 2 unchanged
+
+Session size:        3.2 MiB
+Disc remaining:      16.9 GiB
+Space check:         OK (session is 0.02% of remaining)
+
+Would burn as: session_005 on ARCHIVE-01
+No disc written (dry run).
+```
+
+If the session would not fit, `Space check:` shows `OVERAGE` with the shortfall, but the command still exits 0.
+
+### Mutual exclusion
+
+`--dry-run` and `--test-iso` cannot be used together (`--test-iso` implies a real write to an ISO file). Use `--dry-run` against a physical device, or against an existing ISO by omitting `--test-iso` and pointing `--device` at the ISO (not recommended; use `--test-iso` for test writes only).
