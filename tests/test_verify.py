@@ -196,3 +196,28 @@ def test_failed_session_reported_per_session_others_ok(tmp_path, capsys):
     assert "Session 000" in out and "FAIL" in out
     assert "Session 001" in out and "OK" in out
     assert "1 error" in out
+
+
+def test_fast_fail_on_invalid_json_manifest_no_traceback(tmp_path, capsys):
+    """
+    Input:  tmp_path, capsys
+    Output: None
+    Details:
+        B5/B6 regression: corrupt JSON in a manifest (simulating `echo junk >>
+        manifest.json`) must cause verify --level fast to exit 1 with a FAIL
+        report, not raise JSONDecodeError.
+    """
+    iso = tmp_path / "test.iso"
+    backend = ISOBackend(iso, disc_size=SMALL_DISC)
+    _burn(backend, _make_staging(tmp_path, 0, {"a.txt": b"content"}), session_n=0)
+
+    manifest_on_disc = backend._sessions_root / "session_000" / "manifest.json"
+    with open(manifest_on_disc, "a", encoding="utf-8") as fh:
+        fh.write("\njunk appended by accident")
+
+    with pytest.raises(SystemExit) as exc:
+        verify(backend, _crypto, level="fast")
+    assert exc.value.code == 1
+
+    out = capsys.readouterr().out
+    assert "FAIL" in out

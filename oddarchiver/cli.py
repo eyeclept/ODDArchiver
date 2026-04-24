@@ -9,6 +9,7 @@ Description:
 """
 # Imports
 import argparse
+import getpass
 import json
 import logging
 import os
@@ -155,11 +156,11 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
 
 def _add_dry_iso_mutex(_parser: argparse.ArgumentParser) -> None:
     """
-    Input:  _parser — subcommand parser (unused; mutual exclusion deferred to dispatch)
+    Input:  _parser — unused; kept for signature compatibility
     Output: None
     Details:
-        argparse mutually_exclusive_group cannot span add_argument calls already
-        made, so --dry-run / --test-iso validation is handled in dispatch().
+        --dry-run and --test-iso are intentionally allowed to coexist.
+        --test-iso selects the ISO backend; --dry-run skips the actual write.
     """
 
 
@@ -171,10 +172,6 @@ def dispatch(args: argparse.Namespace) -> int:
         Validates cross-flag constraints then routes to the correct handler.
         Returns exit code; does not call sys.exit() directly.
     """
-    if getattr(args, "dry_run", False) and getattr(args, "test_iso", None):
-        print("error: --dry-run and --test-iso are mutually exclusive.", file=sys.stderr)
-        return 1
-
     # Apply config file defaults where CLI flags were not explicitly set (None)
     cfg = resolve_config(args)
     if getattr(args, "device", None) is None:
@@ -262,7 +259,7 @@ def _crypto_for_disc(backend: "BurnBackend") -> "CryptoBackend":
     if mode == "passphrase":
         passphrase = os.environ.get("ODDARCHIVER_PASSPHRASE", "")
         if not passphrase:
-            passphrase = input("Passphrase: ")
+            passphrase = getpass.getpass("Passphrase: ")
         return make_crypto("passphrase", passphrase=passphrase.encode())
     if mode == "keyfile":
         raise NotImplementedError(
@@ -285,7 +282,7 @@ def _make_init_crypto(args: argparse.Namespace) -> "CryptoBackend":
     if mode == "passphrase":
         passphrase = os.environ.get("ODDARCHIVER_PASSPHRASE", "")
         if not passphrase:
-            passphrase = input("Passphrase: ")
+            passphrase = getpass.getpass("Passphrase: ")
         return make_crypto("passphrase", passphrase=passphrase.encode())
     if mode == "keyfile":
         key_path = getattr(args, "key", None)
@@ -595,8 +592,9 @@ def _run_sync(args: argparse.Namespace) -> int:
     }
     changed = {p for p in current_state if p in disc_state and current_state[p] != disc_state[p]}
     new_files = {p for p in current_state if p not in disc_state}
+    deleted_files = [p for p in disc_state if p not in current_state]
 
-    if not changed and not new_files:
+    if not changed and not new_files and not deleted_files:
         return 0  # silent exit on no change
 
     cache = CacheManager()

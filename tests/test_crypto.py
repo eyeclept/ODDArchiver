@@ -131,3 +131,18 @@ class TestMakeCrypto:
     def test_unknown_mode_raises(self):
         with pytest.raises(ValueError):
             make_crypto("unknown")
+
+
+class TestPassphraseBytesRegression:
+    """B3 regression: PassphraseCrypto must accept bytes without AttributeError."""
+
+    def test_bytes_passphrase_no_attribute_error(self):
+        pc = PassphraseCrypto(passphrase=b"already bytes")
+        result = pc.decrypt(pc.encrypt(SAMPLE_PLAINTEXT))
+        assert result == SAMPLE_PLAINTEXT
+
+    def test_bytes_and_str_produce_same_key(self):
+        pc_str = PassphraseCrypto(passphrase="samepass")
+        pc_bytes = PassphraseCrypto(passphrase=b"samepass")
+        ciphertext = pc_str.encrypt(SAMPLE_PLAINTEXT)
+        assert pc_bytes.decrypt(ciphertext) == SAMPLE_PLAINTEXT

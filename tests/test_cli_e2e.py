@@ -157,6 +157,45 @@ def test_history_prints_one_row_per_session(tmp_path, capsys):
     assert "001" in out
 
 
+def test_sync_deletion_only_writes_session_and_restore_has_no_ghost(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        B4 regression: init with file1.txt + file2.txt, delete file1.txt,
+        sync must detect the deletion and write session 1.
+        Subsequent restore must not contain file1.txt.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "file1.txt").write_bytes(b"will be deleted")
+    (source / "file2.txt").write_bytes(b"stays")
+
+    iso = tmp_path / "test.iso"
+    assert dispatch(_make_args(command="init", source=str(source), test_iso=str(iso))) == 0
+
+    # Delete file1.txt — only change is a deletion
+    (source / "file1.txt").unlink()
+    rc = dispatch(_make_args(command="sync", source=str(source), test_iso=str(iso)))
+
+    assert rc == 0
+    backend = ISOBackend(iso, disc_size=SMALL_DISC)
+    assert backend.mediainfo().session_count == 2, "deletion-only sync must write a new session"
+
+    # Verify the session 1 manifest records the deletion
+    manifest_bytes = backend.read_path("session_001/manifest.json")
+    manifest_data = json.loads(manifest_bytes)
+    assert "file1.txt" in manifest_data["deleted"]
+
+    # Restore — file1.txt must not appear
+    dest = tmp_path / "dest"
+    from oddarchiver.crypto import NullCrypto
+    from oddarchiver.restore import restore
+    restore(dest, backend, NullCrypto())
+    assert not (dest / "file1.txt").exists(), "ghost file: deleted file must not appear in restore"
+    assert (dest / "file2.txt").exists()
+
+
 def test_status_shows_suspect_on_bad_checksum(tmp_path, capsys):
     """
     Input:  tmp_path, capsys

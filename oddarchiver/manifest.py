@@ -84,7 +84,15 @@ def read_manifest(path: Path) -> Manifest:
         Validates manifest_checksum (sha256 of manifest with that field set to "").
         Sets manifest.suspect = True on checksum mismatch; does not raise.
     """
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logging.warning("SUSPECT manifest at %s: cannot parse JSON: %s", path, exc)
+        return Manifest(
+            version=0, session=-1, timestamp="", source="", label="",
+            based_on_session=None, encryption={}, entries=[], deleted=[],
+            manifest_checksum="", suspect=True,
+        )
     stored_checksum = raw.get("manifest_checksum", "")
     check_dict = {k: v for k, v in raw.items() if k != "suspect"}
     check_dict["manifest_checksum"] = ""

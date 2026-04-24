@@ -80,22 +80,23 @@ class PassphraseCrypto(CryptoBackend):
 
     KDF_PARAMS = {"m": 65536, "t": 3, "p": 4}
 
-    def __init__(self, passphrase: str | None = None) -> None:
-        self._passphrase = passphrase or os.environ.get(PASSPHRASE_ENV)
-        if not self._passphrase:
+    def __init__(self, passphrase: str | bytes | None = None) -> None:
+        raw = passphrase or os.environ.get(PASSPHRASE_ENV)
+        if not raw:
             raise RuntimeError(
                 "No passphrase provided and ODDARCHIVER_PASSPHRASE is not set."
             )
+        self._passphrase: bytes = raw if isinstance(raw, bytes) else raw.encode()
 
     def _derive_key(self, salt: bytes) -> bytes:
         """
         Input:  salt — 16-byte random salt
         Output: 32-byte derived key
         Details:
-            Argon2id with KDF_PARAMS; secret is passphrase UTF-8 encoded.
+            Argon2id with KDF_PARAMS; secret is passphrase bytes.
         """
         return hash_secret_raw(
-            secret=self._passphrase.encode(),
+            secret=self._passphrase,
             salt=salt,
             time_cost=self.KDF_PARAMS["t"],
             memory_cost=self.KDF_PARAMS["m"],

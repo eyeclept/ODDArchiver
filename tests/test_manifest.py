@@ -189,3 +189,40 @@ def test_write_manifest_is_atomic(tmp_path, monkeypatch):
         write_manifest(tmp_path, _make_manifest())
 
     assert not (tmp_path / "manifest.json").exists()
+
+
+def test_read_manifest_invalid_json_returns_suspect(tmp_path, caplog):
+    """
+    Input:  tmp_path, caplog
+    Output: None
+    Details:
+        B5 regression: read_manifest on a file containing invalid JSON must
+        return a Manifest with suspect=True and log WARNING, not raise JSONDecodeError.
+    """
+    bad = tmp_path / "manifest.json"
+    bad.write_text('{"valid": "json"}extra junk that breaks parse', encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        m = read_manifest(bad)
+
+    assert m.suspect is True
+    assert any("cannot parse JSON" in r.message for r in caplog.records)
+
+
+def test_read_manifest_appended_garbage_returns_suspect(tmp_path, caplog):
+    """
+    Input:  tmp_path, caplog
+    Output: None
+    Details:
+        B5 regression: appending bytes after valid JSON (as in bugs.txt: echo junk >>)
+        must return suspect=True, not raise.
+    """
+    write_manifest(tmp_path, _make_manifest())
+    manifest_path = tmp_path / "manifest.json"
+    with open(manifest_path, "a", encoding="utf-8") as fh:
+        fh.write("\njunk appended by accident")
+
+    with caplog.at_level(logging.WARNING):
+        m = read_manifest(manifest_path)
+
+    assert m.suspect is True

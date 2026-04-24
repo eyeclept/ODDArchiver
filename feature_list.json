@@ -95,6 +95,12 @@
       "name": "Tests",
       "description": "Unit: delta, manifest, crypto. Integration: full cycle, dry-run, SIGINT, interrupted burn",
       "passes": true
+    },
+    {
+      "id": 16,
+      "name": "Bug Fixes",
+      "description": "B1-B6: dry-run/test-iso coexistence, getpass, bytes passphrase, deletion-only sync, JSON parse SUSPECT",
+      "passes": true
     }
   ]
 }
