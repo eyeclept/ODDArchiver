@@ -81,17 +81,21 @@ def build_staging(
     backend: "BurnBackend",
     cache: "CacheManager",
     crypto: "CryptoBackend",
+    _staging_root: Path | None = None,
 ) -> Path:
     """
-    Input:  session_n  — session number to build (e.g. 1 for first sync)
-            source     — directory being archived
-            disc_state — {path: result_checksum} from manifest.build_disc_state()
-            backend    — BurnBackend for disc reads on cache miss
-            cache      — CacheManager for encrypted blob retrieval
-            crypto     — CryptoBackend for encrypt/decrypt
+    Input:  session_n     — session number to build (e.g. 1 for first sync)
+            source        — directory being archived
+            disc_state    — {path: result_checksum} from manifest.build_disc_state()
+            backend       — BurnBackend for disc reads on cache miss
+            cache         — CacheManager for encrypted blob retrieval
+            crypto        — CryptoBackend for encrypt/decrypt
+            _staging_root — override temp root (default: system tmpdir); for testing
     Output: Path — path to completed staging directory (caller owns cleanup)
     Details:
-        Uses tempfile.mkdtemp; cleans up in except (runs on Ctrl+C via SIGINT flag).
+        Uses a deterministic named staging dir so a crash-left dir can be detected
+        and removed on the next run.  If a stale dir exists it is logged and removed
+        before a fresh one is created.
         Installs SIGINT handler at entry.
         Raises SystemExit(1) if space check fails.
         On BaseException the staging dir is removed before re-raising.
@@ -100,7 +104,14 @@ def build_staging(
     _sigint_received = False
     signal.signal(signal.SIGINT, _handle_sigint)
 
-    staging = Path(tempfile.mkdtemp(prefix="oddarchiver_"))
+    root = _staging_root if _staging_root is not None else Path(tempfile.gettempdir())
+    staging = root / f"oddarchiver_staging_{session_n:03d}"
+    if staging.exists():
+        _log.warning(
+            "Stale staging dir found for session %03d; removing and rebuilding.", session_n
+        )
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
     try:
         session_name = f"session_{session_n:03d}"
         session_dir = staging / session_name

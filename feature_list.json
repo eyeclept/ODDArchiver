@@ -88,13 +88,13 @@
       "id": 14,
       "name": "Idempotency",
       "description": "init on existing disc, sync no-change silence, interrupted burn recovery, staging rebuild",
-      "passes": false
+      "passes": true
     },
     {
       "id": 15,
       "name": "Tests",
       "description": "Unit: delta, manifest, crypto. Integration: full cycle, dry-run, SIGINT, interrupted burn",
-      "passes": false
+      "passes": true
     }
   ]
 }

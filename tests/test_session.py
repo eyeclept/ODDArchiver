@@ -10,7 +10,6 @@ Description:
 # Imports
 import hashlib
 import json
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -66,6 +65,7 @@ def test_new_files_staged_in_full_dir(tmp_path):
         backend=_make_backend(),
         cache=_make_cache(),
         crypto=NullCrypto(),
+        _staging_root=tmp_path / "staging",
     )
     try:
         full_dir = staging / "session_000" / "full"
@@ -102,6 +102,7 @@ def test_changed_files_staged_in_deltas_dir(tmp_path):
         backend=_make_backend(),
         cache=_make_cache(old_content),   # cache returns the old plaintext (NullCrypto)
         crypto=NullCrypto(),
+        _staging_root=tmp_path / "staging",
     )
     try:
         deltas_dir = staging / "session_001" / "deltas"
@@ -133,6 +134,7 @@ def test_deleted_list_in_manifest(tmp_path):
         backend=_make_backend(),
         cache=_make_cache(b"old kept"),
         crypto=NullCrypto(),
+        _staging_root=tmp_path / "staging",
     )
     try:
         manifest = read_manifest(staging / "session_002" / "manifest.json")
@@ -159,16 +161,15 @@ def test_space_check_exits_1_when_over_limit(tmp_path):
     tiny_backend = _make_backend(remaining_bytes=1)
 
     with pytest.raises(SystemExit) as exc_info:
-        staging = session_mod.build_staging(
+        session_mod.build_staging(
             session_n=0,
             source=tmp_path,
             disc_state={},
             backend=tiny_backend,
             cache=_make_cache(),
             crypto=NullCrypto(),
+            _staging_root=tmp_path / "staging",
         )
-        import shutil
-        shutil.rmtree(staging, ignore_errors=True)
 
     assert exc_info.value.code == 1
 
@@ -179,19 +180,9 @@ def test_sigint_during_staging_cleans_up_temp_dir(tmp_path, monkeypatch):
     Output: None
     Details:
         If _sigint_received is set during the staging scan, build_staging raises
-        KeyboardInterrupt and the temp staging directory is removed.
+        KeyboardInterrupt and the staging directory is removed.
     """
     (tmp_path / "file.txt").write_bytes(b"content")
-
-    captured: list[Path] = []
-    real_mkdtemp = tempfile.mkdtemp
-
-    def tracking_mkdtemp(**kw):
-        p = real_mkdtemp(**kw)
-        captured.append(Path(p))
-        return p
-
-    monkeypatch.setattr("tempfile.mkdtemp", tracking_mkdtemp)
 
     # Simulate SIGINT arriving during the sha256 scan
     real_sha256 = session_mod._sha256_file
@@ -202,6 +193,10 @@ def test_sigint_during_staging_cleans_up_temp_dir(tmp_path, monkeypatch):
 
     monkeypatch.setattr(session_mod, "_sha256_file", sha256_then_signal)
 
+    staging_root = tmp_path / "staging"
+    staging_root.mkdir()
+    expected_staging = staging_root / "oddarchiver_staging_001"
+
     with pytest.raises(KeyboardInterrupt):
         session_mod.build_staging(
             session_n=1,
@@ -210,7 +205,7 @@ def test_sigint_during_staging_cleans_up_temp_dir(tmp_path, monkeypatch):
             backend=_make_backend(),
             cache=_make_cache(),
             crypto=NullCrypto(),
+            _staging_root=staging_root,
         )
 
-    assert len(captured) == 1, "mkdtemp must have been called exactly once"
-    assert not captured[0].exists(), "staging dir must be removed after SIGINT"
+    assert not expected_staging.exists(), "staging dir must be removed after SIGINT"
