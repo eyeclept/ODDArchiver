@@ -32,6 +32,11 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _blob_id(session_n: int, rel_path: str) -> str:
+    """Matching session.py _blob_id: sha256(session_n:rel_path)."""
+    return hashlib.sha256(f"{session_n}:{rel_path}".encode()).hexdigest()
+
+
 def _make_staging(tmp_path: Path, session_n: int, files: dict[str, bytes],
                   deleted: list[str] | None = None,
                   based_on: int | None = None) -> Path:
@@ -44,6 +49,7 @@ def _make_staging(tmp_path: Path, session_n: int, files: dict[str, bytes],
     Output: Path to staging directory ready for backend.init/append
     Details:
         Writes each file as an unencrypted blob (NullCrypto identity).
+        Blob filenames are sha256(session_n:rel_path) matching session.py.
         Builds a valid manifest.json with correct checksums.
     """
     session_name = f"session_{session_n:03d}"
@@ -55,15 +61,15 @@ def _make_staging(tmp_path: Path, session_n: int, files: dict[str, bytes],
     entries = []
     for rel_path, content in files.items():
         blob = _crypto.encrypt(content)  # NullCrypto: blob == content
-        dest = full_dir / rel_path
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        blob_name = _blob_id(session_n, rel_path)
+        dest = full_dir / blob_name
         dest.write_bytes(blob)
         entries.append(ManifestEntry(
             path=rel_path,
             type="full",
             result_checksum=_sha256(content),
             full_size_bytes=len(content),
-            file=f"{session_name}/full/{rel_path}",
+            file=f"{session_name}/full/{blob_name}",
         ))
 
     manifest = Manifest(
@@ -201,7 +207,7 @@ def test_checksum_mismatch_logs_error_no_corrupt_file(tmp_path, caplog):
     _burn(backend, _make_staging(tmp_path, 0, {"a.txt": content}), session_n=0)
 
     # corrupt the blob on the sessions_root
-    blob_path = backend._sessions_root / "session_000" / "full" / "a.txt"
+    blob_path = backend._sessions_root / "session_000" / "full" / _blob_id(0, "a.txt")
     blob_path.write_bytes(b"CORRUPTED GARBAGE")
 
     dest = tmp_path / "dest"

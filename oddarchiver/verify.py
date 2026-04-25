@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Literal, TYPE_CHECKING
 
-from oddarchiver.manifest import Manifest, read_manifest
+from oddarchiver.manifest import Manifest, read_manifest, validate_blob_path
 
 if TYPE_CHECKING:
     from oddarchiver.disc import BurnBackend
@@ -190,6 +190,11 @@ def _check_blobs(
     """
     for entry in manifest.entries:
         blob_path = entry.file if entry.type == "full" else entry.delta_file
+        try:
+            validate_blob_path(blob_path)
+        except ValueError as exc:
+            errors.append(f"{blob_path}: refused: {exc}")
+            continue
         try:
             raw = backend.read_path(blob_path)
             plaintext = crypto.decrypt(raw)

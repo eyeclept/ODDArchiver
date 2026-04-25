@@ -23,11 +23,11 @@ sudo apt install xdelta3
 For each changed file during a `sync`:
 
 1. The previous version (plaintext) is retrieved from cache or disc.
-2. `compute_delta(old_bytes, new_path)` runs `xdelta3 -e -c -s <tmp_source> <new_path>` and returns the delta as bytes.
+2. `compute_delta(old_bytes, new_path)` runs `xdelta3 -e -c -s /proc/self/fd/{N} <new_path>`, feeding `old_bytes` via `os.memfd_create` — no plaintext temp file is ever created on disk.
 3. `delta_or_full` compares `len(delta)` against `DELTA_THRESHOLD * len(full)`. If the delta is too large relative to the full file, the full content is stored instead.
 4. The chosen bytes are then passed to the encryption layer before being written to staging.
 
-Reconstruction (restore) reverses the process: `apply_delta(base_bytes, delta_bytes)` runs `xdelta3 -d -c -s <tmp_base> -`, feeding the delta on stdin and reading the result from stdout.
+Reconstruction (restore) reverses the process: `apply_delta(base_bytes, delta_bytes)` feeds `base_bytes` via `os.memfd_create + /proc/self/fd` and the delta via stdin — no plaintext temp file is created on disk.
 
 ---
 
@@ -58,7 +58,7 @@ Format: `<filename>: delta <N>KB vs full <N>KB -- storing delta|full`
 
 `process_files(jobs, max_workers=4)` runs `delta_or_full` concurrently across a list of `(old_bytes, new_path)` pairs using `ThreadPoolExecutor`. Results are returned in the same order as the input list regardless of completion order.
 
-Delta computation is I/O-bound (subprocess + temp file writes), so thread-level parallelism is effective. The default pool size is 4; it can be adjusted by passing `max_workers` directly.
+Delta computation is I/O-bound (subprocess + memfd writes), so thread-level parallelism is effective. The default pool size is 4; it can be adjusted by passing `max_workers` directly.
 
 ---
 

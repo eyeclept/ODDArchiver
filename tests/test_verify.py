@@ -29,6 +29,11 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _blob_id(session_n: int, rel_path: str) -> str:
+    """Matching session.py _blob_id: sha256(session_n:rel_path)."""
+    return hashlib.sha256(f"{session_n}:{rel_path}".encode()).hexdigest()
+
+
 def _make_staging(
     tmp_path: Path,
     session_n: int,
@@ -43,6 +48,7 @@ def _make_staging(
     Output: staging Path ready for ISOBackend.init / append
     Details:
         Writes NullCrypto blobs (plaintext == ciphertext) and a valid manifest.
+        Blob filenames are sha256(session_n:rel_path) matching session.py.
     """
     session_name = f"session_{session_n:03d}"
     staging = tmp_path / f"staging_{session_n}"
@@ -53,15 +59,15 @@ def _make_staging(
     entries = []
     for rel_path, content in files.items():
         blob = _crypto.encrypt(content)
-        dest = full_dir / rel_path
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        blob_name = _blob_id(session_n, rel_path)
+        dest = full_dir / blob_name
         dest.write_bytes(blob)
         entries.append(ManifestEntry(
             path=rel_path,
             type="full",
             result_checksum=_sha256(content),
             full_size_bytes=len(content),
-            file=f"{session_name}/full/{rel_path}",
+            file=f"{session_name}/full/{blob_name}",
         ))
 
     manifest = Manifest(
@@ -143,7 +149,7 @@ def test_checksum_fail_on_corrupted_blob(tmp_path, capsys):
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     _burn(backend, _make_staging(tmp_path, 0, {"a.txt": b"real content"}), session_n=0)
 
-    blob_path = backend._sessions_root / "session_000" / "full" / "a.txt"
+    blob_path = backend._sessions_root / "session_000" / "full" / _blob_id(0, "a.txt")
     blob_path.write_bytes(b"CORRUPTED GARBAGE")
 
     with pytest.raises(SystemExit) as exc:
@@ -185,7 +191,7 @@ def test_failed_session_reported_per_session_others_ok(tmp_path, capsys):
     _burn(backend, _make_staging(tmp_path, 0, {"a.txt": b"alpha"}, timestamp="2026-04-23T00:00:00Z"), session_n=0)
     _burn(backend, _make_staging(tmp_path, 1, {"b.txt": b"beta"}, based_on=0, timestamp="2026-04-23T01:00:00Z"), session_n=1)
 
-    blob_path = backend._sessions_root / "session_000" / "full" / "a.txt"
+    blob_path = backend._sessions_root / "session_000" / "full" / _blob_id(0, "a.txt")
     blob_path.write_bytes(b"CORRUPTED")
 
     with pytest.raises(SystemExit) as exc:

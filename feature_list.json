@@ -119,6 +119,12 @@
       "name": "Test Quality Audit",
       "description": "Shortcut audit of all test files; 12 new scenario tests in test_stress.py",
       "passes": true
+    },
+    {
+      "id": 20,
+      "name": "Security Review (Red Team)",
+      "description": "H1: memfd delta, H2: path traversal validators, M1: private staging root, M2: keyfile CLI wiring; docs/security.md created",
+      "passes": true
     }
   ]
 }

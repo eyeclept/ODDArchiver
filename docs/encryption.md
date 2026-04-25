@@ -12,6 +12,8 @@ ODDArchiver supports three encryption modes. The mode is chosen at `init` time a
 
 Select at init: `oddarchiver init --encrypt passphrase` or `--encrypt keyfile --key /path/to/keyfile`.
 
+For keyfile mode, `--key PATH` must be supplied on **init** and on every subsequent command (`sync`, `restore`, `verify`, `history`, `status`). The disc holds only a mode indicator (`enc_mode.json`), not the keyfile — you must supply it each time.
+
 ## NullCrypto (mode 0)
 
 Identity transform. `encrypt(b)` returns `b`; `decrypt(b)` returns `b`. Use for archival media where confidentiality is not required.
@@ -87,3 +89,5 @@ Mounting a disc with `mode=passphrase` shows only opaque hex filenames and an `e
 ## In-memory guarantee
 
 All encrypt and decrypt operations work on `bytes` in memory. No plaintext is written to the filesystem or to temporary files at any point.
+
+- Delta computation feeds the previous version to xdelta3 via `os.memfd_create + /proc/self/fd`; not via a tempfile.

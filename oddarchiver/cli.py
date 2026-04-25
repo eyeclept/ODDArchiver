@@ -101,6 +101,7 @@ def _add_sync(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--disc-size", default=None, dest="disc_size", metavar="SIZE")
     p.add_argument("--prefill", metavar="SIZE")
     p.add_argument("--mirror", metavar="PATH", help="Second drive or ISO to mirror each session to.")
+    p.add_argument("--key", metavar="PATH", help="Keyfile path (keyfile mode only).")
     _add_dry_iso_mutex(p)
 
 
@@ -117,6 +118,7 @@ def _add_restore(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--test-iso", metavar="PATH", dest="test_iso")
     p.add_argument("--session", type=int, metavar="N")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--key", metavar="PATH", help="Keyfile path (keyfile mode only).")
 
 
 def _add_history(sub: argparse._SubParsersAction) -> None:
@@ -129,6 +131,7 @@ def _add_history(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("history", help="List all sessions on disc or ISO.")
     p.add_argument("--device", default=None, metavar="DEV")
     p.add_argument("--test-iso", metavar="PATH", dest="test_iso")
+    p.add_argument("--key", metavar="PATH", help="Keyfile path (keyfile mode only).")
 
 
 def _add_verify(sub: argparse._SubParsersAction) -> None:
@@ -142,6 +145,7 @@ def _add_verify(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--device", default=None, metavar="DEV")
     p.add_argument("--test-iso", metavar="PATH", dest="test_iso")
     p.add_argument("--level", choices=["fast", "checksum", "full"], default="fast")
+    p.add_argument("--key", metavar="PATH", help="Keyfile path (keyfile mode only).")
 
 
 def _add_status(sub: argparse._SubParsersAction) -> None:
@@ -154,6 +158,7 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("status", help="Show disc/ISO state and warnings.")
     p.add_argument("--device", default=None, metavar="DEV")
     p.add_argument("--test-iso", metavar="PATH", dest="test_iso")
+    p.add_argument("--key", metavar="PATH", help="Keyfile path (keyfile mode only).")
 
 
 def _add_dry_iso_mutex(_parser: argparse.ArgumentParser) -> None:
@@ -288,9 +293,13 @@ def _read_disc_manifests(
     return manifests
 
 
-def _crypto_for_disc(backend: "BurnBackend") -> "CryptoBackend":
+def _crypto_for_disc(
+    backend: "BurnBackend",
+    key_path: str | None = None,
+) -> "CryptoBackend":
     """
-    Input:  backend — BurnBackend with at least one session
+    Input:  backend  — BurnBackend with at least one session
+            key_path — path to keyfile (required when disc is keyfile-encrypted)
     Output: CryptoBackend matching the encryption mode stored on disc
     Details:
         Reads enc_mode.json from session_000 to get the mode without needing
@@ -324,9 +333,10 @@ def _crypto_for_disc(backend: "BurnBackend") -> "CryptoBackend":
             passphrase = getpass.getpass("Passphrase: ")
         return make_crypto("passphrase", passphrase=passphrase.encode())
     if mode == "keyfile":
-        raise NotImplementedError(
-            "keyfile mode requires --key on non-init commands (not yet wired)"
-        )
+        if not key_path:
+            print("error: --key is required for keyfile-encrypted disc.", file=sys.stderr)
+            raise SystemExit(1)
+        return make_crypto("keyfile", keyfile_path=key_path)
     raise ValueError(f"Unknown encryption mode on disc: {mode!r}")
 
 
@@ -357,8 +367,7 @@ def _make_init_crypto(args: argparse.Namespace) -> "CryptoBackend":
         if not key_path:
             print("error: --key is required for keyfile mode.", file=sys.stderr)
             raise SystemExit(1)
-        key_bytes = Path(key_path).read_bytes()
-        return make_crypto("keyfile", key=key_bytes)
+        return make_crypto("keyfile", keyfile_path=key_path)
     raise ValueError(f"Unknown mode: {mode!r}")
 
 
@@ -485,7 +494,7 @@ def _run_dry_run(args: argparse.Namespace, is_init: bool = False) -> int:
         disc_state = build_disc_state(manifests)
         label = manifests[0].label if manifests else "ARCHIVE"
         session_n = disc_info.session_count
-        crypto = _crypto_for_disc(backend)
+        crypto = _crypto_for_disc(backend, key_path=getattr(args, "key", None))
 
     source = Path(args.source)
 
@@ -702,7 +711,7 @@ def _run_sync(args: argparse.Namespace) -> int:
         if isinstance(backend, ISOBackend):
             backend.prefill(parse_disc_size(args.prefill))
 
-    crypto = _crypto_for_disc(backend)
+    crypto = _crypto_for_disc(backend, key_path=getattr(args, "key", None))
     manifests = _read_disc_manifests(backend, crypto=crypto)
     disc_state = build_disc_state(manifests)
     enc_block = _encryption_block(crypto)
@@ -790,7 +799,7 @@ def _run_restore(args: argparse.Namespace) -> int:
     from oddarchiver.restore import restore
 
     backend = _make_backend(args)
-    crypto = _crypto_for_disc(backend)
+    crypto = _crypto_for_disc(backend, key_path=getattr(args, "key", None))
 
     _, failures = restore(
         dest=Path(args.dest),
@@ -811,7 +820,7 @@ def _run_history(args: argparse.Namespace) -> int:
         Columns: session, timestamp, files, total_bytes, encryption mode.
     """
     backend = _make_backend(args)
-    crypto = _crypto_for_disc(backend)
+    crypto = _crypto_for_disc(backend, key_path=getattr(args, "key", None))
     manifests = _read_disc_manifests(backend, crypto=crypto)
 
     if not manifests:
@@ -844,7 +853,7 @@ def _run_verify(args: argparse.Namespace) -> int:
     from oddarchiver import verify as verify_mod
 
     backend = _make_backend(args)
-    crypto = _crypto_for_disc(backend)
+    crypto = _crypto_for_disc(backend, key_path=getattr(args, "key", None))
 
     try:
         verify_mod.verify(backend, crypto, level=args.level)
@@ -888,7 +897,7 @@ def _run_status(args: argparse.Namespace) -> int:
         warnings, and any SUSPECT manifests.
     """
     backend = _make_backend(args)
-    crypto = _crypto_for_disc(backend)
+    crypto = _crypto_for_disc(backend, key_path=getattr(args, "key", None))
     disc_info = backend.mediainfo()
 
     used_pct = (

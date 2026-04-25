@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from oddarchiver.delta import apply_delta
-from oddarchiver.manifest import ManifestEntry, read_manifest
+from oddarchiver.manifest import ManifestEntry, read_manifest, validate_blob_path, safe_join_under
 
 if TYPE_CHECKING:
     from oddarchiver.disc import BurnBackend
@@ -138,7 +138,11 @@ def _process_file(
         return "skipped"
 
     target_checksum = chain[-1][1].result_checksum
-    dest_file = dest / rel_path
+    try:
+        dest_file = safe_join_under(dest, rel_path)
+    except ValueError as exc:
+        _log.error("Refused %s: %s", rel_path, exc)
+        return "failed"
 
     if not force and dest_file.exists():
         if hashlib.sha256(dest_file.read_bytes()).hexdigest() == target_checksum:
@@ -249,6 +253,7 @@ def _read_full(
     Output: (plaintext_bytes, success_bool)
     """
     try:
+        validate_blob_path(entry.file)
         return crypto.decrypt(backend.read_path(entry.file)), True
     except _BLOB_ERRORS as exc:
         _log.error("Failed to read full blob for %s: %s", rel_path, exc)
@@ -269,6 +274,7 @@ def _apply_delta_entry(
     Output: (patched_bytes, success_bool)
     """
     try:
+        validate_blob_path(entry.delta_file)
         delta_bytes = crypto.decrypt(backend.read_path(entry.delta_file))
         return apply_delta(current, delta_bytes), True
     except _BLOB_ERRORS as exc:

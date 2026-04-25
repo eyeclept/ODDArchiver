@@ -6,12 +6,21 @@
 
 ---
 
+## Staging Directory Location
+
+By default, `build_staging` places the staging directory under a per-user private root with mode `0o700`:
+
+- **Preferred:** `$XDG_RUNTIME_DIR/oddarchiver/` (tmpfs, cleaned on logout)
+- **Fallback:** `~/.local/state/oddarchiver/staging/`
+
+Using a user-private directory prevents a local attacker from pre-creating the deterministic staging path (DoS) or reading partially-written encrypted blobs (information leak). The `_staging_root` parameter overrides the default for tests.
+
 ## Staging Directory Layout
 
-`build_staging` creates a temporary directory and populates it as follows:
+`build_staging` creates its directory under the root above and populates it as follows:
 
 ```
-<tmpdir>/
+<staging_root>/
 └── session_NNN/
     ├── manifest.json          ← provisional plaintext manifest (no label/encryption yet)
     ├── full/

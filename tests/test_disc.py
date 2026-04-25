@@ -8,6 +8,7 @@ Description:
     prefill, parse_disc_size, and _parse_mediainfo.
 """
 # Imports
+import hashlib
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -24,16 +25,20 @@ from oddarchiver.disc import (
 # Globals
 SMALL_DISC = 10 * 2**20  # 10 MiB — keeps ISO builds fast in tests
 
+# Blob name for the test file in session_000 (sha256("0:hello.txt"))
+_HELLO_BLOB = hashlib.sha256(b"0:hello.txt").hexdigest()
+
 
 # Functions
 
 
 def _make_staging(tmp_path: Path, session_name: str = "session_000") -> Path:
-    """Build a minimal staging directory with one file."""
+    """Build a minimal staging directory with one blob-named file."""
     staging = tmp_path / "staging"
     session_dir = staging / session_name
-    session_dir.mkdir(parents=True)
-    (session_dir / "hello.txt").write_bytes(b"hello world")
+    blob_dir = session_dir / "full"
+    blob_dir.mkdir(parents=True)
+    (blob_dir / _HELLO_BLOB).write_bytes(b"hello world")
     return staging
 
 
@@ -149,7 +154,7 @@ def test_read_path_returns_file_bytes(tmp_path):
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     staging = _make_staging(tmp_path)
     backend.init(staging, label="TEST")
-    data = backend.read_path("session_000/hello.txt")
+    data = backend.read_path(f"session_000/full/{_HELLO_BLOB}")
     assert data == b"hello world"
 
 
@@ -163,8 +168,9 @@ def test_read_path_missing_raises(tmp_path):
     iso = tmp_path / "test.iso"
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     backend.init(_make_staging(tmp_path), label="TEST")
+    missing_blob = "a" * 64  # valid hex length but never written
     with pytest.raises(FileNotFoundError):
-        backend.read_path("session_000/does_not_exist.bin")
+        backend.read_path(f"session_000/full/{missing_blob}")
 
 
 @pytest.mark.parametrize("size_str,expected", [

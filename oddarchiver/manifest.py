@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -224,6 +225,54 @@ def _compute_checksum(manifest_dict: dict[str, Any]) -> str:
     """
     canonical = json.dumps(manifest_dict, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+# Path validators — reject traversal in manifest-supplied paths.
+
+_BLOB_PATH_RE = re.compile(
+    r"^session_\d{3}/(full|deltas)/[0-9a-f]{64}$"
+)
+_MANIFEST_PATH_RE = re.compile(
+    r"^session_\d{3}/(manifest\.enc|manifest\.json|enc_mode\.json)$"
+)
+
+
+def validate_blob_path(path: str) -> str:
+    """Return path if it is a legal blob path; raise ValueError otherwise."""
+    if not _BLOB_PATH_RE.fullmatch(path):
+        raise ValueError(
+            f"Refusing to read manifest-supplied blob path: {path!r}"
+        )
+    return path
+
+
+def validate_disc_read_path(path: str) -> str:
+    """Permit a blob path or a known manifest/control path; raise ValueError otherwise."""
+    if _BLOB_PATH_RE.fullmatch(path) or _MANIFEST_PATH_RE.fullmatch(path):
+        return path
+    raise ValueError(
+        f"Refusing disc read of unrecognized path: {path!r}"
+    )
+
+
+def safe_join_under(root: Path, rel_path: str) -> Path:
+    """Join root / rel_path, ensuring the result stays under root.
+
+    Rejects absolute paths, paths containing '..' segments, and any joined
+    path whose resolved form escapes root. Raises ValueError on rejection.
+    """
+    if not rel_path or Path(rel_path).is_absolute():
+        raise ValueError(f"Refusing absolute or empty path: {rel_path!r}")
+    parts = Path(rel_path).parts
+    if any(p == ".." for p in parts):
+        raise ValueError(f"Refusing path with parent segment: {rel_path!r}")
+    candidate = (root / rel_path).resolve()
+    root_resolved = root.resolve()
+    if not candidate.is_relative_to(root_resolved):
+        raise ValueError(
+            f"Refusing path that escapes {root_resolved}: {rel_path!r}"
+        )
+    return candidate
 
 
 if __name__ == "__main__":

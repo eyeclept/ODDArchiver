@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -33,6 +34,25 @@ SPACE_SAFETY_MARGIN = 0.95
 _log = logging.getLogger(__name__)
 
 # Functions
+
+
+def _default_staging_root() -> Path:
+    """Per-user staging root with 0o700 permissions.
+
+    Prefers $XDG_RUNTIME_DIR/oddarchiver (tmpfs, cleaned on logout).
+    Falls back to ~/.local/state/oddarchiver/staging.
+    """
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        base = Path(xdg) / "oddarchiver"
+    else:
+        base = Path.home() / ".local" / "state" / "oddarchiver" / "staging"
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        base.chmod(0o700)
+    except OSError as exc:
+        _log.warning("Could not tighten staging root mode on %s: %s", base, exc)
+    return base
 
 
 def _blob_id(session_n: int, rel_path: str) -> str:
@@ -136,7 +156,7 @@ def build_staging(
     _sigint_received = False
     old_sigint = signal.signal(signal.SIGINT, _handle_sigint)
 
-    root = _staging_root if _staging_root is not None else Path(tempfile.gettempdir())
+    root = _staging_root if _staging_root is not None else _default_staging_root()
     staging = root / f"oddarchiver_staging_{session_n:03d}"
     if staging.exists():
         _log.warning(

@@ -150,7 +150,10 @@ class DiscBackend(BurnBackend):
         Details:
             Locates the disc mount point via /proc/mounts and reads the file.
             Raises RuntimeError if the device is not currently mounted.
+            Raises ValueError if path is not a known-safe blob or manifest path.
         """
+        from oddarchiver.manifest import validate_disc_read_path
+        validate_disc_read_path(path)
         mount_point = _find_mount(self.device)
         if mount_point is None:
             raise RuntimeError(
@@ -270,7 +273,10 @@ class ISOBackend(BurnBackend):
         Output: bytes
         Details:
             Reads from the sessions_root directory tree; no loop mount required.
+            Raises ValueError if path is not a known-safe blob or manifest path.
         """
+        from oddarchiver.manifest import validate_disc_read_path
+        validate_disc_read_path(path)
         target = self._sessions_root / path
         if not target.exists():
             raise FileNotFoundError(f"Path not found in ISO sessions: {path!r}")

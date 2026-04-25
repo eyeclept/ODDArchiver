@@ -11,8 +11,8 @@ Description:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -23,24 +23,38 @@ _log = logging.getLogger(__name__)
 # Functions
 
 
+def _memfd_with_bytes(name: str, data: bytes) -> int:
+    """Create an anonymous in-memory file, write data, seek back to 0.
+
+    Returns the file descriptor. Caller is responsible for os.close(fd).
+    Uses os.memfd_create so no plaintext bytes ever touch disk.
+    """
+    fd = os.memfd_create(name, 0)
+    os.write(fd, data)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return fd
+
+
 def compute_delta(old_bytes: bytes, new_path: Path) -> bytes:
     """
     Input:  old_bytes — plaintext content of the previous version
             new_path  — filesystem path to the new version
     Output: bytes — raw xdelta3 delta
     Details:
-        Writes old_bytes to a temp file as source; xdelta3 reads new_path
-        and writes delta to stdout (-c flag). Temp file removed on exit.
+        Feeds old_bytes to xdelta3 via an anonymous memfd (/proc/self/fd/N)
+        so no plaintext temp file is ever created on disk.
     """
-    with tempfile.NamedTemporaryFile(suffix=".odd.src", delete=True) as tf:
-        tf.write(old_bytes)
-        tf.flush()
+    fd = _memfd_with_bytes("oddarchiver_delta_src", old_bytes)
+    try:
         proc = subprocess.Popen(
-            ["xdelta3", "-e", "-c", "-s", tf.name, str(new_path)],
+            ["xdelta3", "-e", "-c", "-s", f"/proc/self/fd/{fd}", str(new_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            pass_fds=(fd,),
         )
         delta, err = proc.communicate()
+    finally:
+        os.close(fd)
     if proc.returncode != 0:
         raise RuntimeError(
             f"xdelta3 encode failed (exit {proc.returncode}): {err.decode()}"
@@ -54,19 +68,21 @@ def apply_delta(base_bytes: bytes, delta_bytes: bytes) -> bytes:
             delta_bytes — xdelta3 delta to apply
     Output: bytes — reconstructed file content
     Details:
-        Writes base_bytes to a temp file as source; delta_bytes fed via
-        stdin ('-' input); decoded output read from stdout.
+        Feeds base_bytes via an anonymous memfd; delta_bytes arrive via
+        stdin. No plaintext temp file is created on disk.
     """
-    with tempfile.NamedTemporaryFile(suffix=".odd.base", delete=True) as tf:
-        tf.write(base_bytes)
-        tf.flush()
+    fd = _memfd_with_bytes("oddarchiver_delta_base", base_bytes)
+    try:
         proc = subprocess.Popen(
-            ["xdelta3", "-d", "-c", "-s", tf.name, "-"],
+            ["xdelta3", "-d", "-c", "-s", f"/proc/self/fd/{fd}", "-"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            pass_fds=(fd,),
         )
         result, err = proc.communicate(input=delta_bytes)
+    finally:
+        os.close(fd)
     if proc.returncode != 0:
         raise RuntimeError(
             f"xdelta3 decode failed (exit {proc.returncode}): {err.decode()}"

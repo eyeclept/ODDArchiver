@@ -58,10 +58,10 @@ If either step fails, cache remains at the previous session's state.
 `build_staging` uses a deterministic staging directory name:
 
 ```
-{tmpdir}/oddarchiver_staging_{NNN}/
+<staging_root>/oddarchiver_staging_{NNN}/
 ```
 
-where `NNN` is the zero-padded session number.
+where `NNN` is the zero-padded session number and `<staging_root>` is the per-user private directory (`$XDG_RUNTIME_DIR/oddarchiver` or `~/.local/state/oddarchiver/staging`; see [session.md](session.md)).
 
 If that directory already exists when `build_staging` is called (left over from
 a prior crash), it is logged as a warning and removed before a fresh directory
