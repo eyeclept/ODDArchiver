@@ -249,44 +249,72 @@ def _backend_id(backend: "BurnBackend") -> str:
     return "unknown"
 
 
-def _read_disc_manifests(backend: "BurnBackend") -> list[Manifest]:
+def _read_disc_manifests(
+    backend: "BurnBackend",
+    crypto: "CryptoBackend | None" = None,
+) -> list[Manifest]:
     """
     Input:  backend — BurnBackend to read from
+            crypto  — CryptoBackend for encrypted manifests (None → plaintext only)
     Output: list of Manifest objects in ascending session order (may be empty)
     Details:
-        Reads all session manifests; skips unreadable sessions without error.
+        Tries manifest.enc before manifest.json for each session so encrypted
+        and plaintext sessions can coexist on the same disc.
     """
     disc_info = backend.mediainfo()
     manifests: list[Manifest] = []
     with tempfile.TemporaryDirectory(prefix="oddarchiver_cli_") as tmp:
         tmp_path = Path(tmp)
         for s in range(disc_info.session_count):
-            disc_path = f"session_{s:03d}/manifest.json"
-            try:
-                data = backend.read_path(disc_path)
-            except OSError:
+            data: bytes | None = None
+            suffix = ".json"
+            for disc_path in (
+                f"session_{s:03d}/manifest.enc",
+                f"session_{s:03d}/manifest.json",
+            ):
+                try:
+                    data = backend.read_path(disc_path)
+                    suffix = Path(disc_path).suffix
+                    break
+                except OSError:
+                    continue
+            if data is None:
                 continue
-            tmp_file = tmp_path / f"manifest_{s:03d}.json"
+            tmp_file = tmp_path / f"manifest_{s:03d}{suffix}"
             tmp_file.write_bytes(data)
-            manifests.append(read_manifest(tmp_file))
+            manifests.append(read_manifest(tmp_file, crypto=crypto))
     return manifests
 
 
 def _crypto_for_disc(backend: "BurnBackend") -> "CryptoBackend":
     """
     Input:  backend — BurnBackend with at least one session
-    Output: CryptoBackend matching the encryption mode stored in session 0 manifest
+    Output: CryptoBackend matching the encryption mode stored on disc
     Details:
-        Reads encryption.mode from the first available manifest.
-        "none" → NullCrypto; "passphrase" → PassphraseCrypto via env var;
-        "keyfile" → raises NotImplementedError (key path not available post-init).
+        Reads enc_mode.json from session_000 to get the mode without needing
+        to decrypt the manifest first (breaks the circular dependency).
+        Falls back to reading the plaintext manifest.json encryption field
+        for discs written before encrypted-manifest support was added.
     """
-    manifests = _read_disc_manifests(backend)
-    if not manifests:
-        return NullCrypto()
-    enc = manifests[0].encryption
-    mode = enc.get("mode", "none")
-    if mode == "none" or not mode:
+    mode = "none"
+    try:
+        data = backend.read_path("session_000/enc_mode.json")
+        mode = json.loads(data).get("mode", "none")
+    except OSError:
+        # Older disc: no enc_mode.json — read plaintext manifest for mode.
+        try:
+            data = backend.read_path("session_000/manifest.json")
+            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
+                fh.write(data)
+                tmp_path = Path(fh.name)
+            m = read_manifest(tmp_path)
+            tmp_path.unlink(missing_ok=True)
+            if not m.suspect:
+                mode = m.encryption.get("mode", "none") or "none"
+        except OSError:
+            pass
+
+    if mode == "none":
         return make_crypto("none")
     if mode == "passphrase":
         passphrase = os.environ.get("ODDARCHIVER_PASSPHRASE", "")
@@ -305,7 +333,8 @@ def _make_init_crypto(args: argparse.Namespace) -> "CryptoBackend":
     Input:  args — parsed init namespace with --encrypt and optional --key
     Output: CryptoBackend for the requested mode
     Details:
-        For passphrase: reads ODDARCHIVER_PASSPHRASE env var or prompts.
+        For passphrase: reads ODDARCHIVER_PASSPHRASE env var or prompts twice
+        (confirmation loop) to catch typos before any data is written.
         For keyfile: reads the file at args.key.
     """
     mode = getattr(args, "encrypt", "none")
@@ -314,7 +343,12 @@ def _make_init_crypto(args: argparse.Namespace) -> "CryptoBackend":
     if mode == "passphrase":
         passphrase = os.environ.get("ODDARCHIVER_PASSPHRASE", "")
         if not passphrase:
-            passphrase = getpass.getpass("Passphrase: ")
+            while True:
+                passphrase = getpass.getpass("Passphrase: ")
+                confirm = getpass.getpass("Confirm passphrase: ")
+                if passphrase == confirm:
+                    break
+                print("Passphrases do not match. Try again.", file=sys.stderr)
         return make_crypto("passphrase", passphrase=passphrase.encode())
     if mode == "keyfile":
         key_path = getattr(args, "key", None)
@@ -349,6 +383,7 @@ def _patch_manifest(
     label: str,
     encryption: dict,
     drives: list[str] | None = None,
+    crypto: "CryptoBackend | None" = None,
 ) -> Manifest:
     """
     Input:  staging    — staging root directory
@@ -356,18 +391,21 @@ def _patch_manifest(
             label      — disc label to apply
             encryption — encryption block dict
             drives     — list of drive/ISO identifiers that will hold this session
+            crypto     — if provided (and non-null), rewrite manifest encrypted
     Output: updated Manifest (also written to disc atomically)
     Details:
-        Reads the manifest written by build_staging, sets label, encryption,
-        and drives, then rewrites it atomically so the burnt manifest is complete.
+        Reads the provisional plaintext manifest written by build_staging,
+        sets label/encryption/drives, then rewrites atomically.
+        If crypto is non-null, the output is manifest.enc + enc_mode.json and
+        the provisional manifest.json is removed.
     """
     session_dir = staging / f"session_{session_n:03d}"
-    manifest = read_manifest(session_dir / "manifest.json")
+    manifest = read_manifest(session_dir / "manifest.json", crypto=None)
     manifest.label = label
     manifest.encryption = encryption
     if drives is not None:
         manifest.drives = drives
-    write_manifest(session_dir, manifest)
+    write_manifest(session_dir, manifest, crypto=crypto)
     return manifest
 
 
@@ -417,10 +455,14 @@ def _run_dry_run(args: argparse.Namespace, is_init: bool = False) -> int:
         Scans source, diffs, computes delta sizes for changed files, prints
         rsync-style report.  Space overage is reported but never causes exit 1.
         No burn, no cache update, no manifest written to disc.
+        Hashing progress is shown inline; file list is printed after.
     """
     import hashlib
     from oddarchiver.delta import delta_or_full
-    from oddarchiver.session import SPACE_SAFETY_MARGIN
+    from oddarchiver.session import SPACE_SAFETY_MARGIN, _print_bar
+
+    print("DRY RUN -- no disc will be written")
+    print()
 
     backend = _make_backend(args)
     disc_info = backend.mediainfo()
@@ -444,31 +486,42 @@ def _run_dry_run(args: argparse.Namespace, is_init: bool = False) -> int:
         crypto = _crypto_for_disc(backend)
 
     source = Path(args.source)
+
+    # Collect paths first so we know the total for the bar.
+    print(f"Scanning {source} ...", flush=True)
     source_files = sorted(f for f in source.rglob("*") if f.is_file())
-    current_state = {
-        str(f.relative_to(source)): hashlib.sha256(f.read_bytes()).hexdigest()
-        for f in source_files
-    }
-    total_source_bytes = sum(f.stat().st_size for f in source_files)
+    total_files = len(source_files)
+    print(f"  {total_files} file(s) found. Hashing...", flush=True)
+
+    current_state: dict[str, str] = {}
+    total_source_bytes = 0
+    for i, f in enumerate(source_files, 1):
+        rel = str(f.relative_to(source))
+        data = f.read_bytes()
+        current_state[rel] = hashlib.sha256(data).hexdigest()
+        total_source_bytes += len(data)
+        _print_bar(i, total_files, suffix=rel)
+    if total_files:
+        print()
 
     changed = {p for p in current_state if p in disc_state and current_state[p] != disc_state[p]}
     new_files = {p for p in current_state if p not in disc_state}
     unchanged_count = len(current_state) - len(changed) - len(new_files)
 
-    print("DRY RUN -- no disc will be written")
-    print()
-    print(
-        f"Scanning source: {source} "
-        f"({len(current_state)} files, {_fmt_bytes(total_source_bytes)})"
-    )
-    print(f"Reading disc state: {label}, session {disc_info.session_count}")
+    print(f"  Disc state: {label}, session {disc_info.session_count}")
+    print(f"  {len(new_files)} new, {len(changed)} changed, {unchanged_count} unchanged")
     print()
 
     if not changed and not new_files:
         print("No changes detected.")
         return 0
 
-    print("Changes detected:")
+    change_count = len(changed) + len(new_files)
+    print(
+        f"Changes ({change_count} files, {_fmt_bytes(total_source_bytes)} total source):"
+        f"  (note: real run adds encryption + staging overhead)"
+    )
+
     cache = CacheManager()
     total_session_bytes = 0
     entry_count = 0
@@ -511,21 +564,21 @@ def _run_dry_run(args: argparse.Namespace, is_init: bool = False) -> int:
     print()
     print(f"  {entry_count} files to write, {unchanged_count} unchanged")
     print()
-    print(f"Session size:        {_fmt_bytes(total_session_bytes)}")
-    print(f"Disc remaining:      {_fmt_bytes(disc_info.remaining_bytes)}")
+    print(f"Session size (unencrypted): {_fmt_bytes(total_session_bytes)}")
+    print(f"Disc remaining:             {_fmt_bytes(disc_info.remaining_bytes)}")
 
     limit = disc_info.remaining_bytes * SPACE_SAFETY_MARGIN
     if disc_info.remaining_bytes > 0 and total_session_bytes < limit:
         pct = 100.0 * total_session_bytes / disc_info.remaining_bytes
-        print(f"Space check:         OK (session is {pct:.2f}% of remaining)")
+        print(f"Space check:                OK (session is {pct:.2f}% of remaining)")
     elif disc_info.remaining_bytes > 0:
         pct = 100.0 * total_session_bytes / disc_info.remaining_bytes
         print(
-            f"Space check:         OVERAGE "
+            f"Space check:                OVERAGE "
             f"({_fmt_bytes(total_session_bytes)} is {pct:.1f}% of remaining -- would not fit)"
         )
     else:
-        print("Space check:         OVERAGE (disc full)")
+        print("Space check:                OVERAGE (disc full)")
 
     print()
     print(f"Would burn as: session_{session_n:03d} on {label}")
@@ -578,20 +631,27 @@ def _run_init(args: argparse.Namespace) -> int:
         crypto=crypto,
     )
     try:
-        manifest = _patch_manifest(staging, 0, args.label, enc_block, drives=drives)
+        manifest = _patch_manifest(staging, 0, args.label, enc_block, drives=drives, crypto=crypto)
+        print(f"Burning session 000 to {_backend_id(backend)} ...", flush=True)
         backend.init(staging, args.label, expected_session_count=0)
+        print("  Burn complete.", flush=True)
         if mirror_backend:
             try:
+                print(f"Burning mirror to {_backend_id(mirror_backend)} ...", flush=True)
                 mirror_backend.init(staging, args.label, expected_session_count=0)
+                print("  Mirror burn complete.", flush=True)
             except Exception as exc:
                 _log.error("Mirror burn failed for session 0: %s", exc)
                 print(f"error: mirror burn failed: {exc}", file=sys.stderr)
                 return 1
         try:
+            print("Verifying burn (fast)...", flush=True)
             verify_mod.verify(backend, crypto, level="fast")
+            print("  Verify OK.", flush=True)
         except SystemExit:
             print("error: post-burn verify failed; cache not updated.", file=sys.stderr)
             return 1
+        print("Updating cache...", flush=True)
         _update_cache(cache, staging, 0, manifest.entries)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -626,9 +686,9 @@ def _run_sync(args: argparse.Namespace) -> int:
         if isinstance(backend, ISOBackend):
             backend.prefill(parse_disc_size(args.prefill))
 
-    manifests = _read_disc_manifests(backend)
-    disc_state = build_disc_state(manifests)
     crypto = _crypto_for_disc(backend)
+    manifests = _read_disc_manifests(backend, crypto=crypto)
+    disc_state = build_disc_state(manifests)
     enc_block = _encryption_block(crypto)
     label = manifests[0].label if manifests else "ARCHIVE"
 
@@ -667,20 +727,27 @@ def _run_sync(args: argparse.Namespace) -> int:
         crypto=crypto,
     )
     try:
-        manifest = _patch_manifest(staging, session_n, label, enc_block, drives=drives)
+        manifest = _patch_manifest(staging, session_n, label, enc_block, drives=drives, crypto=crypto)
+        print(f"Burning session {session_n:03d} to {_backend_id(backend)} ...", flush=True)
         backend.append(staging, label, expected_session_count=session_n)
+        print("  Burn complete.", flush=True)
         if mirror_backend:
             try:
+                print(f"Burning mirror to {_backend_id(mirror_backend)} ...", flush=True)
                 mirror_backend.append(staging, label, expected_session_count=session_n)
+                print("  Mirror burn complete.", flush=True)
             except Exception as exc:
                 _log.error("Mirror burn failed for session %d: %s", session_n, exc)
                 print(f"error: mirror burn failed: {exc}", file=sys.stderr)
                 return 1
         try:
+            print("Verifying burn (fast)...", flush=True)
             verify_mod.verify(backend, crypto, level="fast")
+            print("  Verify OK.", flush=True)
         except SystemExit:
             print("error: post-burn verify failed; cache not updated.", file=sys.stderr)
             return 1
+        print("Updating cache...", flush=True)
         _update_cache(cache, staging, session_n, manifest.entries)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -719,7 +786,8 @@ def _run_history(args: argparse.Namespace) -> int:
         Columns: session, timestamp, files, total_bytes, encryption mode.
     """
     backend = _make_backend(args)
-    manifests = _read_disc_manifests(backend)
+    crypto = _crypto_for_disc(backend)
+    manifests = _read_disc_manifests(backend, crypto=crypto)
 
     if not manifests:
         print("No sessions found.")
@@ -795,6 +863,7 @@ def _run_status(args: argparse.Namespace) -> int:
         warnings, and any SUSPECT manifests.
     """
     backend = _make_backend(args)
+    crypto = _crypto_for_disc(backend)
     disc_info = backend.mediainfo()
 
     used_pct = (
@@ -810,7 +879,7 @@ def _run_status(args: argparse.Namespace) -> int:
 
     check_capacity(used_pct, disc_info.remaining_bytes, _log)
 
-    manifests = _read_disc_manifests(backend)
+    manifests = _read_disc_manifests(backend, crypto=crypto)
     suspects = [m for m in manifests if m.suspect]
     if suspects:
         print(f"\nSUSPECT sessions ({len(suspects)}):")

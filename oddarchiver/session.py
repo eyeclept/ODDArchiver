@@ -34,6 +34,38 @@ _log = logging.getLogger(__name__)
 
 # Functions
 
+
+def _blob_id(session_n: int, rel_path: str) -> str:
+    """
+    Input:  session_n — session index
+            rel_path  — relative source path
+    Output: 64-char hex string used as the on-disc blob filename
+    Details:
+        sha256(session_n:rel_path) — deterministic, opaque, collision-free.
+        Stored flat in full/ or deltas/ with no extension so the disc
+        directory tree reveals nothing about the original file names or layout.
+    """
+    import hashlib
+    return hashlib.sha256(f"{session_n}:{rel_path}".encode()).hexdigest()
+
+
+def _print_bar(current: int, total: int, suffix: str = "", bar_width: int = 35) -> None:
+    """
+    Input:  current   — items completed
+            total     — total items
+            suffix    — short label appended after the counter (truncated to 40 chars)
+            bar_width — number of characters in the bar itself
+    Output: None (writes to stdout, no newline — caller prints newline when done)
+    Details:
+        Uses carriage-return overwrite so successive calls update in-place.
+    """
+    pct = current / total if total > 0 else 1.0
+    filled = int(bar_width * pct)
+    bar = "█" * filled + "░" * (bar_width - filled)
+    label = suffix[:40].ljust(40)
+    print(f"\r  [{bar}] {current}/{total}  {label}", end="", flush=True)
+
+
 _sigint_received = False
 
 
@@ -102,7 +134,7 @@ def build_staging(
     """
     global _sigint_received
     _sigint_received = False
-    signal.signal(signal.SIGINT, _handle_sigint)
+    old_sigint = signal.signal(signal.SIGINT, _handle_sigint)
 
     root = _staging_root if _staging_root is not None else Path(tempfile.gettempdir())
     staging = root / f"oddarchiver_staging_{session_n:03d}"
@@ -120,12 +152,20 @@ def build_staging(
         full_dir.mkdir(parents=True, exist_ok=True)
         deltas_dir.mkdir(parents=True, exist_ok=True)
 
-        # Step 3: scan source
+        # Step 3: scan source — collect paths first so we know the total for the bar
+        print(f"Scanning {source} ...", flush=True)
+        source_files = sorted(f for f in source.rglob("*") if f.is_file())
+        total_files = len(source_files)
+        print(f"  {total_files} file(s) found. Hashing...", flush=True)
         current_state: dict[str, str] = {}
-        for src_file in sorted(source.rglob("*")):
-            if src_file.is_file():
-                rel = str(src_file.relative_to(source))
-                current_state[rel] = _sha256_file(src_file)
+        for i, src_file in enumerate(source_files, 1):
+            if _sigint_received:
+                raise KeyboardInterrupt
+            rel = str(src_file.relative_to(source))
+            current_state[rel] = _sha256_file(src_file)
+            _print_bar(i, total_files, suffix=rel)
+        if total_files:
+            print()  # newline after bar
 
         # Step 4: diff
         changed = {
@@ -135,11 +175,20 @@ def build_staging(
         new_files = {p for p in current_state if p not in disc_state}
         deleted = [p for p in disc_state if p not in current_state]
 
+        print(
+            f"  {len(new_files)} new, {len(changed)} changed, {len(deleted)} deleted",
+            flush=True,
+        )
+
         entries: list[ManifestEntry] = []
         base_session = session_n - 1
 
         # Step 5: stage changed files
-        for rel_path, new_checksum in changed.items():
+        if changed:
+            print(f"Staging {len(changed)} changed file(s)...", flush=True)
+        for idx, (rel_path, new_checksum) in enumerate(changed.items(), 1):
+            if _sigint_received:
+                raise KeyboardInterrupt
             abs_path = source / rel_path
             encrypted_old = cache.get_with_fallback(rel_path, base_session, backend)
             old_bytes = crypto.decrypt(encrypted_old)
@@ -147,12 +196,12 @@ def build_staging(
             kind, blob = delta_or_full(old_bytes, abs_path)
             encrypted_blob = crypto.encrypt(blob)
 
+            blob_id = _blob_id(session_n, rel_path)
             if kind == "delta":
-                dest = deltas_dir / (rel_path + ".xdelta")
+                dest = deltas_dir / blob_id
             else:
-                dest = full_dir / rel_path
+                dest = full_dir / blob_id
 
-            dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(encrypted_blob)
 
             entries.append(ManifestEntry(
@@ -161,21 +210,28 @@ def build_staging(
                 result_checksum=new_checksum,
                 full_size_bytes=abs_path.stat().st_size,
                 source_checksum=disc_state.get(rel_path, ""),
-                delta_file=f"{session_name}/deltas/{rel_path}.xdelta" if kind == "delta" else "",
+                delta_file=f"{session_name}/deltas/{blob_id}" if kind == "delta" else "",
                 delta_size_bytes=len(blob) if kind == "delta" else 0,
-                file=f"{session_name}/full/{rel_path}" if kind == "full" else "",
+                file=f"{session_name}/full/{blob_id}" if kind == "full" else "",
             ))
 
+            _print_bar(idx, len(changed), suffix=f"[{kind}] {rel_path}")
             _log.info("staged %s as %s", rel_path, kind)
+        if changed:
+            print()
 
         # Step 6: stage new files
-        for rel_path in sorted(new_files):
+        if new_files:
+            print(f"Staging {len(new_files)} new file(s)...", flush=True)
+        for idx, rel_path in enumerate(sorted(new_files), 1):
+            if _sigint_received:
+                raise KeyboardInterrupt
             abs_path = source / rel_path
             file_bytes = abs_path.read_bytes()
             encrypted_blob = crypto.encrypt(file_bytes)
 
-            dest = full_dir / rel_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            blob_id = _blob_id(session_n, rel_path)
+            dest = full_dir / blob_id
             dest.write_bytes(encrypted_blob)
 
             entries.append(ManifestEntry(
@@ -183,15 +239,19 @@ def build_staging(
                 type="full",
                 result_checksum=_sha256_file(abs_path),
                 full_size_bytes=abs_path.stat().st_size,
-                file=f"{session_name}/full/{rel_path}",
+                file=f"{session_name}/full/{blob_id}",
             ))
 
+            _print_bar(idx, len(new_files), suffix=rel_path)
             _log.info("staged new file %s", rel_path)
+        if new_files:
+            print()
 
         if _sigint_received:
             raise KeyboardInterrupt
 
         # Space check
+        print("Checking available disc space...", flush=True)
         used = _staging_bytes(staging)
         disc_info = backend.mediainfo()
         limit = disc_info.remaining_bytes * SPACE_SAFETY_MARGIN
@@ -202,12 +262,15 @@ def build_staging(
             )
             raise SystemExit(1)
 
+        pct = 100.0 * used / disc_info.remaining_bytes if disc_info.remaining_bytes else 0
+        print(f"  OK — session is {pct:.1f}% of remaining space.", flush=True)
         _log.info(
             "Space check OK: staging %d bytes, remaining %d bytes",
             used, disc_info.remaining_bytes,
         )
 
         # Step 7: write manifest
+        print("Writing session manifest...", flush=True)
         manifest = Manifest(
             version=1,
             session=session_n,
@@ -220,7 +283,7 @@ def build_staging(
             deleted=deleted,
             manifest_checksum="",
         )
-        write_manifest(session_dir, manifest)
+        write_manifest(session_dir, manifest)  # plaintext; _patch_manifest encrypts on burn
 
         _log.info(
             "Staged %s: %d new, %d changed, %d deleted",
@@ -231,6 +294,8 @@ def build_staging(
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
 
 
 if __name__ == "__main__":

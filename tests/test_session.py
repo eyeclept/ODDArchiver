@@ -68,9 +68,11 @@ def test_new_files_staged_in_full_dir(tmp_path):
         _staging_root=tmp_path / "staging",
     )
     try:
-        full_dir = staging / "session_000" / "full"
-        assert (full_dir / "hello.txt").exists()
-        assert (full_dir / "sub" / "data.bin").exists()
+        from oddarchiver.manifest import read_manifest
+        manifest = read_manifest(staging / "session_000" / "manifest.json")
+        assert len(manifest.entries) == 2
+        for entry in manifest.entries:
+            assert (staging / entry.file).exists(), f"blob missing: {entry.file}"
     finally:
         import shutil
         shutil.rmtree(staging, ignore_errors=True)
@@ -105,8 +107,12 @@ def test_changed_files_staged_in_deltas_dir(tmp_path):
         _staging_root=tmp_path / "staging",
     )
     try:
-        deltas_dir = staging / "session_001" / "deltas"
-        assert (deltas_dir / "doc.txt.xdelta").exists()
+        from oddarchiver.manifest import read_manifest
+        manifest = read_manifest(staging / "session_001" / "manifest.json")
+        delta_entries = [e for e in manifest.entries if e.type == "delta"]
+        assert len(delta_entries) == 1, "expected one delta entry"
+        assert (staging / delta_entries[0].delta_file).exists(), \
+            f"delta blob missing: {delta_entries[0].delta_file}"
     finally:
         import shutil
         shutil.rmtree(staging, ignore_errors=True)

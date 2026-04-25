@@ -205,3 +205,43 @@ def test_parse_mediainfo_parses_fields():
     assert info.remaining_bytes == 10000 * 2048
     assert info.used_bytes == 2000 * 2048
     assert info.label == "MYDISC"
+
+
+def test_parse_mediainfo_blank_disc_returns_zero_sessions():
+    """
+    Input:  None
+    Output: None
+    Details:
+        Blank BD-R discs report "Number of Sessions: 1" with "Disc status: blank".
+        _parse_mediainfo must return session_count=0 so init() proceeds instead
+        of reporting "disc already initialized".
+        Regression for bug: false "disc already initialized" on blank BD-R media.
+    """
+    fixture = (
+        "Disc status:           blank\n"
+        "Number of Sessions:    1\n"
+        "State of Last Session: empty\n"
+        "Next Writable Address: 0\n"
+        "Free Blocks:           12219392*2KB\n"
+    )
+    info = _parse_mediainfo(fixture)
+    assert info.session_count == 0
+    assert info.remaining_bytes == 12219392 * 2048
+
+
+def test_parse_mediainfo_empty_last_session_returns_zero_sessions():
+    """
+    Input:  None
+    Output: None
+    Details:
+        Some drives omit "Disc status" but report "State of Last Session: empty"
+        with a single session. _parse_mediainfo must treat this as 0 sessions.
+    """
+    fixture = (
+        "Number of Sessions:    1\n"
+        "State of Last Session: empty\n"
+        "Free Blocks:           5000*2KB\n"
+    )
+    info = _parse_mediainfo(fixture)
+    assert info.session_count == 0
+    assert info.remaining_bytes == 5000 * 2048

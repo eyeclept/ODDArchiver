@@ -101,7 +101,7 @@ class DiscBackend(BurnBackend):
         self._guard(expected_session_count)
         cmd = [
             "growisofs", "-Z", self.device,
-            "-R", "-J", "-udf", "-T",
+            "-R", "-udf", "-T",
             "-V", label,
             str(staging),
         ]
@@ -119,7 +119,7 @@ class DiscBackend(BurnBackend):
         self._guard(expected_session_count)
         cmd = [
             "growisofs", "-M", self.device,
-            "-R", "-J", "-udf", "-T",
+            "-R", "-udf", "-T",
             "-V", label,
             str(staging),
         ]
@@ -303,18 +303,15 @@ class ISOBackend(BurnBackend):
         tmp = self.iso_path.with_suffix(".tmp")
         cmd = [
             "genisoimage",
-            "-udf", "-R", "-J",
+            "-udf", "-R",
             "-V", label[:32],
             "-o", str(tmp),
             str(self._sessions_root),
         ]
-        result = subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd)
         if result.returncode != 0:
             tmp.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"genisoimage failed (exit {result.returncode}): "
-                f"{result.stderr.decode(errors='replace').strip()}"
-            )
+            raise RuntimeError(f"genisoimage failed (exit {result.returncode})")
         tmp.rename(self.iso_path)
 
     def _read_prefill(self) -> int:
@@ -388,17 +385,38 @@ def _parse_mediainfo(stdout: str) -> DiscInfo:
     Details:
         Extracts session count, remaining blocks (2KB units), total capacity,
         and label. Remaining and capacity blocks are multiplied by 2048.
+        Blank BD-R discs report "Number of Sessions: 1" with an implicit empty
+        session; these are treated as 0 written sessions.
     """
     session_match = re.search(r"Sessions:\s+(\d+)", stdout)
     remaining_match = re.search(r"Remaining:\s+(\d+)\*2KB", stdout)
+    free_blocks_match = re.search(r"Free Blocks:\s+(\d+)\*2KB", stdout)
     capacity_match = re.search(r"READ CAPACITY:\s+(\d+)\*2KB", stdout)
     label_match = re.search(r"Volume id:\s+(\S+)", stdout, re.IGNORECASE)
+    disc_status_match = re.search(r"Disc status:\s+(\S+)", stdout, re.IGNORECASE)
+    last_session_match = re.search(r"State of Last Session:\s+(\S+)", stdout, re.IGNORECASE)
 
     session_count = int(session_match.group(1)) if session_match else 0
-    remaining_bytes = int(remaining_match.group(1)) * 2048 if remaining_match else 0
+
+    # Blank discs report Remaining: or Free Blocks: but not both; prefer Remaining:.
+    if remaining_match:
+        remaining_bytes = int(remaining_match.group(1)) * 2048
+    elif free_blocks_match:
+        remaining_bytes = int(free_blocks_match.group(1)) * 2048
+    else:
+        remaining_bytes = 0
+
     total_bytes = int(capacity_match.group(1)) * 2048 if capacity_match else 0
     used_bytes = max(0, total_bytes - remaining_bytes)
     label = label_match.group(1) if label_match else ""
+
+    disc_status = disc_status_match.group(1).lower() if disc_status_match else ""
+    last_session_state = last_session_match.group(1).lower() if last_session_match else ""
+
+    # A blank BD-R reports "Number of Sessions: 1" for the implicit empty session.
+    # Treat the disc as uninitialized so init() proceeds rather than skipping.
+    if disc_status == "blank" or (last_session_state == "empty" and session_count == 1):
+        session_count = 0
 
     return DiscInfo(
         session_count=session_count,

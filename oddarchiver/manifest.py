@@ -17,7 +17,10 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from oddarchiver.crypto import CryptoBackend
 
 # Globals
 MANIFEST_VERSION = 1
@@ -56,14 +59,21 @@ class Manifest:
     suspect: bool = field(default=False, compare=False)
 
 
-def write_manifest(staging_path: Path, manifest: Manifest) -> None:
+def write_manifest(
+    staging_path: Path,
+    manifest: Manifest,
+    crypto: "CryptoBackend | None" = None,
+) -> None:
     """
-    Input:  staging_path — directory where manifest.json will be written
+    Input:  staging_path — directory where the manifest will be written
             manifest     — Manifest dataclass instance
+            crypto       — if provided (and not NullCrypto), write manifest.enc
+                           and enc_mode.json; otherwise write manifest.json
     Output: None
     Details:
         Writes atomically via .tmp then rename.
-        Sets manifest_checksum before writing.
+        Sets manifest_checksum over plaintext JSON before encrypting.
+        Removes the opposite format file if it exists (enc ↔ json swap).
     """
     d = dataclasses.asdict(manifest)
     d.pop("suspect", None)
@@ -71,29 +81,84 @@ def write_manifest(staging_path: Path, manifest: Manifest) -> None:
     d["manifest_checksum"] = _compute_checksum(d)
     manifest.manifest_checksum = d["manifest_checksum"]
 
-    dest = staging_path / "manifest.json"
-    tmp = dest.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    json_bytes = json.dumps(d, indent=2).encode("utf-8")
+
+    # Lazy import to avoid circular dependency at module load time.
+    use_crypto = False
+    if crypto is not None:
+        from oddarchiver.crypto import NullCrypto
+        use_crypto = not isinstance(crypto, NullCrypto)
+
+    if use_crypto:
+        payload = crypto.encrypt(json_bytes)  # type: ignore[union-attr]
+        dest = staging_path / "manifest.enc"
+        tmp = staging_path / "manifest.enc.tmp"
+        # Write tiny plaintext mode indicator so _crypto_for_disc can determine
+        # the encryption mode without first decrypting the manifest.
+        from oddarchiver.crypto import PassphraseCrypto, KeyfileCrypto
+        if isinstance(crypto, PassphraseCrypto):
+            mode = "passphrase"
+        elif isinstance(crypto, KeyfileCrypto):
+            mode = "keyfile"
+        else:
+            mode = "none"
+        (staging_path / "enc_mode.json").write_text(
+            json.dumps({"mode": mode}), encoding="utf-8"
+        )
+        (staging_path / "manifest.json").unlink(missing_ok=True)
+    else:
+        payload = json_bytes
+        dest = staging_path / "manifest.json"
+        tmp = staging_path / "manifest.json.tmp"
+        (staging_path / "manifest.enc").unlink(missing_ok=True)
+        (staging_path / "enc_mode.json").unlink(missing_ok=True)
+
+    tmp.write_bytes(payload)
     os.replace(tmp, dest)
 
 
-def read_manifest(path: Path) -> Manifest:
+def read_manifest(
+    path: Path,
+    crypto: "CryptoBackend | None" = None,
+) -> Manifest:
     """
-    Input:  path — path to manifest.json
+    Input:  path   — path to manifest.json (or manifest.enc)
+            crypto — required when the manifest is encrypted; ignored otherwise
     Output: Manifest — parsed and checksum-validated manifest
     Details:
-        Validates manifest_checksum (sha256 of manifest with that field set to "").
-        Sets manifest.suspect = True on checksum mismatch; does not raise.
+        If path is manifest.json but does not exist, falls back to manifest.enc
+        in the same directory (backward compat with encrypted sessions).
+        Validates manifest_checksum over plaintext JSON.
+        Sets manifest.suspect = True on any parse/decrypt/checksum failure.
     """
+    actual = path
+    if path.suffix == ".json" and not path.exists():
+        enc_candidate = path.with_name("manifest.enc")
+        if enc_candidate.exists():
+            actual = enc_candidate
+
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw_bytes = actual.read_bytes()
+    except OSError as exc:
+        logging.warning("SUSPECT manifest at %s: cannot read: %s", path, exc)
+        return _suspect_manifest()
+
+    if actual.suffix == ".enc":
+        if crypto is None:
+            logging.warning("SUSPECT manifest at %s: encrypted but no crypto provided", path)
+            return _suspect_manifest()
+        try:
+            raw_bytes = crypto.decrypt(raw_bytes)
+        except Exception as exc:
+            logging.warning("SUSPECT manifest at %s: decryption failed: %s", path, exc)
+            return _suspect_manifest()
+
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         logging.warning("SUSPECT manifest at %s: cannot parse JSON: %s", path, exc)
-        return Manifest(
-            version=0, session=-1, timestamp="", source="", label="",
-            based_on_session=None, encryption={}, entries=[], deleted=[],
-            manifest_checksum="", suspect=True,
-        )
+        return _suspect_manifest()
+
     stored_checksum = raw.get("manifest_checksum", "")
     check_dict = {k: v for k, v in raw.items() if k != "suspect"}
     check_dict["manifest_checksum"] = ""
@@ -118,6 +183,15 @@ def read_manifest(path: Path) -> Manifest:
     if suspect:
         logging.warning("SUSPECT manifest at %s: checksum mismatch", path)
     return manifest
+
+
+def _suspect_manifest() -> Manifest:
+    """Return a blank SUSPECT manifest for error paths."""
+    return Manifest(
+        version=0, session=-1, timestamp="", source="", label="",
+        based_on_session=None, encryption={}, entries=[], deleted=[],
+        manifest_checksum="", suspect=True,
+    )
 
 
 def build_disc_state(manifests: list[Manifest]) -> dict[str, str]:

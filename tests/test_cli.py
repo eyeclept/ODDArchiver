@@ -134,8 +134,7 @@ def test_passphrase_prompt_uses_getpass(tmp_path):
     Output: None
     Details:
         B2 regression: passphrase prompt must use getpass.getpass, not input().
-        Asserts getpass.getpass is called when --encrypt passphrase is used
-        and no env var is set.
+        Prompts twice (passphrase + confirm); both return same value so loop exits.
     """
     parser = build_parser()
     args = parser.parse_args(["init", str(tmp_path), "--encrypt", "passphrase"])
@@ -144,7 +143,28 @@ def test_passphrase_prompt_uses_getpass(tmp_path):
             import os
             os.environ.pop("ODDARCHIVER_PASSPHRASE", None)
             crypto = _make_init_crypto(args)
-    mock_gp.assert_called_once()
-    # Verify crypto actually works (round-trip)
+    assert mock_gp.call_count == 2  # passphrase prompt + confirm prompt
+    from oddarchiver.crypto import PassphraseCrypto
+    assert isinstance(crypto, PassphraseCrypto)
+
+
+def test_passphrase_confirm_mismatch_retries(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        When passphrase and confirm do not match, the loop retries.
+        Sequence: wrong/wrong, wrong/wrong, correct/correct — getpass called 6x.
+    """
+    parser = build_parser()
+    args = parser.parse_args(["init", str(tmp_path), "--encrypt", "passphrase"])
+    # Alternate: (pass1, confirm_bad), (pass2, confirm_bad2), (good, good)
+    side_effects = ["aaa", "bbb", "ccc", "ddd", "final", "final"]
+    with patch("oddarchiver.cli.getpass.getpass", side_effect=side_effects) as mock_gp:
+        with patch("oddarchiver.cli.sys.stderr"):
+            import os
+            os.environ.pop("ODDARCHIVER_PASSPHRASE", None)
+            crypto = _make_init_crypto(args)
+    assert mock_gp.call_count == 6
     from oddarchiver.crypto import PassphraseCrypto
     assert isinstance(crypto, PassphraseCrypto)

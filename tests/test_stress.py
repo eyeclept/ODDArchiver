@@ -368,12 +368,15 @@ def test_6_2_encrypted_storage_differs_from_plaintext(tmp_path):
     )
     try:
         from oddarchiver.cli import _patch_manifest, _encryption_block
+        from oddarchiver.manifest import read_manifest
+        manifest = read_manifest(staging / "session_000" / "manifest.json")
+        entry = manifest.entries[0]
         _patch_manifest(staging, 0, "STRESS", _encryption_block(crypto))
         backend.init(staging, "STRESS", expected_session_count=0)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
-    blob = backend.read_path("session_000/full/data.txt")
+    blob = backend.read_path(entry.file)
     assert blob != plaintext, "encrypted blob must not equal plaintext"
     assert plaintext not in blob, "plaintext must not appear verbatim in ciphertext"
 

@@ -60,7 +60,7 @@ def restore(
         _log.warning("No sessions found on disc; nothing to restore.")
         return (0, 0)
 
-    file_chains, deleted_at = _build_chains(_read_manifests(backend, max_session))
+    file_chains, deleted_at = _build_chains(_read_manifests(backend, max_session, crypto))
 
     restored = 0
     failures = 0
@@ -159,28 +159,42 @@ def _process_file(
     return "restored"
 
 
-def _read_manifests(backend: "BurnBackend", max_session: int) -> list:
+def _read_manifests(
+    backend: "BurnBackend",
+    max_session: int,
+    crypto: "CryptoBackend | None" = None,
+) -> list:
     """
     Input:  backend     — BurnBackend to read from
             max_session — highest session index to read (inclusive)
+            crypto      — CryptoBackend for encrypted manifests (None → plaintext)
     Output: list of Manifest objects in ascending session order
     Details:
-        Reads manifest.json for each session; skips unreadable sessions.
+        Tries manifest.enc before manifest.json for each session.
         Uses a temp directory so read_manifest() can operate on real files.
     """
     manifests = []
     with tempfile.TemporaryDirectory(prefix="oddarchiver_restore_") as tmp:
         tmp_path = Path(tmp)
         for s in range(max_session + 1):
-            disc_path = f"session_{s:03d}/manifest.json"
-            try:
-                data = backend.read_path(disc_path)
-            except OSError as exc:
-                _log.error("Cannot read manifest for session %d: %s", s, exc)
+            data: bytes | None = None
+            suffix = ".json"
+            for disc_path in (
+                f"session_{s:03d}/manifest.enc",
+                f"session_{s:03d}/manifest.json",
+            ):
+                try:
+                    data = backend.read_path(disc_path)
+                    suffix = Path(disc_path).suffix
+                    break
+                except OSError:
+                    continue
+            if data is None:
+                _log.error("Cannot read manifest for session %d", s)
                 continue
-            tmp_file = tmp_path / f"manifest_{s:03d}.json"
+            tmp_file = tmp_path / f"manifest_{s:03d}{suffix}"
             tmp_file.write_bytes(data)
-            manifests.append(read_manifest(tmp_file))
+            manifests.append(read_manifest(tmp_file, crypto=crypto))
     return manifests
 
 

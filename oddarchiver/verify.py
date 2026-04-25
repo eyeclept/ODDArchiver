@@ -64,7 +64,7 @@ def verify(
 
     with tempfile.TemporaryDirectory(prefix="oddarchiver_verify_") as tmp:
         tmp_path = Path(tmp)
-        manifests = _read_all_manifests(backend, max_session, tmp_path)
+        manifests = _read_all_manifests(backend, max_session, tmp_path, crypto=crypto)
 
         for s in range(max_session + 1):
             manifest = manifests.get(s)
@@ -102,24 +102,37 @@ def _read_all_manifests(
     backend: "BurnBackend",
     max_session: int,
     tmp_path: Path,
+    crypto: "CryptoBackend | None" = None,
 ) -> dict[int, Manifest]:
     """
     Input:  backend     — BurnBackend to read from
             max_session — inclusive upper bound
             tmp_path    — temp directory for manifest files
+            crypto      — CryptoBackend for encrypted manifests (None → plaintext)
     Output: dict mapping session index -> Manifest (missing sessions absent)
+    Details:
+        Tries manifest.enc before manifest.json for each session.
     """
     manifests: dict[int, Manifest] = {}
     for s in range(max_session + 1):
-        disc_path = f"session_{s:03d}/manifest.json"
-        try:
-            data = backend.read_path(disc_path)
-        except OSError as exc:
-            _log.error("Cannot read manifest for session %d: %s", s, exc)
+        data: bytes | None = None
+        suffix = ".json"
+        for disc_path in (
+            f"session_{s:03d}/manifest.enc",
+            f"session_{s:03d}/manifest.json",
+        ):
+            try:
+                data = backend.read_path(disc_path)
+                suffix = Path(disc_path).suffix
+                break
+            except OSError:
+                continue
+        if data is None:
+            _log.error("Cannot read manifest for session %d", s)
             continue
-        tmp_file = tmp_path / f"manifest_{s:03d}.json"
+        tmp_file = tmp_path / f"manifest_{s:03d}{suffix}"
         tmp_file.write_bytes(data)
-        manifests[s] = read_manifest(tmp_file)
+        manifests[s] = read_manifest(tmp_file, crypto=crypto)
     return manifests
 
 
