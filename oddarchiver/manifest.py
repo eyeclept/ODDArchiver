@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 # Globals
 MANIFEST_VERSION = 1
+_log = logging.getLogger(__name__)
 
 # Functions
 
@@ -140,23 +141,23 @@ def read_manifest(
     try:
         raw_bytes = actual.read_bytes()
     except OSError as exc:
-        logging.warning("SUSPECT manifest at %s: cannot read: %s", path, exc)
+        _log.warning("SUSPECT manifest at %s: cannot read: %s", path, exc)
         return _suspect_manifest()
 
     if actual.suffix == ".enc":
         if crypto is None:
-            logging.warning("SUSPECT manifest at %s: encrypted but no crypto provided", path)
+            _log.warning("SUSPECT manifest at %s: encrypted but no crypto provided", path)
             return _suspect_manifest()
         try:
             raw_bytes = crypto.decrypt(raw_bytes)
         except Exception as exc:
-            logging.warning("SUSPECT manifest at %s: decryption failed: %s", path, exc)
+            _log.warning("SUSPECT manifest at %s: decryption failed: %s", path, exc)
             return _suspect_manifest()
 
     try:
         raw = json.loads(raw_bytes.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        logging.warning("SUSPECT manifest at %s: cannot parse JSON: %s", path, exc)
+        _log.warning("SUSPECT manifest at %s: cannot parse JSON: %s", path, exc)
         return _suspect_manifest()
 
     stored_checksum = raw.get("manifest_checksum", "")
@@ -181,7 +182,7 @@ def read_manifest(
         suspect=suspect,
     )
     if suspect:
-        logging.warning("SUSPECT manifest at %s: checksum mismatch", path)
+        _log.warning("SUSPECT manifest at %s: checksum mismatch", path)
     return manifest
 
 
@@ -205,7 +206,7 @@ def build_disc_state(manifests: list[Manifest]) -> dict[str, str]:
     state: dict[str, str] = {}
     for m in manifests:
         if m.suspect:
-            logging.warning("Skipping SUSPECT manifest for session %d", m.session)
+            _log.warning("Skipping SUSPECT manifest for session %d", m.session)
             continue
         for entry in m.entries:
             state[entry.path] = entry.result_checksum

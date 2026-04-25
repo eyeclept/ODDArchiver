@@ -8,16 +8,30 @@
 
 ## Staging Directory Layout
 
-`build_staging` creates a temporary directory via `tempfile.mkdtemp` and populates it as follows:
+`build_staging` creates a temporary directory and populates it as follows:
 
 ```
 <tmpdir>/
 └── session_NNN/
-    ├── manifest.json
+    ├── manifest.json          ← provisional plaintext manifest (no label/encryption yet)
     ├── full/
-    │   └── <relative/path/to/new_or_full_file>   # encrypted
+    │   └── <sha256_blob_id>   ← encrypted blob, opaque filename
     └── deltas/
-        └── <relative/path/to/changed_file>.xdelta # encrypted delta
+        └── <sha256_blob_id>   ← encrypted delta blob, opaque filename
+```
+
+**Blob names** are `sha256(session_n:relative_path)` — deterministic, flat, and opaque. The original file name and directory structure are not visible anywhere in the disc layout.
+
+**Provisional manifest:** `build_staging` writes `manifest.json` with empty `label` and `encryption` fields. The CLI layer calls `_patch_manifest` after staging to set those fields and rewrite the manifest. When encryption is active, `_patch_manifest` replaces `manifest.json` with `manifest.enc` (encrypted) and writes `enc_mode.json` (tiny plaintext mode indicator). The final disc layout is therefore:
+
+```
+session_NNN/
+    ├── manifest.enc           ← encrypted manifest (passphrase/keyfile modes)
+    ├── enc_mode.json          ← {"mode": "passphrase"} — no key material
+    ├── full/
+    │   └── <sha256_blob_id>
+    └── deltas/
+        └── <sha256_blob_id>
 ```
 
 The caller receives the `<tmpdir>` path and is responsible for passing it to the burn backend. On any error (including Ctrl+C), the temp directory is removed automatically.
@@ -50,7 +64,7 @@ For each changed file:
 2. Decrypt to memory: `crypto.decrypt(encrypted_old)`.
 3. Compute `delta_or_full(old_bytes, new_path)` — returns `("delta", bytes)` or `("full", bytes)`.
 4. Encrypt result: `crypto.encrypt(blob)`.
-5. Write to `session_NNN/deltas/<path>.xdelta` (delta) or `session_NNN/full/<path>` (full).
+5. Write to `session_NNN/deltas/<blob_id>` (delta) or `session_NNN/full/<blob_id>` (full), where `<blob_id>` = `sha256(session_n:rel_path)`.
 
 Plaintext never touches the filesystem — all encrypt/decrypt happens in memory.
 
@@ -60,7 +74,7 @@ For each new file:
 
 1. Read file into memory.
 2. Encrypt: `crypto.encrypt(file_bytes)`.
-3. Write to `session_NNN/full/<relative_path>`.
+3. Write to `session_NNN/full/<blob_id>`, where `<blob_id>` = `sha256(session_n:rel_path)`.
 
 ### Space Check
 
@@ -73,9 +87,9 @@ If `staging_bytes >= limit`, logs ERROR and raises `SystemExit(1)`. The except c
 
 ### Step 7 — Write Manifest
 
-A `Manifest` is constructed with all `ManifestEntry` objects and the `deleted` list, then written atomically to `session_NNN/manifest.json` via `manifest.write_manifest`.
+A `Manifest` is constructed with all `ManifestEntry` objects and the `deleted` list, then written atomically to `session_NNN/manifest.json` as a provisional plaintext file via `manifest.write_manifest`.
 
-`label` and `encryption` fields are written as empty defaults; the caller (CLI layer) should fill these in before burning.
+`label` and `encryption` fields are empty at this stage. The CLI layer calls `_patch_manifest` afterward to set them and, when encryption is active, replace `manifest.json` with the encrypted `manifest.enc` + `enc_mode.json`.
 
 ---
 

@@ -12,7 +12,7 @@
 
 Run after every burn automatically. Does not read file blobs.
 
-- Re-reads each session's `manifest.json` off disc/ISO.
+- Re-reads each session's manifest off disc/ISO (`manifest.enc` or `manifest.json`; decrypts if needed).
 - Validates `manifest_checksum` (sha256 of manifest with the field set to `""`).
 - Checks `manifest.session` field matches the session directory index.
 - Checks timestamps are non-decreasing across sessions.

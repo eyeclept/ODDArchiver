@@ -1,6 +1,6 @@
 # ODDArchiver — Manifest Format
 
-Each session written to disc produces a `manifest.json` file stored at `session_NNN/manifest.json`. Manifests are the authoritative record of what was archived and how to reconstruct it.
+Each session written to disc produces a manifest stored at `session_NNN/`. When encryption is active the manifest is stored as `manifest.enc` (ciphertext) alongside a tiny plaintext `enc_mode.json`. For `NullCrypto` (mode `none`) the manifest is stored as `manifest.json`. Manifests are the authoritative record of what was archived and how to reconstruct it.
 
 ---
 
@@ -15,25 +15,32 @@ Each session written to disc produces a `manifest.json` file stored at `session_
   "label": "ARCHIVE",
   "based_on_session": null,
   "encryption": {
-    "mode": "none"
+    "mode": "passphrase",
+    "cipher": "chacha20-poly1305",
+    "kdf": "argon2id"
   },
   "entries": [
     {
       "path": "notes/todo.txt",
       "type": "full",
-      "file": "session_000/full/notes_todo.txt",
-      "result_checksum": "sha256:<hex>",
+      "file": "session_000/full/3a7f2b1c9e4d8f0a...",
+      "result_checksum": "<sha256-hex>",
       "full_size_bytes": 1024,
-      "source_checksum": "sha256:<hex>",
+      "source_checksum": "<sha256-hex>",
       "delta_file": "",
       "delta_size_bytes": 0,
       "encrypted_dek": ""
     }
   ],
   "deleted": [],
+  "drives": ["/dev/sr0"],
   "manifest_checksum": "<hex>"
 }
 ```
+
+When `encryption.mode` is `passphrase` or `keyfile`, this JSON is encrypted with the session passphrase/keyfile and stored as `manifest.enc`. Reading it requires the correct key.
+
+`enc_mode.json` is stored unencrypted alongside the manifest and contains only `{"mode": "passphrase"}` (or `"keyfile"` / `"none"`). It carries no key material and exists solely so commands can determine which passphrase prompt to show before decrypting the manifest.
 
 ### Top-level fields
 
@@ -56,8 +63,8 @@ Each session written to disc produces a `manifest.json` file stored at `session_
 |---|---|---|
 | `path` | `str` | Relative path within the source directory |
 | `type` | `str` | `"full"` or `"delta"` |
-| `file` | `str` | Disc-relative path to the stored full blob |
-| `delta_file` | `str` | Disc-relative path to the stored delta blob (delta entries only) |
+| `file` | `str` | Disc-relative path to the stored full blob (opaque sha256-based name) |
+| `delta_file` | `str` | Disc-relative path to the stored delta blob (opaque sha256-based name; delta entries only) |
 | `result_checksum` | `str` | SHA-256 of the reconstructed file after applying all deltas |
 | `source_checksum` | `str` | SHA-256 of the source file at scan time |
 | `full_size_bytes` | `int` | Size of the reconstructed file in bytes |
@@ -103,4 +110,4 @@ The result reflects the disc contents as of the last non-SUSPECT session.
 
 ## Atomic Writes
 
-`write_manifest` writes to `manifest.json.tmp` then calls `os.replace()` to rename atomically. A process crash during the write leaves a `.tmp` file but never a partial `manifest.json`.
+`write_manifest` writes to a `.tmp` sidecar then calls `os.replace()` to rename atomically. A process crash during the write leaves a `.tmp` file but never a partial manifest. When switching between encrypted and plaintext formats the opposite file is removed after the new one is in place.

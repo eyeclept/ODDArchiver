@@ -70,6 +70,20 @@ generate_keyfile('/path/to/keyfile.bin')
 
 These are tuned for interactive use (sub-second on modern hardware). Increase `t` or `m` for higher security at the cost of initialization time.
 
+## What is encrypted on disc
+
+When `--encrypt passphrase` or `--encrypt keyfile` is used:
+
+| Item | Encrypted? | Notes |
+|---|---|---|
+| File blobs (`full/`) | Yes | Each blob is an independent ciphertext with its own salt/nonce |
+| Delta blobs (`deltas/`) | Yes | Same as full blobs |
+| Session manifest | Yes | Stored as `manifest.enc`; contains file paths, checksums, sizes |
+| Blob filenames | N/A | Names are `sha256(session:path)` — opaque, reveal no source info |
+| `enc_mode.json` | No | Contains only `{"mode": "passphrase"}`; no key material or paths |
+
+Mounting a disc with `mode=passphrase` shows only opaque hex filenames and an `enc_mode.json` with no sensitive content. File names, directory structure, checksums, and content are all inaccessible without the passphrase.
+
 ## In-memory guarantee
 
 All encrypt and decrypt operations work on `bytes` in memory. No plaintext is written to the filesystem or to temporary files at any point.

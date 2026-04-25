@@ -101,7 +101,7 @@ class DiscBackend(BurnBackend):
         self._guard(expected_session_count)
         cmd = [
             "growisofs", "-Z", self.device,
-            "-R", "-udf", "-T",
+            "-R", "-T",
             "-V", label,
             str(staging),
         ]
@@ -119,7 +119,7 @@ class DiscBackend(BurnBackend):
         self._guard(expected_session_count)
         cmd = [
             "growisofs", "-M", self.device,
-            "-R", "-udf", "-T",
+            "-R", "-T",
             "-V", label,
             str(staging),
         ]

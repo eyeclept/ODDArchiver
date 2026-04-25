@@ -132,7 +132,7 @@ def check_capacity(
 
     if used_pct >= 95:
         lg.error(
-            "Disc capacity %.0f%% used — %.s remaining; disc nearly full",
+            "Disc capacity %.0f%% used — %s remaining; disc nearly full",
             used_pct,
             remaining_str,
         )

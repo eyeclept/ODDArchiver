@@ -202,6 +202,7 @@ def build_staging(
             else:
                 dest = full_dir / blob_id
 
+            dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(encrypted_blob)
 
             entries.append(ManifestEntry(
@@ -232,6 +233,7 @@ def build_staging(
 
             blob_id = _blob_id(session_n, rel_path)
             dest = full_dir / blob_id
+            dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(encrypted_blob)
 
             entries.append(ManifestEntry(

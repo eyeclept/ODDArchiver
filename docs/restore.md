@@ -23,7 +23,7 @@ oddarchiver restore <dest> --device /dev/sr0 --force
 ## Restore procedure
 
 1. Read `mediainfo()` to determine how many sessions are on the disc.
-2. Read `session_NNN/manifest.json` for each session up to the target.
+2. Read each session's manifest (`manifest.enc` if encrypted, else `manifest.json`) up to the target session. Decrypts using the passphrase/keyfile read from `enc_mode.json`.
 3. Build a per-file chain from all manifest entries (skipping SUSPECT sessions with a WARNING).
 4. For each file in the final state:
    - If dest file exists and already matches the target checksum, skip (unless `--force`).

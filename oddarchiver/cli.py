@@ -200,9 +200,11 @@ def dispatch(args: argparse.Namespace) -> int:
     except SystemExit as exc:
         return int(exc.code) if exc.code is not None else 1
     except KeyboardInterrupt:
+        _log.warning("Command interrupted by user.")
         print("\nInterrupted.", file=sys.stderr)
         return 1
     except Exception as exc:  # noqa: BLE001
+        _log.error("Unhandled error in %s: %s", args.command, exc, exc_info=True)
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -602,9 +604,12 @@ def _run_init(args: argparse.Namespace) -> int:
     from oddarchiver import verify as verify_mod
 
     backend = _make_backend(args)
+    _log.info("init: source=%s label=%s device=%s",
+              args.source, getattr(args, "label", "ARCHIVE"), _backend_id(backend))
     disc_info = backend.mediainfo()
 
     if disc_info.session_count > 0:
+        _log.warning("init: disc already initialized (%s); skipping.", _backend_id(backend))
         print("warning: disc already initialized; skipping init.", file=sys.stderr)
         return 0
 
@@ -633,12 +638,16 @@ def _run_init(args: argparse.Namespace) -> int:
     try:
         manifest = _patch_manifest(staging, 0, args.label, enc_block, drives=drives, crypto=crypto)
         print(f"Burning session 000 to {_backend_id(backend)} ...", flush=True)
+        _log.info("init: burning session 000 to %s", _backend_id(backend))
         backend.init(staging, args.label, expected_session_count=0)
+        _log.info("init: burn complete")
         print("  Burn complete.", flush=True)
         if mirror_backend:
             try:
                 print(f"Burning mirror to {_backend_id(mirror_backend)} ...", flush=True)
+                _log.info("init: burning mirror to %s", _backend_id(mirror_backend))
                 mirror_backend.init(staging, args.label, expected_session_count=0)
+                _log.info("init: mirror burn complete")
                 print("  Mirror burn complete.", flush=True)
             except Exception as exc:
                 _log.error("Mirror burn failed for session 0: %s", exc)
@@ -647,12 +656,15 @@ def _run_init(args: argparse.Namespace) -> int:
         try:
             print("Verifying burn (fast)...", flush=True)
             verify_mod.verify(backend, crypto, level="fast")
+            _log.info("init: post-burn verify OK")
             print("  Verify OK.", flush=True)
         except SystemExit:
+            _log.error("init: post-burn verify FAILED; cache not updated")
             print("error: post-burn verify failed; cache not updated.", file=sys.stderr)
             return 1
         print("Updating cache...", flush=True)
         _update_cache(cache, staging, 0, manifest.entries)
+        _log.info("init: session 000 complete — %d file(s) archived", len(manifest.entries))
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -677,8 +689,12 @@ def _run_sync(args: argparse.Namespace) -> int:
     disc_info = backend.mediainfo()
 
     if disc_info.session_count == 0:
+        _log.error("sync: disc not initialized (%s)", _backend_id(backend))
         print("error: disc not initialized; run 'init' first.", file=sys.stderr)
         return 1
+
+    _log.info("sync: source=%s session=%d device=%s",
+              args.source, disc_info.session_count, _backend_id(backend))
 
     mirror_backend = _make_mirror_backend(args)
 
@@ -711,6 +727,7 @@ def _run_sync(args: argparse.Namespace) -> int:
     deleted_files = [p for p in disc_state if p not in current_state]
 
     if not changed and not new_files and not deleted_files:
+        _log.info("sync: no changes detected; nothing to burn")
         return 0  # silent exit on no change
 
     drives = [_backend_id(backend)]
@@ -729,12 +746,17 @@ def _run_sync(args: argparse.Namespace) -> int:
     try:
         manifest = _patch_manifest(staging, session_n, label, enc_block, drives=drives, crypto=crypto)
         print(f"Burning session {session_n:03d} to {_backend_id(backend)} ...", flush=True)
+        _log.info("sync: burning session %03d to %s (%d new, %d changed, %d deleted)",
+                  session_n, _backend_id(backend), len(new_files), len(changed), len(deleted_files))
         backend.append(staging, label, expected_session_count=session_n)
+        _log.info("sync: burn complete")
         print("  Burn complete.", flush=True)
         if mirror_backend:
             try:
                 print(f"Burning mirror to {_backend_id(mirror_backend)} ...", flush=True)
+                _log.info("sync: burning mirror to %s", _backend_id(mirror_backend))
                 mirror_backend.append(staging, label, expected_session_count=session_n)
+                _log.info("sync: mirror burn complete")
                 print("  Mirror burn complete.", flush=True)
             except Exception as exc:
                 _log.error("Mirror burn failed for session %d: %s", session_n, exc)
@@ -743,12 +765,15 @@ def _run_sync(args: argparse.Namespace) -> int:
         try:
             print("Verifying burn (fast)...", flush=True)
             verify_mod.verify(backend, crypto, level="fast")
+            _log.info("sync: post-burn verify OK")
             print("  Verify OK.", flush=True)
         except SystemExit:
+            _log.error("sync: post-burn verify FAILED; cache not updated")
             print("error: post-burn verify failed; cache not updated.", file=sys.stderr)
             return 1
         print("Updating cache...", flush=True)
         _update_cache(cache, staging, session_n, manifest.entries)
+        _log.info("sync: session %03d complete", session_n)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
