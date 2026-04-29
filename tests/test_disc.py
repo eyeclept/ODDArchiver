@@ -251,3 +251,36 @@ def test_parse_mediainfo_empty_last_session_returns_zero_sessions():
     info = _parse_mediainfo(fixture)
     assert info.session_count == 0
     assert info.remaining_bytes == 5000 * 2048
+
+
+def test_parse_mediainfo_bdr_srm_pow_real_output():
+    """
+    Input:  None
+    Output: None
+    Details:
+        BD-R SRM+POW drives (e.g. Buffalo) use *2048 in READ CAPACITY and
+        have two Free Blocks: lines — Track#1 (written, 0 free) and Track#2
+        (invisible writable, full remaining space). Parser must take the last
+        Free Blocks entry and parse *2048 as well as *2KB.
+        Regression for bug: remaining_bytes reported as 0 on appendable BD-R.
+    """
+    fixture = (
+        " Mounted Media:         41h, BD-R SRM+POW\n"
+        "READ DISC INFORMATION:\n"
+        " Disc status:           appendable\n"
+        " Number of Sessions:    1\n"
+        " State of Last Session: incomplete\n"
+        "READ TRACK INFORMATION[#1]:\n"
+        " Track State:           partial incremental\n"
+        " Free Blocks:           0*2KB\n"
+        " Track Size:            55872*2KB\n"
+        "READ TRACK INFORMATION[#2]:\n"
+        " Track State:           invisible incremental\n"
+        " Free Blocks:           12032448*2KB\n"
+        " Track Size:            12032448*2KB\n"
+        "READ CAPACITY:          12088320*2048=24756879360\n"
+    )
+    info = _parse_mediainfo(fixture)
+    assert info.session_count == 1
+    assert info.remaining_bytes == 12032448 * 2048
+    assert info.used_bytes == (12088320 - 12032448) * 2048  # ~109 MB written

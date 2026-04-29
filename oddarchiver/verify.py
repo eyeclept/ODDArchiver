@@ -53,20 +53,19 @@ def verify(
         A failed session does not invalidate others; per-session status printed.
         Output format matches DesignDoc sample.
     """
-    disc_info = backend.mediainfo()
-    max_session = disc_info.session_count - 1
-
-    if max_session < 0:
-        print("No sessions found.")
-        return True
-
     total_errors = 0
 
     with tempfile.TemporaryDirectory(prefix="oddarchiver_verify_") as tmp:
         tmp_path = Path(tmp)
-        manifests = _read_all_manifests(backend, max_session, tmp_path, crypto=crypto)
+        manifests = _read_all_manifests(backend, tmp_path, crypto=crypto)
 
-        for s in range(max_session + 1):
+        if not manifests:
+            print("No sessions found.")
+            return True
+
+        max_session = max(manifests)
+
+        for s in sorted(manifests):
             manifest = manifests.get(s)
             if manifest is None:
                 _print_session_fail(s, 0, [f"session_{s:03d}/manifest.json: unreadable"])
@@ -100,21 +99,22 @@ def verify(
 
 def _read_all_manifests(
     backend: "BurnBackend",
-    max_session: int,
     tmp_path: Path,
     crypto: "CryptoBackend | None" = None,
 ) -> dict[int, Manifest]:
     """
-    Input:  backend     — BurnBackend to read from
-            max_session — inclusive upper bound
-            tmp_path    — temp directory for manifest files
-            crypto      — CryptoBackend for encrypted manifests (None → plaintext)
-    Output: dict mapping session index -> Manifest (missing sessions absent)
+    Input:  backend  — BurnBackend to read from
+            tmp_path — temp directory for manifest files
+            crypto   — CryptoBackend for encrypted manifests (None → plaintext)
+    Output: dict mapping session index -> Manifest
     Details:
-        Tries manifest.enc before manifest.json for each session.
+        Scans session_NNN/manifest.* until the first missing session.
+        Avoids relying on dvd+rw-mediainfo's session count, which on BD-R
+        SRM+POW always reports 1 regardless of how many sessions are present.
     """
     manifests: dict[int, Manifest] = {}
-    for s in range(max_session + 1):
+    s = 0
+    while True:
         data: bytes | None = None
         suffix = ".json"
         for disc_path in (
@@ -125,14 +125,14 @@ def _read_all_manifests(
                 data = backend.read_path(disc_path)
                 suffix = Path(disc_path).suffix
                 break
-            except OSError:
+            except (OSError, ValueError):
                 continue
         if data is None:
-            _log.error("Cannot read manifest for session %d", s)
-            continue
+            break
         tmp_file = tmp_path / f"manifest_{s:03d}{suffix}"
         tmp_file.write_bytes(data)
         manifests[s] = read_manifest(tmp_file, crypto=crypto)
+        s += 1
     return manifests
 
 

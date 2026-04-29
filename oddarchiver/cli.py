@@ -265,14 +265,16 @@ def _read_disc_manifests(
             crypto  — CryptoBackend for encrypted manifests (None → plaintext only)
     Output: list of Manifest objects in ascending session order (may be empty)
     Details:
-        Tries manifest.enc before manifest.json for each session so encrypted
-        and plaintext sessions can coexist on the same disc.
+        Scans for session_NNN/manifest.* until the first missing session.
+        This is more reliable than using dvd+rw-mediainfo's session count,
+        which on BD-R SRM+POW always reports 1 regardless of how many
+        oddarchiver sessions have been appended.
     """
-    disc_info = backend.mediainfo()
     manifests: list[Manifest] = []
     with tempfile.TemporaryDirectory(prefix="oddarchiver_cli_") as tmp:
         tmp_path = Path(tmp)
-        for s in range(disc_info.session_count):
+        s = 0
+        while True:
             data: bytes | None = None
             suffix = ".json"
             for disc_path in (
@@ -283,13 +285,14 @@ def _read_disc_manifests(
                     data = backend.read_path(disc_path)
                     suffix = Path(disc_path).suffix
                     break
-                except OSError:
+                except (OSError, ValueError):
                     continue
             if data is None:
-                continue
+                break
             tmp_file = tmp_path / f"manifest_{s:03d}{suffix}"
             tmp_file.write_bytes(data)
             manifests.append(read_manifest(tmp_file, crypto=crypto))
+            s += 1
     return manifests
 
 
@@ -717,27 +720,42 @@ def _run_sync(args: argparse.Namespace) -> int:
     enc_block = _encryption_block(crypto)
     label = manifests[0].label if manifests else "ARCHIVE"
 
-    session_n = disc_info.session_count
+    # Use manifest count, not dvd+rw-mediainfo session count — BD-R SRM+POW
+    # always reports session_count=1 regardless of how many appends occurred.
+    session_n = len(manifests)
     source = Path(args.source)
 
-    # step 3-4: scan and diff to detect no-change early
+    # Scan source with progress bar, compute diff, always show summary.
     import hashlib
+    from oddarchiver.session import _print_bar
 
-    def _sha256_file(p: Path) -> str:
-        return hashlib.sha256(p.read_bytes()).hexdigest()
+    print(f"Scanning {source} ...", flush=True)
+    source_files = sorted(f for f in source.rglob("*") if f.is_file())
+    total_files = len(source_files)
+    print(f"  {total_files} file(s) found. Hashing...", flush=True)
+    current_state: dict[str, str] = {}
+    for i, sf in enumerate(source_files, 1):
+        rel = str(sf.relative_to(source))
+        current_state[rel] = hashlib.sha256(sf.read_bytes()).hexdigest()
+        _print_bar(i, total_files, suffix=rel)
+    if total_files:
+        print()
 
-    current_state = {
-        str(f.relative_to(source)): _sha256_file(f)
-        for f in sorted(source.rglob("*"))
-        if f.is_file()
-    }
     changed = {p for p in current_state if p in disc_state and current_state[p] != disc_state[p]}
     new_files = {p for p in current_state if p not in disc_state}
     deleted_files = [p for p in disc_state if p not in current_state]
+    unchanged_count = len(current_state) - len(changed) - len(new_files)
+
+    print(
+        f"  {len(new_files)} new, {len(changed)} changed, "
+        f"{len(deleted_files)} deleted, {unchanged_count} unchanged",
+        flush=True,
+    )
 
     if not changed and not new_files and not deleted_files:
         _log.info("sync: no changes detected; nothing to burn")
-        return 0  # silent exit on no change
+        print("All files up to date.", flush=True)
+        return 0
 
     drives = [_backend_id(backend)]
     if mirror_backend:
@@ -751,20 +769,25 @@ def _run_sync(args: argparse.Namespace) -> int:
         backend=backend,
         cache=cache,
         crypto=crypto,
+        _current_state=current_state,
     )
     try:
         manifest = _patch_manifest(staging, session_n, label, enc_block, drives=drives, crypto=crypto)
         print(f"Burning session {session_n:03d} to {_backend_id(backend)} ...", flush=True)
         _log.info("sync: burning session %03d to %s (%d new, %d changed, %d deleted)",
                   session_n, _backend_id(backend), len(new_files), len(changed), len(deleted_files))
-        backend.append(staging, label, expected_session_count=session_n)
+        # Guard uses the dvd+rw-mediainfo count (disc_info.session_count), not
+        # the oddarchiver count (session_n). On BD-R SRM+POW the physical count
+        # is always 1; using session_n would always trigger a false guard trip.
+        backend.append(staging, label, expected_session_count=disc_info.session_count)
         _log.info("sync: burn complete")
         print("  Burn complete.", flush=True)
         if mirror_backend:
             try:
                 print(f"Burning mirror to {_backend_id(mirror_backend)} ...", flush=True)
                 _log.info("sync: burning mirror to %s", _backend_id(mirror_backend))
-                mirror_backend.append(staging, label, expected_session_count=session_n)
+                mirror_info = mirror_backend.mediainfo()
+                mirror_backend.append(staging, label, expected_session_count=mirror_info.session_count)
                 _log.info("sync: mirror burn complete")
                 print("  Mirror burn complete.", flush=True)
             except Exception as exc:

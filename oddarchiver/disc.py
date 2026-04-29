@@ -16,6 +16,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -103,6 +104,7 @@ class DiscBackend(BurnBackend):
             "growisofs", "-Z", self.device,
             "-R", "-T",
             "-V", label,
+            "-use-the-force-luke=notray",
             str(staging),
         ]
         result = subprocess.run(cmd)
@@ -121,27 +123,45 @@ class DiscBackend(BurnBackend):
             "growisofs", "-M", self.device,
             "-R", "-T",
             "-V", label,
+            "-use-the-force-luke=notray",
             str(staging),
         ]
         result = subprocess.run(cmd)
         if result.returncode != 0:
             raise RuntimeError(f"growisofs -M failed with exit code {result.returncode}")
 
-    def mediainfo(self) -> DiscInfo:
+    def mediainfo(self, retries: int = 6, retry_delay: float = 5.0) -> DiscInfo:
         """
-        Input:  None
+        Input:  retries     — number of extra attempts if the drive reports no media
+                retry_delay — seconds to wait between attempts
         Output: DiscInfo
         Details:
             Runs dvd+rw-mediainfo and parses session count and capacity.
+            Retries when the drive reports "no media" — this happens immediately
+            after a burn while the drive is reloading the tray and the disc is
+            still spinning up (typically takes 5–30 seconds).
         """
-        result = subprocess.run(
-            ["dvd+rw-mediainfo", self.device],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"dvd+rw-mediainfo failed: {result.stderr.strip()}")
-        return _parse_mediainfo(result.stdout)
+        last_err = ""
+        for attempt in range(retries + 1):
+            result = subprocess.run(
+                ["dvd+rw-mediainfo", self.device],
+                capture_output=True,
+            )
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            if result.returncode == 0:
+                stdout = result.stdout.decode("utf-8", errors="replace")
+                return _parse_mediainfo(stdout)
+            last_err = stderr
+            if "no media" in stderr.lower() and attempt < retries:
+                print(
+                    f"  Drive not ready (attempt {attempt + 1}/{retries + 1}); "
+                    f"waiting {retry_delay:.0f}s for disc...",
+                    flush=True,
+                )
+                time.sleep(retry_delay)
+            else:
+                break
+        raise RuntimeError(f"dvd+rw-mediainfo failed: {last_err}")
 
     def read_path(self, path: str) -> bytes:
         """
@@ -149,17 +169,44 @@ class DiscBackend(BurnBackend):
         Output: bytes
         Details:
             Locates the disc mount point via /proc/mounts and reads the file.
-            Raises RuntimeError if the device is not currently mounted.
+            If the disc is not mounted, attempts to mount it via udisksctl
+            (available on all systemd/udisks2 desktops without root).
             Raises ValueError if path is not a known-safe blob or manifest path.
+            Raises RuntimeError if the disc cannot be mounted.
         """
         from oddarchiver.manifest import validate_disc_read_path
         validate_disc_read_path(path)
-        mount_point = _find_mount(self.device)
-        if mount_point is None:
-            raise RuntimeError(
-                f"Device {self.device} is not mounted; cannot read {path!r}"
-            )
+        mount_point = _find_mount(self.device) or self._auto_mount()
         return (mount_point / path).read_bytes()
+
+    def _auto_mount(self) -> Path:
+        """
+        Input:  None
+        Output: Path — mount point after mounting
+        Details:
+            Calls 'udisksctl mount -b DEVICE' to mount without root.
+            Parses the mount point from udisksctl's stdout.
+            Falls back to re-checking /proc/mounts in case another process
+            raced to mount it.  Raises RuntimeError if all attempts fail.
+        """
+        result = subprocess.run(
+            ["udisksctl", "mount", "-b", self.device],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            # "Mounted /dev/sr0 at /run/media/user/LABEL."
+            m = re.search(r"\bat\s+(\S+?)\.?\s*$", result.stdout.strip())
+            if m:
+                return Path(m.group(1))
+        # Race: another process may have mounted it between our check and now.
+        mount_point = _find_mount(self.device)
+        if mount_point:
+            return mount_point
+        err = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            f"Device {self.device} is not mounted and auto-mount failed: {err}"
+        )
 
     def _guard(self, expected: int) -> None:
         """
@@ -395,20 +442,25 @@ def _parse_mediainfo(stdout: str) -> DiscInfo:
         session; these are treated as 0 written sessions.
     """
     session_match = re.search(r"Sessions:\s+(\d+)", stdout)
-    remaining_match = re.search(r"Remaining:\s+(\d+)\*2KB", stdout)
-    free_blocks_match = re.search(r"Free Blocks:\s+(\d+)\*2KB", stdout)
-    capacity_match = re.search(r"READ CAPACITY:\s+(\d+)\*2KB", stdout)
+    # dvd+rw-mediainfo uses *2KB for DVD and *2048 for BD; accept both.
+    _BLOCKS_RE = r"(\d+)\*(?:2KB|2048)"
+    remaining_match = re.search(r"Remaining:\s+" + _BLOCKS_RE, stdout)
+    # Free Blocks: appears once per track; the last entry is the writable track.
+    free_blocks_all = re.findall(r"Free Blocks:\s+" + _BLOCKS_RE, stdout)
+    capacity_match = re.search(r"READ CAPACITY:\s+" + _BLOCKS_RE, stdout)
     label_match = re.search(r"Volume id:\s+(\S+)", stdout, re.IGNORECASE)
     disc_status_match = re.search(r"Disc status:\s+(\S+)", stdout, re.IGNORECASE)
     last_session_match = re.search(r"State of Last Session:\s+(\S+)", stdout, re.IGNORECASE)
 
     session_count = int(session_match.group(1)) if session_match else 0
 
-    # Blank discs report Remaining: or Free Blocks: but not both; prefer Remaining:.
+    # Prefer the explicit Remaining: field; fall back to the last Free Blocks:
+    # entry (the invisible/writable track on BD-R SRM, which holds the actual
+    # remaining capacity — earlier tracks show 0 and must be ignored).
     if remaining_match:
         remaining_bytes = int(remaining_match.group(1)) * 2048
-    elif free_blocks_match:
-        remaining_bytes = int(free_blocks_match.group(1)) * 2048
+    elif free_blocks_all:
+        remaining_bytes = int(free_blocks_all[-1]) * 2048
     else:
         remaining_bytes = 0
 

@@ -134,15 +134,17 @@ def build_staging(
     cache: "CacheManager",
     crypto: "CryptoBackend",
     _staging_root: Path | None = None,
+    _current_state: dict[str, str] | None = None,
 ) -> Path:
     """
-    Input:  session_n     — session number to build (e.g. 1 for first sync)
-            source        — directory being archived
-            disc_state    — {path: result_checksum} from manifest.build_disc_state()
-            backend       — BurnBackend for disc reads on cache miss
-            cache         — CacheManager for encrypted blob retrieval
-            crypto        — CryptoBackend for encrypt/decrypt
-            _staging_root — override temp root (default: system tmpdir); for testing
+    Input:  session_n      — session number to build (e.g. 1 for first sync)
+            source         — directory being archived
+            disc_state     — {path: result_checksum} from manifest.build_disc_state()
+            backend        — BurnBackend for disc reads on cache miss
+            cache          — CacheManager for encrypted blob retrieval
+            crypto         — CryptoBackend for encrypt/decrypt
+            _staging_root  — override temp root (default: system tmpdir); for testing
+            _current_state — pre-computed {path: sha256} to skip re-scanning source
     Output: Path — path to completed staging directory (caller owns cleanup)
     Details:
         Uses a deterministic named staging dir so a crash-left dir can be detected
@@ -172,20 +174,23 @@ def build_staging(
         full_dir.mkdir(parents=True, exist_ok=True)
         deltas_dir.mkdir(parents=True, exist_ok=True)
 
-        # Step 3: scan source — collect paths first so we know the total for the bar
-        print(f"Scanning {source} ...", flush=True)
-        source_files = sorted(f for f in source.rglob("*") if f.is_file())
-        total_files = len(source_files)
-        print(f"  {total_files} file(s) found. Hashing...", flush=True)
-        current_state: dict[str, str] = {}
-        for i, src_file in enumerate(source_files, 1):
-            if _sigint_received:
-                raise KeyboardInterrupt
-            rel = str(src_file.relative_to(source))
-            current_state[rel] = _sha256_file(src_file)
-            _print_bar(i, total_files, suffix=rel)
-        if total_files:
-            print()  # newline after bar
+        # Step 3: scan source (skipped if caller pre-computed current_state)
+        if _current_state is not None:
+            current_state = _current_state
+        else:
+            print(f"Scanning {source} ...", flush=True)
+            source_files = sorted(f for f in source.rglob("*") if f.is_file())
+            total_files = len(source_files)
+            print(f"  {total_files} file(s) found. Hashing...", flush=True)
+            current_state = {}
+            for i, src_file in enumerate(source_files, 1):
+                if _sigint_received:
+                    raise KeyboardInterrupt
+                rel = str(src_file.relative_to(source))
+                current_state[rel] = _sha256_file(src_file)
+                _print_bar(i, total_files, suffix=rel)
+            if total_files:
+                print()
 
         # Step 4: diff
         changed = {
@@ -195,10 +200,14 @@ def build_staging(
         new_files = {p for p in current_state if p not in disc_state}
         deleted = [p for p in disc_state if p not in current_state]
 
-        print(
-            f"  {len(new_files)} new, {len(changed)} changed, {len(deleted)} deleted",
-            flush=True,
-        )
+        if _current_state is None:
+            # Only reprint the summary when the caller hasn't already shown it.
+            unchanged = len(current_state) - len(new_files) - len(changed)
+            print(
+                f"  {len(new_files)} new, {len(changed)} changed, "
+                f"{len(deleted)} deleted, {unchanged} unchanged",
+                flush=True,
+            )
 
         entries: list[ManifestEntry] = []
         base_session = session_n - 1

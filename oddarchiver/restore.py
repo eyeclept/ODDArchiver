@@ -52,25 +52,45 @@ def restore(
         On checksum mismatch: logs ERROR; does not write corrupt data.
         SUSPECT manifests are skipped with a WARNING.
     """
+    from oddarchiver.session import _print_bar
+
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
 
+    print("Scanning disc for sessions...", flush=True)
     max_session = _resolve_max_session(backend, session)
     if max_session < 0:
         _log.warning("No sessions found on disc; nothing to restore.")
+        print("No sessions found on disc.", flush=True)
         return (0, 0)
 
+    print(f"  Found {max_session + 1} session(s). Reading manifests...", flush=True)
     file_chains, deleted_at = _build_chains(_read_manifests(backend, max_session, crypto))
+
+    total_files = len(file_chains)
+    print(f"  {total_files} file(s) to reconstruct. Writing to {dest} ...", flush=True)
 
     restored = 0
     failures = 0
+    done = 0
     for rel_path, chain in sorted(file_chains.items()):
         outcome = _process_file(rel_path, chain, deleted_at, max_session, dest, backend, crypto, force)
+        done += 1
         if outcome == "restored":
             restored += 1
         elif outcome == "failed":
             failures += 1
+        _print_bar(done, total_files, suffix=rel_path)
+    if total_files:
+        print()
 
+    status = f"{restored} restored"
+    if failures:
+        status += f", {failures} failed"
+    skipped = total_files - restored - failures
+    if skipped:
+        status += f", {skipped} already up to date"
+    print(f"  Done — {status}.", flush=True)
     _log.info("Restore complete: %d restored, %d failures", restored, failures)
     if failures:
         _log.error("%d file(s) could not be restored", failures)
@@ -82,9 +102,28 @@ def _resolve_max_session(backend: "BurnBackend", session: int | None) -> int:
     Input:  backend — BurnBackend to query
             session — user-requested stop point (None = latest)
     Output: highest session index to read (may be -1 if disc is empty)
+    Details:
+        Probes for session_NNN/manifest.* files rather than using
+        dvd+rw-mediainfo's session count, which on BD-R SRM+POW always
+        reports 1 regardless of how many oddarchiver sessions exist.
     """
-    disc_info = backend.mediainfo()
-    max_s = disc_info.session_count - 1
+    max_s = -1
+    while True:
+        next_s = max_s + 1
+        found = False
+        for disc_path in (
+            f"session_{next_s:03d}/manifest.enc",
+            f"session_{next_s:03d}/manifest.json",
+        ):
+            try:
+                backend.read_path(disc_path)
+                found = True
+                break
+            except (OSError, ValueError):
+                continue
+        if not found:
+            break
+        max_s = next_s
     if session is not None:
         max_s = min(session, max_s)
     return max_s
@@ -191,7 +230,7 @@ def _read_manifests(
                     data = backend.read_path(disc_path)
                     suffix = Path(disc_path).suffix
                     break
-                except OSError:
+                except (OSError, ValueError):
                     continue
             if data is None:
                 _log.error("Cannot read manifest for session %d", s)
