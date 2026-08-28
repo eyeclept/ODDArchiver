@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for oddarchiver.restore — full restore, point-in-time, non-destructive,
+    Tests for oddarchiver.restore - full restore, point-in-time, non-destructive,
     force overwrite, and checksum-mismatch handling.
 """
 # Imports
@@ -21,7 +21,7 @@ from oddarchiver.manifest import Manifest, ManifestEntry, write_manifest
 from oddarchiver.restore import restore
 
 # Globals
-SMALL_DISC = 20 * 2**20  # 20 MiB — fast ISO builds
+SMALL_DISC = 20 * 2**20  # 20 MiB - fast ISO builds
 _crypto = NullCrypto()
 
 
@@ -41,11 +41,11 @@ def _make_staging(tmp_path: Path, session_n: int, files: dict[str, bytes],
                   deleted: list[str] | None = None,
                   based_on: int | None = None) -> Path:
     """
-    Input:  tmp_path  — base temp directory
-            session_n — session index
-            files     — {rel_path: content} for this session (all written as "full")
-            deleted   — list of rel_paths deleted in this session
-            based_on  — based_on_session field
+    Input:  tmp_path  - base temp directory
+            session_n - session index
+            files     - {rel_path: content} for this session (all written as "full")
+            deleted   - list of rel_paths deleted in this session
+            based_on  - based_on_session field
     Output: Path to staging directory ready for backend.init/append
     Details:
         Writes each file as an unencrypted blob (NullCrypto identity).
@@ -104,7 +104,7 @@ def test_full_restore_matches_source(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        Single session with two files; restore must reproduce exact bytes.
+        Single session with two files. Restore must reproduce exact bytes.
     """
     files = {"a.txt": b"hello archiver", "sub/b.bin": b"\x00\xff\xde\xad"}
     iso = tmp_path / "test.iso"
@@ -125,7 +125,7 @@ def test_session_arg_stops_at_s(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        Session 0 has a.txt; session 1 adds c.txt.
+        Session 0 has a.txt. Session 1 adds c.txt.
         restore(session=0) must not include c.txt.
     """
     iso = tmp_path / "test.iso"
@@ -225,7 +225,7 @@ def test_deleted_files_not_restored(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        Session 0 has a.txt and b.txt; session 1 deletes b.txt.
+        Session 0 has a.txt and b.txt. Session 1 deletes b.txt.
         Full restore must not include b.txt.
     """
     iso = tmp_path / "test.iso"

@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for oddarchiver.verify — fast, checksum, and full verification levels.
+    Tests for oddarchiver.verify - fast, checksum, and full verification levels.
 """
 # Imports
 import hashlib
@@ -43,8 +43,8 @@ def _make_staging(
     timestamp: str = "2026-04-23T00:00:00Z",
 ) -> Path:
     """
-    Input:  tmp_path, session_n, files — base dir, session index, file contents
-            deleted, based_on, timestamp — optional manifest fields
+    Input:  tmp_path, session_n, files - base dir, session index, file contents
+            deleted, based_on, timestamp - optional manifest fields
     Output: staging Path ready for ISOBackend.init / append
     Details:
         Writes NullCrypto blobs (plaintext == ciphertext) and a valid manifest.
@@ -182,7 +182,7 @@ def test_failed_session_reported_per_session_others_ok(tmp_path, capsys):
     Input:  tmp_path, capsys
     Output: None
     Details:
-        Two-session ISO; corrupt session 0 blob only.
+        Two-session ISO. Corrupt session 0 blob only.
         Output must show session 0 FAIL and session 1 OK.
         Result line must show exactly 1 error.
     """
@@ -209,9 +209,9 @@ def test_fast_fail_on_invalid_json_manifest_no_traceback(tmp_path, capsys):
     Input:  tmp_path, capsys
     Output: None
     Details:
-        B5/B6 regression: corrupt JSON in a manifest (simulating `echo junk >>
-        manifest.json`) must cause verify --level fast to exit 1 with a FAIL
-        report, not raise JSONDecodeError.
+        B5/B6 regression: extra bytes in a manifest (simulating echo junk >>
+        manifest.json) must cause verify --level fast to exit 1 with a FAIL
+        report. Do not raise JSONDecodeError.
     """
     iso = tmp_path / "test.iso"
     backend = ISOBackend(iso, disc_size=SMALL_DISC)

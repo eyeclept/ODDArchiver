@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for oddarchiver/log.py — setup_logging, check_capacity, SUSPECT level.
+    Tests for oddarchiver/log.py - setup_logging, check_capacity, SUSPECT level.
 """
 # Imports
 import logging
@@ -26,7 +26,7 @@ from oddarchiver.log import (
 
 @pytest.fixture(autouse=True)
 def _reset_root_logger():
-    """Isolate each test: save root logger state and restore after."""
+    """Save root logger state. Restore it after the test."""
     root = logging.getLogger()
     original_level = root.level
     original_handlers = root.handlers[:]
@@ -79,7 +79,7 @@ def test_suspect_level_value():
 
 
 def test_capacity_79_pct_logs_info(tmp_path):
-    """Capacity < 80% → INFO level."""
+    """Capacity below 80 percent logs INFO."""
     log_file = tmp_path / "cap.log"
     setup_logging(log_file)
     lg = logging.getLogger("oddarchiver.test_cap_info")
@@ -91,7 +91,7 @@ def test_capacity_79_pct_logs_info(tmp_path):
 
 
 def test_capacity_81_pct_logs_warning(tmp_path):
-    """Capacity ≥ 80% → WARNING level."""
+    """Capacity at or above 80 percent logs WARNING."""
     log_file = tmp_path / "cap.log"
     setup_logging(log_file)
     lg = logging.getLogger("oddarchiver.test_cap_warn")
@@ -102,7 +102,7 @@ def test_capacity_81_pct_logs_warning(tmp_path):
 
 
 def test_capacity_96_pct_logs_error(tmp_path):
-    """Capacity ≥ 95% → ERROR level."""
+    """Capacity at or above 95 percent logs ERROR."""
     log_file = tmp_path / "cap.log"
     setup_logging(log_file)
     lg = logging.getLogger("oddarchiver.test_cap_error")
@@ -112,7 +112,7 @@ def test_capacity_96_pct_logs_error(tmp_path):
 
 
 def test_no_stdout_handler(tmp_path):
-    """setup_logging attaches no stdout handler; only file + stderr."""
+    """setup_logging attaches no stdout handler."""
     log_file = tmp_path / "stdout_check.log"
     setup_logging(log_file)
     root = logging.getLogger()

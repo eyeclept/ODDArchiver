@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for Task 4: delta.py — compute_delta, apply_delta, delta_or_full,
+    Tests for delta.py. compute_delta, apply_delta, delta_or_full,
     threshold logic, and process_files parallelism.
 """
 # Imports
@@ -64,7 +64,7 @@ def test_delta_or_full_returns_delta_for_small_change(tmp_path):
     Output: None
     Details:
         A one-character change on a large file must produce a delta well
-        below DELTA_THRESHOLD, so delta_or_full must return ("delta", ...).
+        below DELTA_THRESHOLD, so delta_or_full must return ("delta", data).
     """
     new_path = tmp_path / "new.txt"
     new_path.write_bytes(_NEW)
@@ -79,8 +79,8 @@ def test_delta_or_full_returns_full_when_threshold_exceeded(tmp_path):
     Output: None
     Details:
         When old content is tiny and new content is large random bytes, the
-        delta will exceed DELTA_THRESHOLD * full_size, so ("full", ...) is
-        returned and the bytes match new_path contents.
+        delta exceeds DELTA_THRESHOLD * full_size. The call returns ("full", data)
+        and the bytes match new_path contents.
     """
     old_tiny = b"\x00" * 16
     new_random = os.urandom(32 * 1024)
@@ -144,7 +144,7 @@ def test_compute_delta_raises_on_missing_file(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        compute_delta must raise RuntimeError when new_path does not exist.
+        compute_delta must raise RuntimeError or FileNotFoundError when new_path does not exist.
     """
     with pytest.raises((RuntimeError, FileNotFoundError)):
         compute_delta(b"old content", tmp_path / "nonexistent.txt")

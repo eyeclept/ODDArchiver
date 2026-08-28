@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for Task 0: project scaffolding — module imports, entry point, pyproject.toml.
+    Tests for project scaffolding. Module imports, entry point, pyproject.toml.
 """
 # Imports
 import importlib

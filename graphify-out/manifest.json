@@ -1,0 +1,112 @@
+{
+  "feature_list.json": {
+    "mtime": 1782661800.438014,
+    "ast_hash": "459401ec313c7c3f984dc234141c0f52",
+    "semantic_hash": "459401ec313c7c3f984dc234141c0f52"
+  },
+  "oddarchiver/__init__.py": {
+    "mtime": 1787136932.1948721,
+    "ast_hash": "00d8b8be772cb4be7db68b3fbbae89b5",
+    "semantic_hash": "00d8b8be772cb4be7db68b3fbbae89b5"
+  },
+  "oddarchiver/__main__.py": {
+    "mtime": 1782661800.3495932,
+    "ast_hash": "15e1e0ad0268b62f018352af057f7288",
+    "semantic_hash": "15e1e0ad0268b62f018352af057f7288"
+  },
+  "oddarchiver/cache.py": {
+    "mtime": 1787136978.0205765,
+    "ast_hash": "3de71f72786b9a7bd23e63a53596572b",
+    "semantic_hash": "3de71f72786b9a7bd23e63a53596572b"
+  },
+  "oddarchiver/cli.py": {
+    "mtime": 1787137233.9009452,
+    "ast_hash": "77e596401cb1ac9892a3238c40d36521",
+    "semantic_hash": "77e596401cb1ac9892a3238c40d36521"
+  },
+  "oddarchiver/config.py": {
+    "mtime": 1787136932.2047942,
+    "ast_hash": "5ef5a65d34027a76612eef6eabce275b",
+    "semantic_hash": "5ef5a65d34027a76612eef6eabce275b"
+  },
+  "oddarchiver/crypto.py": {
+    "mtime": 1787136965.524363,
+    "ast_hash": "2313bf95835f5cb7898f47d11dc4b5b3",
+    "semantic_hash": "2313bf95835f5cb7898f47d11dc4b5b3"
+  },
+  "oddarchiver/delta.py": {
+    "mtime": 1787137002.305991,
+    "ast_hash": "c72c5086378aa8a034718f6d0a395062",
+    "semantic_hash": "c72c5086378aa8a034718f6d0a395062"
+  },
+  "oddarchiver/disc.py": {
+    "mtime": 1787137050.629816,
+    "ast_hash": "1a5b0b7539a5858f45f0088a92f6b5e3",
+    "semantic_hash": "1a5b0b7539a5858f45f0088a92f6b5e3"
+  },
+  "oddarchiver/log.py": {
+    "mtime": 1787136978.0255766,
+    "ast_hash": "90dca80e6da52c75b2ce8ced7ab6197b",
+    "semantic_hash": "90dca80e6da52c75b2ce8ced7ab6197b"
+  },
+  "oddarchiver/manifest.py": {
+    "mtime": 1787137029.3724532,
+    "ast_hash": "6888861618da6fa24ccfa1ca5c2ac9b4",
+    "semantic_hash": "6888861618da6fa24ccfa1ca5c2ac9b4"
+  },
+  "oddarchiver/restore.py": {
+    "mtime": 1787137036.1355686,
+    "ast_hash": "2b666482f43a57eb710b1d8e4d3c1c95",
+    "semantic_hash": "2b666482f43a57eb710b1d8e4d3c1c95"
+  },
+  "oddarchiver/session.py": {
+    "mtime": 1787137283.9527996,
+    "ast_hash": "b3d9b69eb7192ff7f1d924205cb4c2aa",
+    "semantic_hash": "b3d9b69eb7192ff7f1d924205cb4c2aa"
+  },
+  "oddarchiver/verify.py": {
+    "mtime": 1787137187.9481606,
+    "ast_hash": "760e2fcafc6aac034eb0747e83c3f699",
+    "semantic_hash": "760e2fcafc6aac034eb0747e83c3f699"
+  },
+  "pyproject.toml": {
+    "mtime": 1782661800.4369795,
+    "ast_hash": "dd1fffc2ad17a97717819702eef2c258",
+    "semantic_hash": "dd1fffc2ad17a97717819702eef2c258"
+  },
+  "run.py": {
+    "mtime": 1787137484.3032203,
+    "ast_hash": "dd23a73b34494660d35d5cd96e7583d3",
+    "semantic_hash": "dd23a73b34494660d35d5cd96e7583d3"
+  },
+  "DesignDoc.md": {
+    "mtime": 1787157583.3782432,
+    "ast_hash": "fd54d9a2aaf2cc33015a725d446ad378",
+    "semantic_hash": "fd54d9a2aaf2cc33015a725d446ad378"
+  },
+  "README.md": {
+    "mtime": 1787141928.71989,
+    "ast_hash": "655b58e2efe84f54bbe51c3a8405da0b",
+    "semantic_hash": "655b58e2efe84f54bbe51c3a8405da0b"
+  },
+  "SETUP.md": {
+    "mtime": 1787141951.477283,
+    "ast_hash": "b78c967e1fbaf9135727e126bfcf0335",
+    "semantic_hash": "b78c967e1fbaf9135727e126bfcf0335"
+  },
+  "STATE_OF_THE_PROGRAM.md": {
+    "mtime": 1787142040.7438245,
+    "ast_hash": "592c369a23dcf4573a1eb2f20eee535e",
+    "semantic_hash": "592c369a23dcf4573a1eb2f20eee535e"
+  },
+  "requirements.txt": {
+    "mtime": 1782661800.4371536,
+    "ast_hash": "4330cefde44e7b808edbfe2c2028771b",
+    "semantic_hash": "4330cefde44e7b808edbfe2c2028771b"
+  },
+  "tmp/file1.txt": {
+    "mtime": 1782661800.4372163,
+    "ast_hash": "6f5902ac237024bdd0c176cb93063dc4",
+    "semantic_hash": "6f5902ac237024bdd0c176cb93063dc4"
+  }
+}

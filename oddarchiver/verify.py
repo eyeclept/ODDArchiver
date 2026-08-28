@@ -4,8 +4,8 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Integrity checking at three levels: fast (manifest checksum),
-    checksum (raw blob hashes), full (restore + result_checksum comparison).
+    Integrity checks at three levels: fast (manifest checksum),
+    checksum (raw blob hashes), full (restore plus result_checksum comparison).
 """
 # Imports
 from __future__ import annotations
@@ -38,20 +38,20 @@ def verify(
     level: VerifyLevel = "fast",
 ) -> bool:
     """
-    Input:  backend — BurnBackend to read manifests and blobs from
-            crypto  — CryptoBackend (required for level="checksum" and "full")
-            level   — verification depth: "fast", "checksum", or "full"
-    Output: bool — True if all checks passed; raises SystemExit(1) on any error
+    Input:  backend - BurnBackend to read manifests and blobs from
+            crypto  - CryptoBackend (used for encrypted manifests at every level)
+            level   - verification depth: "fast", "checksum", or "full"
+    Output: bool - True if all checks passed. Raises SystemExit(1) if total_errors != 0.
     Details:
-        fast:     re-read manifests, validate manifest_checksum, check session
+        fast:     load manifests, flag suspect checksums, check session
                   index and timestamp ordering.
-        checksum: all fast checks + decrypt each blob and hash against the
-                  manifest result_checksum (full entries) or verify readability
-                  (delta entries).
-        full:     restore all sessions to a temp dir; verify each reconstructed
-                  file's sha256 against result_checksum.
-        A failed session does not invalidate others; per-session status printed.
+        checksum: all fast checks, then decrypt each blob. Hash full entries
+                  against result_checksum. Check that delta entries decrypt.
+        full:     run checksum checks, then restore to a temp dir. restore()
+                  verifies each reconstructed file sha256 against result_checksum.
+        A failed session does not stop later sessions. Per-session status is printed.
         Output format matches DesignDoc sample.
+        Blob checks are skipped for a session that already failed fast checks.
     """
     total_errors = 0
 
@@ -103,14 +103,13 @@ def _read_all_manifests(
     crypto: "CryptoBackend | None" = None,
 ) -> dict[int, Manifest]:
     """
-    Input:  backend  — BurnBackend to read from
-            tmp_path — temp directory for manifest files
-            crypto   — CryptoBackend for encrypted manifests (None → plaintext)
+    Input:  backend  - BurnBackend to read from
+            tmp_path - temp directory for manifest files
+            crypto   - CryptoBackend for encrypted manifests (None = plaintext)
     Output: dict mapping session index -> Manifest
     Details:
         Scans session_NNN/manifest.* until the first missing session.
-        Avoids relying on dvd+rw-mediainfo's session count, which on BD-R
-        SRM+POW always reports 1 regardless of how many sessions are present.
+        Does not use dvd+rw-mediainfo session count. On BD-R SRM+POW that count is 1.
     """
     manifests: dict[int, Manifest] = {}
     s = 0
@@ -143,14 +142,14 @@ def _check_fast(
     errors: list[str],
 ) -> None:
     """
-    Input:  manifest     — Manifest to check
-            session_idx  — expected session number
-            all_manifests — all loaded manifests (for timestamp ordering)
-            errors       — list to append error strings to
-    Output: None (mutates errors)
+    Input:  manifest      - Manifest to check
+            session_idx   - expected session number
+            all_manifests - all loaded manifests (for timestamp ordering)
+            errors        - list to append error strings to
+    Output: None (appends to errors)
     Details:
-        Checks manifest_checksum validity, session index match, and that
-        timestamp is not earlier than the previous session's timestamp.
+        Flags a suspect manifest_checksum, a session index mismatch, and a
+        timestamp earlier than the previous session timestamp.
     """
     if manifest.suspect:
         errors.append(
@@ -178,15 +177,15 @@ def _check_blobs(
     errors: list[str],
 ) -> None:
     """
-    Input:  manifest — Manifest to check
-            backend  — BurnBackend for blob reads
-            crypto   — CryptoBackend for decryption
-            errors   — list to append error strings to
-    Output: None (mutates errors)
+    Input:  manifest - Manifest to check
+            backend  - BurnBackend for blob reads
+            crypto   - CryptoBackend for decryption
+            errors   - list to append error strings to
+    Output: None (appends to errors)
     Details:
-        For "full" entries: decrypt blob, sha256 compare against result_checksum.
-        For "delta" entries: decrypt blob to verify readability.
-        Both catch read errors, auth failures, and hash mismatches.
+        For "full" entries: decrypt the blob, then compare sha256 to result_checksum.
+        For "delta" entries: decrypt the blob to check readability. No hash check.
+        Records path-validation failures, read errors, auth failures, and hash mismatches.
     """
     for entry in manifest.entries:
         blob_path = entry.file if entry.type == "full" else entry.delta_file
@@ -219,12 +218,12 @@ def _check_full(
     tmp_path: Path,
 ) -> int:
     """
-    Input:  backend, crypto, max_session — restore parameters
-            tmp_path                     — temp directory for restore dest
-    Output: number of errors (0 on clean restore)
+    Input:  backend, crypto, max_session - restore parameters
+            tmp_path                     - temp directory for restore dest
+    Output: number of restore() failures (0 on a clean restore)
     Details:
-        Restores all sessions to a temp dest; counts verification failures.
-        Errors are logged but not re-printed (restore() already reports them).
+        Restores the latest reconstructed tree to a temp dest.
+        max_session is unused. restore() already reports per-file failures.
     """
     from oddarchiver.restore import restore as do_restore
 

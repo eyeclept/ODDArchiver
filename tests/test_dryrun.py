@@ -6,9 +6,8 @@ Email:  eyeclept@pm.me
 Description:
     Tests for --dry-run mode: no ISO written, no cache updated, correct output,
     space overage reported without exit 1.
-    Tests call _run_dry_run directly because --dry-run and --test-iso are
-    mutually exclusive in dispatch() by design; _run_dry_run itself accepts any
-    backend so ISOBackend can serve as a read-only disc-state source in tests.
+    Tests call _run_dry_run directly so they can pass a test ISO path
+    without going through dispatch() write paths.
 """
 # Imports
 import argparse
@@ -27,7 +26,7 @@ SMALL_DISC = 50 * 2**20  # 50 MiB
 
 def _make_args(**kwargs) -> argparse.Namespace:
     """
-    Input:  kwargs — field overrides
+    Input:  kwargs - field overrides
     Output: argparse.Namespace with sensible defaults for dry-run tests
     """
     defaults = {
@@ -92,7 +91,7 @@ def test_sync_dry_run_iso_not_modified(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        _run_dry_run must not call backend.append(); session count stays at 1.
+        _run_dry_run must not call backend.append(). Session count stays at 1.
     """
     source = tmp_path / "src"
     source.mkdir()

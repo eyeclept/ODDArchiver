@@ -4,10 +4,10 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Integration tests for Task 15: full pipeline exercised against ISOBackend.
-    Covers: init + sync + verify --level full + restore cycle; dry-run ISO
-    invariance; SIGINT staging cleanup; interrupted burn cache isolation.
-    No physical disc required — all tests use ISOBackend.
+    Integration tests. Full pipeline against ISOBackend.
+    Covers init plus sync plus verify --level full plus restore.
+    Also covers dry-run ISO invariance, SIGINT staging cleanup, and burn cache isolation.
+    No physical disc is required. All tests use ISOBackend.
 """
 # Imports
 import argparse
@@ -26,7 +26,7 @@ from oddarchiver.crypto import NullCrypto
 import oddarchiver.session as session_mod
 
 # Globals
-SMALL_DISC = 100 * 2**20  # 100 MiB — room for several sessions
+SMALL_DISC = 100 * 2**20  # 100 MiB - room for several sessions
 
 
 # Functions
@@ -34,7 +34,7 @@ SMALL_DISC = 100 * 2**20  # 100 MiB — room for several sessions
 
 def _make_args(**kwargs) -> argparse.Namespace:
     """
-    Input:  kwargs — field overrides
+    Input:  kwargs - field overrides
     Output: argparse.Namespace with test-safe defaults
     """
     defaults = {
@@ -71,10 +71,10 @@ def test_full_pipeline_init_sync_verify_restore(tmp_path):
     Output: None
     Details:
         Full end-to-end pipeline:
-          1. init  — session 0, two files
-          2. sync  — session 1, one file changed + one new file
-          3. verify --level full — must exit 0
-          4. restore — reconstructed tree matches session-1 source byte-for-byte
+          1. init  - session 0, two files
+          2. sync  - session 1, one file changed + one new file
+          3. verify --level full - must exit 0
+          4. restore - reconstructed tree matches session-1 source byte-for-byte
     """
     source = tmp_path / "src"
     source.mkdir()
@@ -90,7 +90,7 @@ def test_full_pipeline_init_sync_verify_restore(tmp_path):
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     assert backend.mediainfo().session_count == 1
 
-    # Step 2: sync — modify alpha, add gamma
+    # Step 2: sync - modify alpha, add gamma
     (source / "alpha.txt").write_bytes(b"The quick brown fox jumps over the LAZY dog.\n" * 100)
     (source / "gamma.txt").write_bytes(b"new file added in session 1")
 
@@ -125,9 +125,8 @@ def test_dry_run_does_not_modify_iso(tmp_path):
     Output: None
     Details:
         _run_dry_run must exit 0 and leave the ISO file unmodified (same mtime
-        and size as before the call).  Called directly because --dry-run and
-        --test-iso are mutually exclusive in dispatch; _run_dry_run accepts any
-        backend so ISOBackend is used here.
+        and size as before the call). The test calls _run_dry_run directly.
+        It passes a test ISO path on the args namespace.
     """
     from oddarchiver.cli import _run_dry_run
 
@@ -210,7 +209,7 @@ def test_interrupted_burn_does_not_update_cache(tmp_path):
     Output: None
     Details:
         If backend.append() raises (simulated burn failure), cache.put must
-        never be called.  Verified by patching CacheManager.put and asserting
+        never be called. Verified by patching CacheManager.put and asserting
         it is not invoked when the burn fails.
     """
     source = tmp_path / "src"

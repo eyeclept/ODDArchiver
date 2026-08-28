@@ -4,8 +4,8 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for Task 18: Multi-Drive Redundancy.
-    Covers --mirror flag on init and sync, mirror burn failure behaviour,
+    Tests for multi-drive redundancy.
+    Covers --mirror flag on init and sync, mirror burn failure behavior,
     and mirror health display in status.
 """
 # Imports
@@ -29,7 +29,7 @@ SMALL_DISC = 50 * 2**20  # 50 MiB
 
 def _make_args(**kwargs) -> argparse.Namespace:
     """
-    Input:  kwargs — field overrides
+    Input:  kwargs - field overrides
     Output: argparse.Namespace with sensible defaults
     """
     defaults = {
@@ -140,7 +140,7 @@ def test_mirror_burn_failure_logs_error_and_exits_1(tmp_path):
     Output: None
     Details:
         If the primary burn succeeds but mirror raises RuntimeError, init must
-        exit 1 and log an ERROR. The command must not silently succeed.
+        exit 1. The command must not succeed.
     """
     source = tmp_path / "src"
     source.mkdir()
@@ -169,7 +169,7 @@ def test_mirror_burn_failure_logs_error_and_exits_1(tmp_path):
         rc = dispatch(args)
 
     assert rc == 1
-    # Primary ISO was written; mirror must not have a sessions directory
+    # Primary ISO was written. Mirror session count must stay 0.
     primary = ISOBackend(iso, disc_size=SMALL_DISC)
     assert primary.mediainfo().session_count == 1
     mirror = ISOBackend(mirror_iso, disc_size=SMALL_DISC)

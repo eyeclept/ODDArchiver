@@ -23,11 +23,11 @@ DEFAULT_CONFIG_PATH = Path.home() / ".config" / "oddarchiver" / "config.toml"
 @dataclass
 class Config:
     """
-    Input:  N/A — constructed by load_config or directly
+    Input:  N/A - constructed by load_config or directly
     Output: N/A
     Details:
-        All configuration fields with sensible defaults.
-        Path fields use expanduser() when loaded from file.
+        Holds all configuration fields with defaults.
+        Path fields use expanduser() when loaded from a file.
     """
     device: str = "/dev/sr0"
     cache_dir: Path = field(default_factory=lambda: Path.home() / ".cache" / "oddarchiver")
@@ -45,7 +45,7 @@ def _try_import_tomllib():
     Input:  None
     Output: tomllib module or None if unavailable
     Details:
-        Prefers stdlib tomllib (3.11+); falls back to tomli third-party package.
+        Prefers stdlib tomllib (Python 3.11+). Falls back to the tomli package.
     """
     if sys.version_info >= (3, 11):
         import tomllib
@@ -64,10 +64,10 @@ def _try_import_tomllib():
 
 def load_config(path: Path | None = None) -> Config:
     """
-    Input:  path — path to config.toml; None uses DEFAULT_CONFIG_PATH
-    Output: Config with file values applied over defaults; returns defaults if file absent
+    Input:  path - path to config.toml. None uses DEFAULT_CONFIG_PATH
+    Output: Config with file values applied over defaults. Returns defaults if the file is absent
     Details:
-        File is entirely optional.  Missing file or missing tomllib returns defaults.
+        The file is optional. A missing file or missing tomllib returns defaults.
         Recognized top-level keys: device, cache_dir, staging_dir, delta_threshold,
         space_safety_margin, log_file, post_burn_verify, disc_size.
         Encryption sub-table: [encryption] with key mode.
@@ -112,13 +112,13 @@ def load_config(path: Path | None = None) -> Config:
 
 def resolve_config(args: argparse.Namespace, path: Path | None = None) -> Config:
     """
-    Input:  args — parsed argparse.Namespace; attributes that are not None override config
-            path — path to config.toml; None uses DEFAULT_CONFIG_PATH
-    Output: Config with CLI flag values applied on top of file/defaults
+    Input:  args - parsed argparse.Namespace. Attributes that are not None override config
+            path - path to config.toml. None uses DEFAULT_CONFIG_PATH
+    Output: Config with CLI flag values applied on top of file or defaults
     Details:
-        Only attributes explicitly present and non-None on args override the config.
-        Designed for args where argparse defaults are set to None so that
-        user-supplied values are distinguishable from absent flags.
+        Only attributes that are present and not None on args override the config.
+        argparse defaults are None so a user-supplied value is distinct from an
+        absent flag.
     """
     cfg = load_config(path)
 
@@ -143,7 +143,7 @@ def main() -> None:
     Input:  None
     Output: None
     Details:
-        Prints the resolved config for debugging.
+        Prints values from load_config() for debugging.
     """
     cfg = load_config()
     for attr, val in vars(cfg).items():

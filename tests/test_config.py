@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for oddarchiver/config.py — load_config and resolve_config.
+    Tests for oddarchiver/config.py. load_config and resolve_config.
 """
 # Imports
 import argparse
@@ -18,7 +18,7 @@ from oddarchiver.config import Config, load_config, resolve_config
 
 
 def test_missing_config_no_error(tmp_path):
-    """Missing config file returns Config with defaults; no exception raised."""
+    """Missing config file returns Config with defaults. No exception is raised."""
     cfg = load_config(tmp_path / "nonexistent.toml")
     assert isinstance(cfg, Config)
 
@@ -64,14 +64,14 @@ def test_cli_flag_overrides_config(tmp_path):
     args = argparse.Namespace(device="/dev/cli-device", disc_size=None)
     cfg = resolve_config(args, path=cfg_file)
 
-    # --device was explicitly set; should override config file
+    # --device was set. It overrides the config file.
     assert cfg.device == "/dev/cli-device"
-    # --disc-size was not set (None); should come from config file
+    # --disc-size was None. The value comes from the config file.
     assert cfg.disc_size == "50gb"
 
 
 def test_resolve_none_args_use_defaults(tmp_path):
-    """resolve_config with all-None args falls back to file/defaults cleanly."""
+    """resolve_config with empty args uses file values or defaults."""
     args = argparse.Namespace()
     cfg = resolve_config(args, path=tmp_path / "nonexistent.toml")
     assert cfg.device == "/dev/sr0"

@@ -5,8 +5,8 @@ Email:  eyeclept@pm.me
 
 Description:
     Encryption layer. Three modes share one interface: NullCrypto (mode 0),
-    PassphraseCrypto (Argon2id + ChaCha20-Poly1305), KeyfileCrypto (X25519 DEK wrapping).
-    Plaintext never written to filesystem; all operations work on bytes in memory.
+    PassphraseCrypto (Argon2id + ChaCha20-Poly1305), and KeyfileCrypto
+    (ChaCha20-Poly1305 DEK wrapping). All operations work on bytes in memory.
 """
 # Imports
 from __future__ import annotations
@@ -36,16 +36,16 @@ class CryptoBackend(abc.ABC):
     @abc.abstractmethod
     def encrypt(self, plaintext: bytes) -> bytes:
         """
-        Input:  plaintext — raw bytes to encrypt
-        Output: ciphertext bytes (nonce/salt embedded)
+        Input:  plaintext - raw bytes to encrypt
+        Output: ciphertext bytes (nonce or salt embedded)
         Details:
-            Must be authenticated encryption; raises ValueError on auth failure in decrypt.
+            Must be authenticated encryption. decrypt() raises ValueError on auth failure.
         """
 
     @abc.abstractmethod
     def decrypt(self, ciphertext: bytes) -> bytes:
         """
-        Input:  ciphertext — bytes produced by encrypt()
+        Input:  ciphertext - bytes produced by encrypt()
         Output: plaintext bytes
         Details:
             Raises ValueError on authentication failure or malformed input.
@@ -57,7 +57,7 @@ class NullCrypto(CryptoBackend):
     Input:  None
     Output: N/A (class)
     Details:
-        Identity crypto — no encryption (mode 0).
+        Identity crypto. No encryption (mode 0).
     """
 
     def encrypt(self, plaintext: bytes) -> bytes:
@@ -69,7 +69,7 @@ class NullCrypto(CryptoBackend):
 
 class PassphraseCrypto(CryptoBackend):
     """
-    Input:  passphrase — str, or None to read from ODDARCHIVER_PASSPHRASE env var
+    Input:  passphrase - str, bytes, or None to read from ODDARCHIVER_PASSPHRASE
     Output: N/A (class)
     Details:
         KDF: Argon2id (argon2-cffi), m=65536, t=3, p=4.
@@ -90,10 +90,10 @@ class PassphraseCrypto(CryptoBackend):
 
     def _derive_key(self, salt: bytes) -> bytes:
         """
-        Input:  salt — 16-byte random salt
+        Input:  salt - 16-byte random salt
         Output: 32-byte derived key
         Details:
-            Argon2id with KDF_PARAMS; secret is passphrase bytes.
+            Argon2id with KDF_PARAMS. The secret is the passphrase bytes.
         """
         return hash_secret_raw(
             secret=self._passphrase,
@@ -127,11 +127,11 @@ class PassphraseCrypto(CryptoBackend):
 
 class KeyfileCrypto(CryptoBackend):
     """
-    Input:  keyfile_path — path to a file containing a 32-byte symmetric key (raw bytes)
+    Input:  keyfile_path - path to a file that holds a 32-byte symmetric key
     Output: N/A (class)
     Details:
-        Per-file DEK: generate random 32-byte DEK, wrap it with keyfile key via
-        ChaCha20-Poly1305, embed encrypted DEK in output.
+        Per-file DEK: generate a random 32-byte DEK, wrap it with the keyfile
+        key via ChaCha20-Poly1305, and embed the encrypted DEK in the output.
         Wire format: kek_nonce(12) + enc_dek(48) + data_nonce(12) + ciphertext.
         The keyfile holds exactly 32 raw bytes (the Key Encryption Key).
         Raises ValueError on authentication failure.
@@ -171,7 +171,7 @@ class KeyfileCrypto(CryptoBackend):
 
 def generate_keyfile(path: str) -> None:
     """
-    Input:  path — destination file path
+    Input:  path - destination file path
     Output: None (writes file)
     Details:
         Writes 32 cryptographically random bytes to path. Used for test key generation.
@@ -182,11 +182,11 @@ def generate_keyfile(path: str) -> None:
 
 def make_crypto(mode: str, **kwargs: object) -> CryptoBackend:
     """
-    Input:  mode   — "none" | "passphrase" | "keyfile"
-            kwargs — forwarded to the appropriate CryptoBackend constructor
+    Input:  mode   - "none" | "passphrase" | "keyfile"
+            kwargs - forwarded to the matching CryptoBackend constructor
     Output: CryptoBackend instance matching the requested mode
     Details:
-        Factory; raises ValueError on unknown mode.
+        Factory. Raises ValueError on an unknown mode.
     """
     if mode == "none":
         return NullCrypto()

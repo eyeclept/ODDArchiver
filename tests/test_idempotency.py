@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for Task 14: Idempotency — init on existing disc, sync no-change silence,
+    Tests for idempotency. Init on an existing disc, sync with no source change,
     interrupted burn recovery, stale staging dir cleanup.
 """
 # Imports
@@ -29,7 +29,7 @@ SMALL_DISC = 50 * 2**20  # 50 MiB
 
 def _make_args(**kwargs) -> argparse.Namespace:
     """
-    Input:  kwargs — field overrides for the Namespace
+    Input:  kwargs - field overrides for the Namespace
     Output: argparse.Namespace with sensible defaults
     """
     defaults = {
@@ -86,7 +86,7 @@ def test_sync_twice_identical_source_produces_one_burn(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        sync with no source changes must silently exit 0 and produce no second burn.
+        Sync with no source changes must exit 0 and produce no second burn.
         Running sync twice with the same source must leave session count at 1.
     """
     source = tmp_path / "src"
@@ -109,7 +109,7 @@ def test_burn_failure_leaves_cache_unchanged(tmp_path):
     Output: None
     Details:
         If backend.append() raises an exception (simulated burn failure), the
-        cache must not be updated.  Cache integrity is verified by asserting that
+        cache must not be updated. Cache integrity is verified by asserting that
         cache.put() is never called when the burn fails.
     """
     source = tmp_path / "src"

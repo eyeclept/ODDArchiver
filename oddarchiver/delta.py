@@ -5,7 +5,7 @@ Email:  eyeclept@pm.me
 
 Description:
     xdelta3 wrapper for binary delta computation and application.
-    Parallelizes across files via ThreadPoolExecutor (I/O bound).
+    process_files() runs xdelta3 subprocess jobs in a ThreadPoolExecutor.
 """
 # Imports
 from __future__ import annotations
@@ -17,17 +17,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Globals
-DELTA_THRESHOLD = 0.90  # store full if delta > 90% of full size
+DELTA_THRESHOLD = 0.90  # store full if delta is more than 90% of full size
 _log = logging.getLogger(__name__)
 
 # Functions
 
 
 def _memfd_with_bytes(name: str, data: bytes) -> int:
-    """Create an anonymous in-memory file, write data, seek back to 0.
+    """Create an anonymous in-memory file, write data, and seek back to 0.
 
-    Returns the file descriptor. Caller is responsible for os.close(fd).
-    Uses os.memfd_create so no plaintext bytes ever touch disk.
+    Returns the file descriptor. The caller must os.close(fd).
+    Uses os.memfd_create so plaintext bytes do not touch disk.
     """
     fd = os.memfd_create(name, 0)
     os.write(fd, data)
@@ -37,12 +37,12 @@ def _memfd_with_bytes(name: str, data: bytes) -> int:
 
 def compute_delta(old_bytes: bytes, new_path: Path) -> bytes:
     """
-    Input:  old_bytes — plaintext content of the previous version
-            new_path  — filesystem path to the new version
-    Output: bytes — raw xdelta3 delta
+    Input:  old_bytes - plaintext content of the previous version
+            new_path  - filesystem path to the new version
+    Output: bytes - raw xdelta3 delta
     Details:
-        Feeds old_bytes to xdelta3 via an anonymous memfd (/proc/self/fd/N)
-        so no plaintext temp file is ever created on disk.
+        Feeds old_bytes to xdelta3 via an anonymous memfd (/proc/self/fd/N).
+        No plaintext temp file is created on disk.
     """
     fd = _memfd_with_bytes("oddarchiver_delta_src", old_bytes)
     try:
@@ -64,12 +64,12 @@ def compute_delta(old_bytes: bytes, new_path: Path) -> bytes:
 
 def apply_delta(base_bytes: bytes, delta_bytes: bytes) -> bytes:
     """
-    Input:  base_bytes  — plaintext content of the base version
-            delta_bytes — xdelta3 delta to apply
-    Output: bytes — reconstructed file content
+    Input:  base_bytes  - plaintext content of the base version
+            delta_bytes - xdelta3 delta to apply
+    Output: bytes - reconstructed file content
     Details:
-        Feeds base_bytes via an anonymous memfd; delta_bytes arrive via
-        stdin. No plaintext temp file is created on disk.
+        Feeds base_bytes via an anonymous memfd. delta_bytes arrive on stdin.
+        No plaintext temp file is created on disk.
     """
     fd = _memfd_with_bytes("oddarchiver_delta_base", base_bytes)
     try:
@@ -92,12 +92,12 @@ def apply_delta(base_bytes: bytes, delta_bytes: bytes) -> bytes:
 
 def delta_or_full(old_bytes: bytes, new_path: Path) -> tuple[str, bytes]:
     """
-    Input:  old_bytes — previous plaintext version
-            new_path  — path to new version
+    Input:  old_bytes - previous plaintext version
+            new_path  - path to new version
     Output: tuple ("delta", delta_bytes) or ("full", full_bytes)
     Details:
-        Computes delta; if len(delta) > DELTA_THRESHOLD * full_size
-        returns full bytes instead. Logs the per-file decision.
+        Computes the delta. Stores full bytes when the file is non-empty and
+        len(delta) is greater than DELTA_THRESHOLD * full_size. Logs the choice.
     """
     full_bytes = new_path.read_bytes()
     delta_bytes = compute_delta(old_bytes, new_path)
@@ -127,12 +127,12 @@ def process_files(
     max_workers: int = 4,
 ) -> list[tuple[str, bytes]]:
     """
-    Input:  jobs        — list of (old_bytes, new_path) pairs
-            max_workers — thread pool size
-    Output: list of ("delta"/"full", bytes) in same order as jobs
+    Input:  jobs        - list of (old_bytes, new_path) pairs
+            max_workers - thread pool size
+    Output: list of ("delta"/"full", bytes) in the same order as jobs
     Details:
-        Runs delta_or_full for each job concurrently via ThreadPoolExecutor.
-        Results are returned in input order regardless of completion order.
+        Runs delta_or_full for each job in a ThreadPoolExecutor.
+        Results stay in input order regardless of completion order.
     """
     results: list[tuple[str, bytes] | None] = [None] * len(jobs)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:

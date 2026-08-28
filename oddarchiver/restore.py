@@ -4,8 +4,8 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Reconstruct any version of the source directory from disc or ISO.
-    Non-destructive by default; --force overwrites unconditionally.
+    Reconstruct a version of the source directory from disc or ISO.
+    Skip dest files that already match the target checksum unless force is True.
 """
 # Imports
 from __future__ import annotations
@@ -39,18 +39,20 @@ def restore(
     force: bool = False,
 ) -> tuple[int, int]:
     """
-    Input:  dest    — destination directory for reconstructed files
-            backend — BurnBackend to read blobs from
-            crypto  — CryptoBackend for decryption
-            session — stop replay at this session index (None = latest)
-            force   — overwrite existing dest files unconditionally
+    Input:  dest    - destination directory for reconstructed files
+            backend - BurnBackend to read blobs from
+            crypto  - CryptoBackend for decryption
+            session - stop replay at this session index (None = latest)
+            force   - write dest files even when the existing checksum matches
     Output: (restored_count, failure_count)
     Details:
         Reads manifests from disc in session order up to max_session.
-        Builds per-file reconstruction chain (full blobs + deltas).
+        Builds a per-file reconstruction chain of full blobs and deltas.
         Verifies sha256 of each result against result_checksum.
-        On checksum mismatch: logs ERROR; does not write corrupt data.
-        SUSPECT manifests are skipped with a WARNING.
+        On checksum mismatch, logs ERROR. Does not write corrupt data.
+        SUSPECT manifests are skipped with a WARNING in _build_chains.
+        Rejects dest paths that escape dest via safe_join_under.
+        Skips a path deleted after its last entry when that delete is in range.
     """
     from oddarchiver.session import _print_bar
 
@@ -99,13 +101,12 @@ def restore(
 
 def _resolve_max_session(backend: "BurnBackend", session: int | None) -> int:
     """
-    Input:  backend — BurnBackend to query
-            session — user-requested stop point (None = latest)
+    Input:  backend - BurnBackend to query
+            session - user-requested stop point (None = latest)
     Output: highest session index to read (may be -1 if disc is empty)
     Details:
-        Probes for session_NNN/manifest.* files rather than using
-        dvd+rw-mediainfo's session count, which on BD-R SRM+POW always
-        reports 1 regardless of how many oddarchiver sessions exist.
+        Probes for session_NNN/manifest.* files. Does not use
+        dvd+rw-mediainfo session count. On BD-R SRM+POW that count is always 1.
     """
     max_s = -1
     while True:
@@ -133,10 +134,10 @@ def _build_chains(
     manifests: list,
 ) -> tuple[dict[str, list[tuple[int, ManifestEntry]]], dict[str, int]]:
     """
-    Input:  manifests — list of Manifest objects in ascending session order
+    Input:  manifests - list of Manifest objects in ascending session order
     Output: (file_chains, deleted_at)
-            file_chains — {path: [(session_n, entry), ...]}
-            deleted_at  — {path: last_session_that_deleted_it}
+            file_chains - {path: [(session_n, entry), ...]}
+            deleted_at  - {path: last_session_that_deleted_it}
     Details:
         SUSPECT manifests are skipped with a WARNING log.
     """
@@ -164,12 +165,14 @@ def _process_file(
     force: bool,
 ) -> str:
     """
-    Input:  rel_path, chain, deleted_at, max_session — file state context
-            dest, backend, crypto, force             — restore parameters
+    Input:  rel_path, chain, deleted_at, max_session - file state context
+            dest, backend, crypto, force             - restore parameters
     Output: "restored" | "skipped" | "failed"
     Details:
-        Handles deletion check, non-destructive skip, reconstruction,
-        checksum verification, and writing to dest.
+        Skip if a later in-range session deleted the path.
+        Skip if dest exists, force is False, and dest matches target checksum.
+        Reconstruct, verify checksum, then write under dest.
+        Fail if the dest path is outside dest.
     """
     last_entry_session = chain[-1][0]
     del_session = deleted_at.get(rel_path, max_session + 1)
@@ -208,9 +211,9 @@ def _read_manifests(
     crypto: "CryptoBackend | None" = None,
 ) -> list:
     """
-    Input:  backend     — BurnBackend to read from
-            max_session — highest session index to read (inclusive)
-            crypto      — CryptoBackend for encrypted manifests (None → plaintext)
+    Input:  backend     - BurnBackend to read from
+            max_session - highest session index to read (inclusive)
+            crypto      - CryptoBackend for encrypted manifests (None = plaintext)
     Output: list of Manifest objects in ascending session order
     Details:
         Tries manifest.enc before manifest.json for each session.
@@ -248,13 +251,13 @@ def _reconstruct(
     crypto: "CryptoBackend",
 ) -> tuple[bytes, bool]:
     """
-    Input:  rel_path — relative file path (for log messages)
-            chain    — ordered list of (session_n, ManifestEntry)
-            backend  — BurnBackend for reading blobs
-            crypto   — CryptoBackend for decryption
+    Input:  rel_path - relative file path (for log messages)
+            chain    - ordered list of (session_n, ManifestEntry)
+            backend  - BurnBackend for reading blobs
+            crypto   - CryptoBackend for decryption
     Output: (bytes, success_bool)
     Details:
-        A "full" entry restarts reconstruction; a "delta" applies an xdelta3 patch.
+        A "full" entry restarts reconstruction. A "delta" applies an xdelta3 patch.
         Returns (b"", False) on any read, decrypt, or apply failure.
     """
     current = b""
@@ -287,9 +290,11 @@ def _read_full(
     crypto: "CryptoBackend",
 ) -> tuple[bytes, bool]:
     """
-    Input:  rel_path, entry — file identity and manifest entry
-            backend, crypto — I/O and decryption
+    Input:  rel_path, entry - file identity and manifest entry
+            backend, crypto - I/O and decryption
     Output: (plaintext_bytes, success_bool)
+    Details:
+        Validates entry.file with validate_blob_path before the disc read.
     """
     try:
         validate_blob_path(entry.file)
@@ -307,10 +312,12 @@ def _apply_delta_entry(
     crypto: "CryptoBackend",
 ) -> tuple[bytes, bool]:
     """
-    Input:  rel_path, entry — file identity and manifest entry
-            current         — bytes to patch
-            backend, crypto — I/O and decryption
+    Input:  rel_path, entry - file identity and manifest entry
+            current         - bytes to patch
+            backend, crypto - I/O and decryption
     Output: (patched_bytes, success_bool)
+    Details:
+        Validates entry.delta_file with validate_blob_path before the disc read.
     """
     try:
         validate_blob_path(entry.delta_file)

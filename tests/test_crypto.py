@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for oddarchiver.crypto — NullCrypto, PassphraseCrypto, KeyfileCrypto.
+    Tests for oddarchiver.crypto. NullCrypto, PassphraseCrypto, KeyfileCrypto.
 """
 # Imports
 import os

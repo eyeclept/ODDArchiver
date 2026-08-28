@@ -7,8 +7,8 @@ Description:
     Structured plaintext logging for oddarchiver.
     Format: TIMESTAMP LEVEL [module] message  (UTC timestamps)
     Adds SUSPECT as a custom level (35) between WARNING and ERROR.
-    setup_logging() wires file handler (all levels) + stderr handler (ERROR+).
-    check_capacity() logs disc fill percentage at the appropriate level.
+    setup_logging() wires a file handler (all levels) and a stderr handler (ERROR+).
+    check_capacity() logs disc fill percentage at the matching level.
 """
 # Imports
 import logging
@@ -30,7 +30,7 @@ _log = logging.getLogger(__name__)
 
 class _UTCFormatter(logging.Formatter):
     """
-    Input:  N/A — subclass of logging.Formatter
+    Input:  N/A - subclass of logging.Formatter
     Output: N/A
     Details:
         Forces asctime to use UTC so the trailing Z in _DATE_FMT is accurate.
@@ -40,7 +40,7 @@ class _UTCFormatter(logging.Formatter):
 
 def _fmt_bytes(n: int) -> str:
     """
-    Input:  n — byte count
+    Input:  n - byte count
     Output: human-readable string (e.g. "1.2 GiB")
     """
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -52,15 +52,15 @@ def _fmt_bytes(n: int) -> str:
 
 def setup_logging(log_file: Path, level: int = logging.INFO) -> None:
     """
-    Input:  log_file — path to append-only log file; parent dirs created if missing
-            level    — minimum log level (default INFO)
+    Input:  log_file - path to the append-only log file. Parent dirs are created if missing
+            level    - minimum log level (default INFO)
     Output: None
     Details:
         Attaches two handlers to the root logger:
           - FileHandler at `log_file` for all messages at `level` and above
           - StreamHandler(stderr) for ERROR and above only
-        Safe to call multiple times; duplicate handlers of the same path are avoided.
-        Existing handlers are NOT removed so library callers are not disrupted.
+        Safe to call more than once. Duplicate handlers for the same path are skipped.
+        Existing handlers stay so library callers are not disrupted.
     """
     log_file = Path(log_file)
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -100,12 +100,12 @@ def setup_logging(log_file: Path, level: int = logging.INFO) -> None:
 
 def suspect(logger: logging.Logger, msg: str, *args, **kwargs) -> None:
     """
-    Input:  logger — Logger instance to emit on
-            msg    — log message (positional args interpolated as with logger.info)
+    Input:  logger - Logger instance to emit on
+            msg    - log message (positional args interpolated as with logger.info)
     Output: None
     Details:
-        Emits a record at SUSPECT_LEVEL (35).  Use for manifest checksum failures
-        that require operator review but do not halt the current operation.
+        Emits a record at SUSPECT_LEVEL (35). Use for manifest checksum failures
+        that need operator review but do not halt the current operation.
     """
     if logger.isEnabledFor(SUSPECT_LEVEL):
         logger.log(SUSPECT_LEVEL, msg, *args, **kwargs)
@@ -117,15 +117,15 @@ def check_capacity(
     logger: logging.Logger | None = None,
 ) -> None:
     """
-    Input:  used_pct        — percentage of disc capacity used (0–100)
-            remaining_bytes — bytes still available on disc/ISO
-            logger          — Logger to emit on; defaults to this module's logger
+    Input:  used_pct        - percentage of disc capacity used (0-100)
+            remaining_bytes - bytes still available on disc/ISO
+            logger          - Logger to emit on. Defaults to this module's logger
     Output: None
     Details:
         Thresholds:
-          used_pct < 80  → INFO
-          used_pct ≥ 80  → WARNING  (warn operator; include remaining space)
-          used_pct ≥ 95  → ERROR    (disc nearly full)
+          used_pct < 80  - INFO
+          used_pct >= 80 - WARNING  (warn operator, include remaining space)
+          used_pct >= 95 - ERROR    (disc nearly full)
     """
     lg = logger or _log
     remaining_str = _fmt_bytes(remaining_bytes)
@@ -155,7 +155,7 @@ def main() -> None:
     Input:  None
     Output: None
     Details:
-        Smoke-test: emit one message at each level to stdout-based logger.
+        Smoke-test: emit one message at each level via setup_logging to a temp file.
     """
     import tempfile
 

@@ -52,3 +52,6 @@ Thumbs.db
 *.db
 *.sqlite3cert.pem
 key.pem
+
+# --- sync_to_public.py state (never commit this) ---
+.sync_state.json

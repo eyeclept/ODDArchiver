@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for Task 1: cli.py argument parsing and dispatch.
+    Tests for cli.py argument parsing and dispatch.
 """
 # Imports
 import subprocess
@@ -24,7 +24,7 @@ SUBCOMMANDS = ["init", "sync", "restore", "history", "verify", "status"]
 @pytest.mark.parametrize("subcmd", SUBCOMMANDS)
 def test_subcommand_help_exits_zero(subcmd):
     """
-    Input:  subcmd — subcommand name
+    Input:  subcmd - subcommand name
     Output: None
     Details:
         `oddarchiver <subcmd> --help` must exit 0 and print usage.
@@ -42,9 +42,8 @@ def test_dry_run_and_test_iso_are_not_mutually_exclusive():
     Input:  None
     Output: None
     Details:
-        --dry-run + --test-iso PATH must parse without error (B1 regression).
-        --test-iso selects the backend; --dry-run prevents any write.
-        dispatch() may still fail for other reasons (missing ISO file is fine).
+        --dry-run plus --test-iso PATH must parse without error (B1 regression).
+        The test only calls parse_args. It does not call dispatch().
     """
     parser = build_parser()
     args = parser.parse_args(["sync", "/src", "--test-iso", "fake.iso", "--dry-run"])
@@ -119,7 +118,7 @@ def test_unknown_flag_exits_nonzero():
     Input:  None
     Output: None
     Details:
-        An unrecognised flag must cause a non-zero exit.
+        An unrecognized flag must cause a non-zero exit.
     """
     result = subprocess.run(
         [sys.executable, "-m", "oddarchiver", "init", "/src", "--unknown-flag"],
@@ -134,7 +133,7 @@ def test_passphrase_prompt_uses_getpass(tmp_path):
     Output: None
     Details:
         B2 regression: passphrase prompt must use getpass.getpass, not input().
-        Prompts twice (passphrase + confirm); both return same value so loop exits.
+        Prompts twice (passphrase plus confirm). Both return the same value so the loop exits.
     """
     parser = build_parser()
     args = parser.parse_args(["init", str(tmp_path), "--encrypt", "passphrase"])
@@ -154,7 +153,7 @@ def test_passphrase_confirm_mismatch_retries(tmp_path):
     Output: None
     Details:
         When passphrase and confirm do not match, the loop retries.
-        Sequence: wrong/wrong, wrong/wrong, correct/correct — getpass called 6x.
+        Sequence: wrong/wrong, wrong/wrong, correct/correct. getpass called 6 times.
     """
     parser = build_parser()
     args = parser.parse_args(["init", str(tmp_path), "--encrypt", "passphrase"])

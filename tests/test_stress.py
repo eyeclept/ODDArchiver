@@ -29,7 +29,7 @@ from oddarchiver.session import build_staging
 from oddarchiver.verify import verify
 
 # Globals
-SMALL_DISC = 200 * 2**20   # 200 MiB — enough for large-file and delta-explosion tests
+SMALL_DISC = 200 * 2**20   # 200 MiB. Enough for large-file and delta-explosion tests.
 
 
 # Functions
@@ -37,7 +37,7 @@ SMALL_DISC = 200 * 2**20   # 200 MiB — enough for large-file and delta-explosi
 
 def _make_args(**kwargs) -> argparse.Namespace:
     """
-    Input:  kwargs — field overrides
+    Input:  kwargs - field overrides
     Output: argparse.Namespace with sensible defaults
     """
     defaults = {
@@ -160,8 +160,8 @@ def test_4_2_cache_bypass_produces_identical_restore(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        Init + sync with cache enabled vs no_cache=True. Restore from both
-        ISOs; assert file contents are identical.
+        Init two ISOs from the same content. Sync one with cache and one with no_cache=True.
+        Restore from both ISOs. File contents must match.
     """
     src_a = tmp_path / "src_a"
     src_a.mkdir()
@@ -301,9 +301,9 @@ def test_6_1_wrong_passphrase_restore_raises(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        Init with PassphraseCrypto("correct"), sync, then restore with
-        PassphraseCrypto("wrong"). Assert it raises an exception (no silent
-        corrupt output).
+        Init with PassphraseCrypto("correct"), then restore with
+        PassphraseCrypto("wrong"). Assert failures greater than 0.
+        No file is written. The call does not have to raise.
     """
     source = tmp_path / "src"
     source.mkdir()
@@ -344,8 +344,8 @@ def test_6_2_encrypted_storage_differs_from_plaintext(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        Init with PassphraseCrypto, sync a file. Read the raw blob from the
-        ISO staging dir. Assert the blob bytes differ from the plaintext source.
+        Init with PassphraseCrypto. Read the raw blob from the disc.
+        Blob bytes must differ from the plaintext source.
     """
     source = tmp_path / "src"
     source.mkdir()
@@ -457,8 +457,8 @@ def test_8_2_large_file_manifest_and_verify(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        Sync a 20 MB random binary. Assert manifest records the file and
-        verify --level checksum exits 0.
+        Init a 20 MiB random binary. Manifest must record the file.
+        verify --level checksum must exit 0.
     """
     source = tmp_path / "src"
     source.mkdir()

@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for Task 3: manifest.py — write/read round-trip, checksum validation,
+    Tests for manifest.py. Write/read round-trip, checksum validation,
     SUSPECT detection, disc-state replay, and atomic write.
 """
 # Imports
@@ -154,8 +154,8 @@ def test_build_disc_state_skips_suspect(tmp_path, caplog):
     Input:  tmp_path, caplog
     Output: None
     Details:
-        A manifest with suspect=True must be skipped; no exception raised;
-        a WARNING must be logged.
+        A manifest with suspect=True must be skipped. No exception is raised.
+        A WARNING must be logged.
     """
     m0 = _make_manifest(0, entries=[_make_entry("a.txt", "good")])
     m1 = _make_manifest(1, entries=[_make_entry("a.txt", "bad")])
@@ -196,12 +196,11 @@ def test_read_manifest_invalid_json_returns_suspect(tmp_path, caplog):
     Input:  tmp_path, caplog
     Output: None
     Details:
-        B5 regression: read_manifest on a file containing invalid JSON must
-        return a Manifest with suspect=True and log WARNING, not raise JSONDecodeError.
+        B5 regression: read_manifest on extra bytes after a JSON object must
+        return a Manifest with suspect=True and log WARNING. Do not raise JSONDecodeError.
     """
     bad = tmp_path / "manifest.json"
     bad.write_text('{"valid": "json"}extra junk that breaks parse', encoding="utf-8")
-
     with caplog.at_level(logging.WARNING):
         m = read_manifest(bad)
 
@@ -214,8 +213,8 @@ def test_read_manifest_appended_garbage_returns_suspect(tmp_path, caplog):
     Input:  tmp_path, caplog
     Output: None
     Details:
-        B5 regression: appending bytes after valid JSON (as in bugs.txt: echo junk >>)
-        must return suspect=True, not raise.
+        B5 regression: extra bytes after valid JSON (as in bugs.txt: echo junk >>)
+        must return suspect=True. Do not raise.
     """
     write_manifest(tmp_path, _make_manifest())
     manifest_path = tmp_path / "manifest.json"

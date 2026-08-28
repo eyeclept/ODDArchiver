@@ -20,7 +20,7 @@ from oddarchiver.disc import ISOBackend
 from oddarchiver.manifest import read_manifest
 
 # Globals
-SMALL_DISC = 50 * 2**20  # 50 MiB — room for two sessions
+SMALL_DISC = 50 * 2**20  # 50 MiB. Room for two sessions.
 
 
 # Functions
@@ -28,7 +28,7 @@ SMALL_DISC = 50 * 2**20  # 50 MiB — room for two sessions
 
 def _make_args(**kwargs) -> argparse.Namespace:
     """
-    Input:  kwargs — field overrides for the Namespace
+    Input:  kwargs - field overrides for the Namespace
     Output: argparse.Namespace with sensible defaults for test commands
     Details:
         Provides defaults so callers only specify what differs.
@@ -136,7 +136,7 @@ def test_history_prints_one_row_per_session(tmp_path, capsys):
     Input:  tmp_path, capsys
     Output: None
     Details:
-        After init + sync, history must print two rows with correct timestamps.
+        After init plus sync, history must print two rows that include 000 and 001.
     """
     source = tmp_path / "src"
     source.mkdir()
@@ -174,7 +174,7 @@ def test_sync_deletion_only_writes_session_and_restore_has_no_ghost(tmp_path):
     iso = tmp_path / "test.iso"
     assert dispatch(_make_args(command="init", source=str(source), test_iso=str(iso))) == 0
 
-    # Delete file1.txt — only change is a deletion
+    # Delete file1.txt. The only change is a deletion.
     (source / "file1.txt").unlink()
     rc = dispatch(_make_args(command="sync", source=str(source), test_iso=str(iso)))
 
@@ -182,12 +182,12 @@ def test_sync_deletion_only_writes_session_and_restore_has_no_ghost(tmp_path):
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     assert backend.mediainfo().session_count == 2, "deletion-only sync must write a new session"
 
-    # Verify the session 1 manifest records the deletion
+    # Confirm the session 1 manifest records the deletion.
     manifest_bytes = backend.read_path("session_001/manifest.json")
     manifest_data = json.loads(manifest_bytes)
     assert "file1.txt" in manifest_data["deleted"]
 
-    # Restore — file1.txt must not appear
+    # Restore. file1.txt must not appear.
     dest = tmp_path / "dest"
     from oddarchiver.crypto import NullCrypto
     from oddarchiver.restore import restore
@@ -201,7 +201,7 @@ def test_status_shows_suspect_on_bad_checksum(tmp_path, capsys):
     Input:  tmp_path, capsys
     Output: None
     Details:
-        After init, tamper with session 0 manifest; status must print SUSPECT.
+        After init, tamper with the session 0 manifest. The status command must print SUSPECT.
     """
     source = tmp_path / "src"
     source.mkdir()

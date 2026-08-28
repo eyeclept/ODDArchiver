@@ -42,10 +42,10 @@ _log = logging.getLogger(__name__)
 def build_parser() -> argparse.ArgumentParser:
     """
     Input:  None
-    Output: argparse.ArgumentParser — fully configured top-level parser
+    Output: argparse.ArgumentParser - fully configured top-level parser
     Details:
-        Constructs parser with all six subcommands and their flags.
-        Mutual exclusion: --dry-run and --test-iso cannot coexist.
+        Builds the parser with all six subcommands and their flags.
+        --dry-run and --test-iso may be used together.
     """
     parser = argparse.ArgumentParser(
         prog="oddarchiver",
@@ -66,10 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_init(sub: argparse._SubParsersAction) -> None:
     """
-    Input:  sub — subparsers action to attach to
+    Input:  sub - subparsers action to attach to
     Output: None
     Details:
-        init <source> [flags] — full snapshot burn, session 0.
+        init <source> [flags] - full snapshot burn, session 0.
     """
     p = sub.add_parser("init", help="Create session 0 (full snapshot) on disc or ISO.")
     p.add_argument("source", help="Directory to archive.")
@@ -87,10 +87,10 @@ def _add_init(sub: argparse._SubParsersAction) -> None:
 
 def _add_sync(sub: argparse._SubParsersAction) -> None:
     """
-    Input:  sub — subparsers action
+    Input:  sub - subparsers action
     Output: None
     Details:
-        sync <source> — incremental session burn.
+        sync <source> - incremental session burn.
     """
     p = sub.add_parser("sync", help="Burn an incremental session.")
     p.add_argument("source", help="Directory to sync.")
@@ -107,10 +107,10 @@ def _add_sync(sub: argparse._SubParsersAction) -> None:
 
 def _add_restore(sub: argparse._SubParsersAction) -> None:
     """
-    Input:  sub — subparsers action
+    Input:  sub - subparsers action
     Output: None
     Details:
-        restore <dest> — reconstruct source directory from disc/ISO.
+        restore <dest> - reconstruct source directory from disc/ISO.
     """
     p = sub.add_parser("restore", help="Reconstruct source from disc or ISO.")
     p.add_argument("dest", help="Destination directory.")
@@ -123,10 +123,10 @@ def _add_restore(sub: argparse._SubParsersAction) -> None:
 
 def _add_history(sub: argparse._SubParsersAction) -> None:
     """
-    Input:  sub — subparsers action
+    Input:  sub - subparsers action
     Output: None
     Details:
-        history — print session table from disc/ISO manifests.
+        history - print session table from disc/ISO manifests.
     """
     p = sub.add_parser("history", help="List all sessions on disc or ISO.")
     p.add_argument("--device", default=None, metavar="DEV")
@@ -136,10 +136,10 @@ def _add_history(sub: argparse._SubParsersAction) -> None:
 
 def _add_verify(sub: argparse._SubParsersAction) -> None:
     """
-    Input:  sub — subparsers action
+    Input:  sub - subparsers action
     Output: None
     Details:
-        verify — integrity check at specified depth.
+        verify - integrity check at specified depth.
     """
     p = sub.add_parser("verify", help="Check integrity of disc or ISO.")
     p.add_argument("--device", default=None, metavar="DEV")
@@ -150,10 +150,10 @@ def _add_verify(sub: argparse._SubParsersAction) -> None:
 
 def _add_status(sub: argparse._SubParsersAction) -> None:
     """
-    Input:  sub — subparsers action
+    Input:  sub - subparsers action
     Output: None
     Details:
-        status — print disc/ISO state and any SUSPECT entries.
+        status - print disc/ISO state and any SUSPECT entries.
     """
     p = sub.add_parser("status", help="Show disc/ISO state and warnings.")
     p.add_argument("--device", default=None, metavar="DEV")
@@ -163,21 +163,21 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
 
 def _add_dry_iso_mutex(_parser: argparse.ArgumentParser) -> None:
     """
-    Input:  _parser — unused; kept for signature compatibility
+    Input:  _parser - unused. Kept for signature compatibility
     Output: None
     Details:
         --dry-run and --test-iso are intentionally allowed to coexist.
-        --test-iso selects the ISO backend; --dry-run skips the actual write.
+        --test-iso selects the ISO backend. --dry-run skips the actual write.
     """
 
 
 def dispatch(args: argparse.Namespace) -> int:
     """
-    Input:  args — parsed namespace from build_parser()
-    Output: int — exit code (0 success, 1 error)
+    Input:  args - parsed namespace from build_parser()
+    Output: int - exit code (0 success, 1 error)
     Details:
-        Validates cross-flag constraints then routes to the correct handler.
-        Returns exit code; does not call sys.exit() directly.
+        Applies config defaults, sets up logging, then routes to the handler.
+        Returns the exit code. Does not call sys.exit().
     """
     # Apply config file defaults where CLI flags were not explicitly set (None)
     cfg = resolve_config(args)
@@ -216,8 +216,8 @@ def dispatch(args: argparse.Namespace) -> int:
 
 def _make_backend(args: argparse.Namespace) -> "BurnBackend":
     """
-    Input:  args — parsed namespace with test_iso and disc_size attributes
-    Output: BurnBackend — ISOBackend if --test-iso set, else DiscBackend
+    Input:  args - parsed namespace with test_iso and disc_size attributes
+    Output: BurnBackend - ISOBackend if --test-iso set, else DiscBackend
     """
     if getattr(args, "test_iso", None):
         size_str = getattr(args, "disc_size", "25gb")
@@ -228,7 +228,7 @@ def _make_backend(args: argparse.Namespace) -> "BurnBackend":
 
 def _make_mirror_backend(args: argparse.Namespace) -> "BurnBackend | None":
     """
-    Input:  args — parsed namespace with optional --mirror and backend flags
+    Input:  args - parsed namespace with optional --mirror and backend flags
     Output: BurnBackend for the mirror drive, or None if --mirror not given
     Details:
         Matches the primary backend type: ISOBackend when --test-iso is set,
@@ -246,8 +246,8 @@ def _make_mirror_backend(args: argparse.Namespace) -> "BurnBackend | None":
 
 def _backend_id(backend: "BurnBackend") -> str:
     """
-    Input:  backend — BurnBackend instance
-    Output: str — canonical identifier (ISO path or device path)
+    Input:  backend - BurnBackend instance
+    Output: str - canonical identifier (ISO path or device path)
     """
     if isinstance(backend, ISOBackend):
         return str(backend.iso_path)
@@ -261,8 +261,8 @@ def _read_disc_manifests(
     crypto: "CryptoBackend | None" = None,
 ) -> list[Manifest]:
     """
-    Input:  backend — BurnBackend to read from
-            crypto  — CryptoBackend for encrypted manifests (None → plaintext only)
+    Input:  backend - BurnBackend to read from
+            crypto  - CryptoBackend for encrypted manifests (None means plaintext only)
     Output: list of Manifest objects in ascending session order (may be empty)
     Details:
         Scans for session_NNN/manifest.* until the first missing session.
@@ -301,8 +301,8 @@ def _crypto_for_disc(
     key_path: str | None = None,
 ) -> "CryptoBackend":
     """
-    Input:  backend  — BurnBackend with at least one session
-            key_path — path to keyfile (required when disc is keyfile-encrypted)
+    Input:  backend  - BurnBackend with at least one session
+            key_path - path to keyfile (required when disc is keyfile-encrypted)
     Output: CryptoBackend matching the encryption mode stored on disc
     Details:
         Reads enc_mode.json from session_000 to get the mode without needing
@@ -315,7 +315,7 @@ def _crypto_for_disc(
         data = backend.read_path("session_000/enc_mode.json")
         mode = json.loads(data).get("mode", "none")
     except OSError:
-        # Older disc: no enc_mode.json — read plaintext manifest for mode.
+        # Older disc: no enc_mode.json. Read the plaintext manifest for mode.
         try:
             data = backend.read_path("session_000/manifest.json")
             with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
@@ -345,7 +345,7 @@ def _crypto_for_disc(
 
 def _make_init_crypto(args: argparse.Namespace) -> "CryptoBackend":
     """
-    Input:  args — parsed init namespace with --encrypt and optional --key
+    Input:  args - parsed init namespace with --encrypt and optional --key
     Output: CryptoBackend for the requested mode
     Details:
         For passphrase: reads ODDARCHIVER_PASSPHRASE env var or prompts twice
@@ -376,8 +376,8 @@ def _make_init_crypto(args: argparse.Namespace) -> "CryptoBackend":
 
 def _encryption_block(crypto: "CryptoBackend") -> dict:
     """
-    Input:  crypto — CryptoBackend instance
-    Output: dict — encryption metadata to embed in manifest
+    Input:  crypto - CryptoBackend instance
+    Output: dict - encryption metadata to embed in manifest
     Details:
         Records mode for subsequent commands to reconstruct crypto.
     """
@@ -400,18 +400,19 @@ def _patch_manifest(
     crypto: "CryptoBackend | None" = None,
 ) -> Manifest:
     """
-    Input:  staging    — staging root directory
-            session_n  — session index
-            label      — disc label to apply
-            encryption — encryption block dict
-            drives     — list of drive/ISO identifiers that will hold this session
-            crypto     — if provided (and non-null), rewrite manifest encrypted
-    Output: updated Manifest (also written to disc atomically)
+    Input:  staging    - staging root directory
+            session_n  - session index
+            label      - disc label to apply
+            encryption - encryption block dict
+            drives     - list of drive/ISO identifiers that will hold this session
+            crypto     - if provided (and non-null), rewrite manifest encrypted
+    Output: updated Manifest (also written to staging atomically)
     Details:
-        Reads the provisional plaintext manifest written by build_staging,
-        sets label/encryption/drives, then rewrites atomically.
-        If crypto is non-null, the output is manifest.enc + enc_mode.json and
-        the provisional manifest.json is removed.
+        Reads the provisional plaintext manifest written by build_staging.
+        Sets label, encryption, and drives, then rewrites the file atomically
+        in the staging session directory.
+        If crypto is non-null, the output is manifest.enc plus enc_mode.json
+        and the provisional manifest.json is removed.
     """
     session_dir = staging / f"session_{session_n:03d}"
     manifest = read_manifest(session_dir / "manifest.json", crypto=None)
@@ -430,10 +431,10 @@ def _update_cache(
     entries: list,
 ) -> None:
     """
-    Input:  cache     — CacheManager to update
-            staging   — staging directory root
-            session_n — session that was just burned
-            entries   — ManifestEntry list from the session manifest
+    Input:  cache     - CacheManager to update
+            staging   - staging directory root
+            session_n - session that was just burned
+            entries   - ManifestEntry list from the session manifest
     Output: None
     Details:
         Copies each encrypted blob from staging into the cache after a
@@ -450,7 +451,7 @@ def _update_cache(
 
 def _fmt_bytes(n: int) -> str:
     """
-    Input:  n — byte count
+    Input:  n - byte count
     Output: human-readable string (e.g. "1.2 GiB")
     """
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -462,14 +463,15 @@ def _fmt_bytes(n: int) -> str:
 
 def _run_dry_run(args: argparse.Namespace, is_init: bool = False) -> int:
     """
-    Input:  args    — parsed namespace with source and backend flags
-            is_init — True when called from _run_init (no prior disc state)
-    Output: exit code (0 always unless disc read fails)
+    Input:  args    - parsed namespace with source and backend flags
+            is_init - True when called from _run_init (no prior disc state)
+    Output: exit code 0, or 1 if a non-init run finds an uninitialized disc
     Details:
-        Scans source, diffs, computes delta sizes for changed files, prints
-        rsync-style report.  Space overage is reported but never causes exit 1.
-        No burn, no cache update, no manifest written to disc.
-        Hashing progress is shown inline; file list is printed after.
+        Scans the source, diffs it, and estimates delta sizes for changed files.
+        Prints an rsync-style report. Space overage is reported but does not
+        cause exit 1. Does not burn and does not write a new session.
+        Fallback reads of prior blobs may fill the local cache.
+        Hashing progress is shown inline. The file list is printed after.
     """
     import hashlib
     from oddarchiver.delta import delta_or_full
@@ -544,7 +546,7 @@ def _run_dry_run(args: argparse.Namespace, is_init: bool = False) -> int:
         abs_path = source / rel_path
         full_size = abs_path.stat().st_size
         try:
-            encrypted_old = cache.get_with_fallback(rel_path, session_n - 1, backend)
+            encrypted_old = cache.get_with_fallback(rel_path, session_n - 1, backend, crypto=crypto)
             old_bytes = crypto.decrypt(encrypted_old)
             kind, blob = delta_or_full(old_bytes, abs_path)
             blob_size = len(blob)
@@ -603,11 +605,11 @@ def _run_dry_run(args: argparse.Namespace, is_init: bool = False) -> int:
 
 def _run_init(args: argparse.Namespace) -> int:
     """
-    Input:  args — parsed init namespace
+    Input:  args - parsed init namespace
     Output: exit code
     Details:
         Builds session 0: scan source, build staging, burn, post-burn fast
-        verify, update cache.  Exits 0 with warning if already initialized.
+        verify, update cache. Exits 0 with a warning if already initialized.
     """
     if getattr(args, "dry_run", False):
         return _run_dry_run(args, is_init=True)
@@ -685,11 +687,12 @@ def _run_init(args: argparse.Namespace) -> int:
 
 def _run_sync(args: argparse.Namespace) -> int:
     """
-    Input:  args — parsed sync namespace
+    Input:  args - parsed sync namespace
     Output: exit code (0 even when no changes)
     Details:
-        Reads disc state, diffs source, exits 0 silently on no changes.
-        Otherwise: build staging, burn, verify, update cache.
+        Reads disc state and diffs the source. On no changes, prints
+        "All files up to date." and returns 0.
+        Otherwise builds staging, burns, verifies, and updates the cache.
     """
     if getattr(args, "dry_run", False):
         return _run_dry_run(args, is_init=False)
@@ -720,7 +723,7 @@ def _run_sync(args: argparse.Namespace) -> int:
     enc_block = _encryption_block(crypto)
     label = manifests[0].label if manifests else "ARCHIVE"
 
-    # Use manifest count, not dvd+rw-mediainfo session count — BD-R SRM+POW
+    # Use manifest count, not dvd+rw-mediainfo session count. BD-R SRM+POW
     # always reports session_count=1 regardless of how many appends occurred.
     session_n = len(manifests)
     source = Path(args.source)
@@ -778,7 +781,7 @@ def _run_sync(args: argparse.Namespace) -> int:
                   session_n, _backend_id(backend), len(new_files), len(changed), len(deleted_files))
         # Guard uses the dvd+rw-mediainfo count (disc_info.session_count), not
         # the oddarchiver count (session_n). On BD-R SRM+POW the physical count
-        # is always 1; using session_n would always trigger a false guard trip.
+        # is always 1. Using session_n would always trigger a false guard trip.
         backend.append(staging, label, expected_session_count=disc_info.session_count)
         _log.info("sync: burn complete")
         print("  Burn complete.", flush=True)
@@ -814,7 +817,7 @@ def _run_sync(args: argparse.Namespace) -> int:
 
 def _run_restore(args: argparse.Namespace) -> int:
     """
-    Input:  args — parsed restore namespace
+    Input:  args - parsed restore namespace
     Output: exit code (0 success, 1 on any failure)
     Details:
         Calls restore.restore() and translates failure_count to exit code.
@@ -836,10 +839,10 @@ def _run_restore(args: argparse.Namespace) -> int:
 
 def _run_history(args: argparse.Namespace) -> int:
     """
-    Input:  args — parsed history namespace
+    Input:  args - parsed history namespace
     Output: exit code
     Details:
-        Reads all manifests; prints one row per session.
+        Reads all manifests. Prints one row per session.
         Columns: session, timestamp, files, total_bytes, encryption mode.
     """
     backend = _make_backend(args)
@@ -868,10 +871,10 @@ def _run_history(args: argparse.Namespace) -> int:
 
 def _run_verify(args: argparse.Namespace) -> int:
     """
-    Input:  args — parsed verify namespace
+    Input:  args - parsed verify namespace
     Output: exit code (verify() raises SystemExit(1) on failure)
     Details:
-        Reads disc crypto then calls verify.verify(); catches SystemExit.
+        Reads disc crypto then calls verify.verify(). Catches SystemExit.
     """
     from oddarchiver import verify as verify_mod
 
@@ -889,8 +892,8 @@ def _mirror_health(
     manifests: list[Manifest], primary_id: str
 ) -> list[tuple[int, str, bool]]:
     """
-    Input:  manifests  — all session manifests
-            primary_id — identifier of the primary backend (excluded from results)
+    Input:  manifests  - all session manifests
+            primary_id - identifier of the primary backend (excluded from results)
     Output: list of (session_n, mirror_drive, accessible) for sessions with mirrors
     Details:
         For ISO paths (not starting with /dev/): checks file existence.
@@ -913,7 +916,7 @@ def _mirror_health(
 
 def _run_status(args: argparse.Namespace) -> int:
     """
-    Input:  args — parsed status namespace
+    Input:  args - parsed status namespace
     Output: exit code
     Details:
         Prints disc label, session count, used/remaining space, capacity

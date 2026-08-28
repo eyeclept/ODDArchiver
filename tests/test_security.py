@@ -4,9 +4,9 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Security regression tests — cover findings from Assist/security_fixes.md.
+    Security regression tests. Cover findings from Assist/security_fixes.md.
     H1: no plaintext temp files during delta operations.
-    H2: path traversal rejected in restore, verify, and disc backends.
+    H2: path traversal rejected in restore and disc backends.
     M1: default staging root is user-private (0o700).
     M2: keyfile CLI wiring end-to-end.
 """
@@ -23,7 +23,7 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# H1 — no plaintext temp files during delta
+# H1 - no plaintext temp files during delta
 # ---------------------------------------------------------------------------
 
 def _snapshot_tmp_files():
@@ -36,7 +36,7 @@ def _snapshot_tmp_files():
 
 
 def test_compute_delta_writes_no_plaintext_tmpfile(tmp_path):
-    """compute_delta must not leave any *.odd.src file in /tmp or /dev/shm."""
+    """compute_delta must not leave any file with .odd. in /tmp or /dev/shm."""
     from oddarchiver.delta import compute_delta
 
     old_data = os.urandom(10 * 1024)
@@ -54,7 +54,7 @@ def test_compute_delta_writes_no_plaintext_tmpfile(tmp_path):
 
 
 def test_apply_delta_writes_no_plaintext_tmpfile(tmp_path):
-    """apply_delta must not leave any *.odd.base file in /tmp or /dev/shm."""
+    """apply_delta must not leave any file with .odd. in /tmp or /dev/shm."""
     from oddarchiver.delta import compute_delta, apply_delta
 
     old_data = os.urandom(10 * 1024)
@@ -73,7 +73,7 @@ def test_apply_delta_writes_no_plaintext_tmpfile(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# H2 — path traversal rejected
+# H2 - path traversal rejected
 # ---------------------------------------------------------------------------
 
 SMALL_DISC = 20 * 2**20
@@ -120,7 +120,7 @@ def _build_traversal_iso(tmp_path: Path, entry_path: str, entry_file: str | None
     write_manifest(session_dir, manifest)
 
     from oddarchiver.disc import _copy_staging
-    # Sessions root already IS the target; write a stub ISO so mediainfo works.
+    # Sessions root already IS the target. Write a stub ISO so mediainfo works.
     import subprocess, tempfile
     staging = tmp_path / "staging"
     staging.mkdir()
@@ -179,7 +179,7 @@ def test_validate_blob_path_accepts_legitimate_values():
 
 
 # ---------------------------------------------------------------------------
-# M2 — keyfile CLI wiring
+# M2 - keyfile CLI wiring
 # ---------------------------------------------------------------------------
 
 def test_init_keyfile_round_trip(tmp_path):
@@ -247,7 +247,7 @@ def test_keyfile_missing_key_arg_exits_1(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# M1 — default staging root is user-private
+# M1 - default staging root is user-private
 # ---------------------------------------------------------------------------
 
 def test_default_staging_root_is_user_private(tmp_path, monkeypatch):

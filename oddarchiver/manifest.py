@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Session manifest read, write, merge, and disc-state reconstruction.
+    Session manifest read, write, and disc-state reconstruction.
     Manifest schema matches DesignDoc JSON structure.
 """
 # Imports
@@ -67,15 +67,15 @@ def write_manifest(
     crypto: "CryptoBackend | None" = None,
 ) -> None:
     """
-    Input:  staging_path — directory where the manifest will be written
-            manifest     — Manifest dataclass instance
-            crypto       — if provided (and not NullCrypto), write manifest.enc
-                           and enc_mode.json; otherwise write manifest.json
+    Input:  staging_path - directory where the manifest will be written
+            manifest     - Manifest dataclass instance
+            crypto       - if provided (and not NullCrypto), write manifest.enc
+                           and enc_mode.json. Otherwise write manifest.json
     Output: None
     Details:
         Writes atomically via .tmp then rename.
         Sets manifest_checksum over plaintext JSON before encrypting.
-        Removes the opposite format file if it exists (enc ↔ json swap).
+        Removes the opposite format file if it exists (enc and json swap).
     """
     d = dataclasses.asdict(manifest)
     d.pop("suspect", None)
@@ -95,7 +95,7 @@ def write_manifest(
         payload = crypto.encrypt(json_bytes)  # type: ignore[union-attr]
         dest = staging_path / "manifest.enc"
         tmp = staging_path / "manifest.enc.tmp"
-        # Write tiny plaintext mode indicator so _crypto_for_disc can determine
+        # Write a tiny plaintext mode indicator so _crypto_for_disc can determine
         # the encryption mode without first decrypting the manifest.
         from oddarchiver.crypto import PassphraseCrypto, KeyfileCrypto
         if isinstance(crypto, PassphraseCrypto):
@@ -124,14 +124,15 @@ def read_manifest(
     crypto: "CryptoBackend | None" = None,
 ) -> Manifest:
     """
-    Input:  path   — path to manifest.json (or manifest.enc)
-            crypto — required when the manifest is encrypted; ignored otherwise
-    Output: Manifest — parsed and checksum-validated manifest
+    Input:  path   - path to manifest.json (or manifest.enc)
+            crypto - required when the manifest is encrypted. Ignored otherwise
+    Output: Manifest - parsed and checksum-validated manifest
     Details:
         If path is manifest.json but does not exist, falls back to manifest.enc
         in the same directory (backward compat with encrypted sessions).
         Validates manifest_checksum over plaintext JSON.
-        Sets manifest.suspect = True on any parse/decrypt/checksum failure.
+        On read, parse, or decrypt failure, returns a blank suspect manifest.
+        On checksum mismatch, returns the parsed manifest with suspect=True.
     """
     actual = path
     if path.suffix == ".json" and not path.exists():
@@ -198,11 +199,11 @@ def _suspect_manifest() -> Manifest:
 
 def build_disc_state(manifests: list[Manifest]) -> dict[str, str]:
     """
-    Input:  manifests — list of Manifest objects in ascending session order
+    Input:  manifests - list of Manifest objects in ascending session order
     Output: dict mapping relative path -> result_checksum
     Details:
-        Replays manifests in order; each entry overwrites prior state.
-        SUSPECT manifests are skipped (logged, not raised).
+        Replays manifests in order. Each entry overwrites prior state.
+        Deleted paths are removed from state. SUSPECT manifests are skipped.
     """
     state: dict[str, str] = {}
     for m in manifests:
@@ -218,7 +219,7 @@ def build_disc_state(manifests: list[Manifest]) -> dict[str, str]:
 
 def _compute_checksum(manifest_dict: dict[str, Any]) -> str:
     """
-    Input:  manifest_dict — manifest as dict with manifest_checksum set to ""
+    Input:  manifest_dict - manifest as dict with manifest_checksum set to ""
     Output: hex sha256 digest
     Details:
         Canonical form: JSON with sorted keys, no trailing whitespace.
@@ -227,7 +228,7 @@ def _compute_checksum(manifest_dict: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-# Path validators — reject traversal in manifest-supplied paths.
+# Path validators. Reject traversal in manifest-supplied paths.
 
 _BLOB_PATH_RE = re.compile(
     r"^session_\d{3}/(full|deltas)/[0-9a-f]{64}$"
@@ -238,7 +239,7 @@ _MANIFEST_PATH_RE = re.compile(
 
 
 def validate_blob_path(path: str) -> str:
-    """Return path if it is a legal blob path; raise ValueError otherwise."""
+    """Return path if it is a legal blob path. Raise ValueError otherwise."""
     if not _BLOB_PATH_RE.fullmatch(path):
         raise ValueError(
             f"Refusing to read manifest-supplied blob path: {path!r}"
@@ -247,7 +248,7 @@ def validate_blob_path(path: str) -> str:
 
 
 def validate_disc_read_path(path: str) -> str:
-    """Permit a blob path or a known manifest/control path; raise ValueError otherwise."""
+    """Permit a blob path or a known manifest/control path. Raise ValueError otherwise."""
     if _BLOB_PATH_RE.fullmatch(path) or _MANIFEST_PATH_RE.fullmatch(path):
         return path
     raise ValueError(
@@ -256,7 +257,7 @@ def validate_disc_read_path(path: str) -> str:
 
 
 def safe_join_under(root: Path, rel_path: str) -> Path:
-    """Join root / rel_path, ensuring the result stays under root.
+    """Join root / rel_path and keep the result under root.
 
     Rejects absolute paths, paths containing '..' segments, and any joined
     path whose resolved form escapes root. Raises ValueError on rejection.

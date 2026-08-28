@@ -18,6 +18,10 @@ encrypt = [
 
 [project.scripts]
 oddarchiver = "oddarchiver.cli:main"
+# oddarchiver-usb-reauth is intentionally NOT a pip entry point: it must
+# be installed root-owned via a manual `sudo install` step, never onto
+# the unprivileged user's own writable PATH. See SETUP.md and
+# oddarchiver/usb_reauth.py's module docstring.
 
 [tool.setuptools.packages.find]
 where = ["."]
