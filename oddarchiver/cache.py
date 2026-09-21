@@ -7,8 +7,8 @@ Description:
     Local cache for encrypted blobs that mirror disc content.
     The cache is a performance optimization only. Correctness never
     depends on it. Cold-cache misses (TODO 23f) group by origin
-    session. The code extracts each session's missing blobs in one
-    read_paths() call. It uses an already-loaded Manifest list when
+    session. The code extracts the missing blobs of each session in
+    one read_paths() call. It uses an already-loaded Manifest list when
     the caller has one.
 """
 # Imports
@@ -57,9 +57,9 @@ def _manifest_path(cache_dir: Path) -> Path:
 def _load_manifest(cache_dir: Path) -> dict:
     """
     Input:  cache_dir - cache root
-    Output: dict of cache manifest entries, empty if missing or corrupt
+    Output: dict of cache manifest entries, empty when absent or corrupt
     Details:
-        Returns an empty dict when the file is missing or the JSON is
+        Returns {} when the file does not exist or the JSON is
         invalid.
     """
     mp = _manifest_path(cache_dir)
@@ -162,15 +162,15 @@ def _read_blob_from_disc(
             session  - session that the entry belongs to
             backend  - BurnBackend to read the blob (and maybe the manifest) from
             crypto   - CryptoBackend for an encrypted manifest (None = plaintext)
-            manifest - optional already-loaded Manifest for this session;
-                       skips a disc re-extract when provided
+            manifest - optional already-loaded Manifest for this session.
+                       Skips a disc re-extract when present
     Output: raw blob bytes exactly as stored on disc for that entry
     Details:
         Finds the entry for path and reads its actual blob. It reads
         entry.file for a "full" entry and entry.delta_file for a
         "delta" entry. The blob name is a content hash, never a path.
-        Raises RuntimeError when the manifest or the entry cannot be
-        found.
+        The code raises RuntimeError when it cannot find the manifest
+        or the entry.
     """
     if manifest is None:
         try:
@@ -201,7 +201,7 @@ class CacheManager:
     Input:  cache_dir - root directory for the cache (default ~/.cache/oddarchiver)
     Output: N/A (class)
     Details:
-        Blobs are keyed by (session, path). get() treats a missing or
+        The code keys blobs by (session, path). get() treats a missing or
         partial blob as a miss. get_with_fallback() reads from the
         backend on a miss. prefetch_origin_blobs() batch-fills misses,
         grouped by origin session.
@@ -278,19 +278,20 @@ class CacheManager:
                 backend   - BurnBackend for disc read on cache miss
                 crypto    - CryptoBackend to decrypt an encrypted manifest
                             (None for a plaintext manifest)
-                manifests - optional already-loaded Manifest list (23b/23f);
-                            used to resolve the blob path without re-extracting
+                manifests - optional already-loaded Manifest list (23b/23f).
+                            Used to resolve the blob path without re-extracting
         Output: encrypted blob bytes, exactly as stored on disc for that entry
         Details:
             Returns the cached blob when present. On a miss, the code
             resolves the real entry for path. It uses the in-memory
-            manifest when one is provided. Otherwise it reads that
-            session's manifest one time. Then it reads that entry's
-            actual blob (entry.file for "full", entry.delta_file for
-            "delta") from the backend. Blobs are named by content hash
-            under full/ or deltas/, never by the plaintext path. A
-            caller cannot guess the path. Raises RuntimeError when the
-            manifest or the entry for path cannot be found.
+            manifest when the caller passes one. Otherwise it reads
+            the manifest of that session one time. Then it reads that
+            actual entry blob (entry.file for "full", entry.delta_file
+            for "delta") from the backend. Content-hash names under
+            full/ or deltas/ identify the blobs. The plaintext path
+            never appears in a blob name. A caller cannot guess the
+            path. The code raises RuntimeError when it cannot find the
+            manifest or the entry for path.
         """
         cached = self.get(path, session)
         if cached is not None:
@@ -314,16 +315,17 @@ class CacheManager:
         crypto: "CryptoBackend | None" = None,
     ) -> None:
         """
-        Input:  needed    - (path, origin_session) pairs to ensure are cached
+        Input:  needed    - (path, origin_session) pairs to keep cached
                 backend   - BurnBackend for batched blob reads
-                manifests - optional already-loaded Manifest list; origin
+                manifests - optional already-loaded Manifest list. Origin
                             sessions present here are not re-extracted
                 crypto    - CryptoBackend for a session whose manifest is
-                            not in manifests and must be loaded from disc
+                            not in manifests and that the code must load
+                            from disc
         Output: None (cache populated for every resolvable miss)
         Details:
             Groups cache misses by origin session, in ascending order.
-            It pulls each origin session's missing blobs in one
+            It pulls the missing blobs of each origin session in one
             backend.read_paths() call. An origin session already in
             manifests is not re-read from disc. The code loads any
             other origin session one time and reuses it for every miss

@@ -39,10 +39,10 @@ SPACE_SAFETY_MARGIN = 0.95
 # ISO9660 multisession append rebuilds the entire cumulative directory
 # tree (path table, directory records, and one full UDF File Entry
 # logical block per file) for every file already on the disc, not only
-# the files being added now. The file data extents are different: they
-# are reused by reference and never recopied. A packing budget that
-# only sums new/changed file bytes undercounts this. The shortfall
-# grows with the disc's total prior file count. Direct reproduction
+# the files added now. The file data extents are different: the
+# builder reuses them by reference and never recopies them. A packing budget
+# that only sums new/changed file bytes undercounts this. The shortfall
+# grows with the total count of prior files on the disc. Direct reproduction
 # confirmed and calibrated this: appending 3085 new files onto a real
 # UDF+RockRidge image already holding 8000 files needed 19.9 MB more
 # than a fresh, non-merged build of the same 3085 files alone (about
@@ -179,12 +179,13 @@ def _check_staging_lock(staging: Path, session_n: int) -> None:
         Guards against the exact collision that caused a real disc
         corruption: two processes race to (re)build the same
         deterministically-named staging directory, and one silently
-        deletes the other's in-flight files mid-burn. Reads a PID from
-        staging/.lock (written by build_staging on every successful
+        deletes in-flight files of the other mid-burn. Reads a PID from
+        staging/.lock (build_staging writes it on every successful
         start) and probes it with os.kill(pid, 0):
+
           - No lockfile, or unreadable/non-integer contents. This is a
             leftover from an old oddarchiver version or a crash before
-            the lock was written. It is stale. The caller may remove
+            build_staging wrote the lock. It is stale. The caller may remove
             it.
           - The lockfile names a PID that no longer exists
             (ProcessLookupError). It is stale. The caller may remove
@@ -215,11 +216,11 @@ def _check_staging_lock(staging: Path, session_n: int) -> None:
 
 def _full_medium_bytes(backend: "BurnBackend") -> int:
     """
-    Input:  backend - burn backend whose fresh-medium capacity is needed
+    Input:  backend - burn backend for which the caller needs fresh-medium capacity
     Output: int - bytes of a blank medium
     Details:
-        ISOBackend stores the configured --disc-size on .disc_size. That
-        value is used when it is a positive int. DiscBackend and anything
+        ISOBackend stores the configured --disc-size on .disc_size. The
+        code uses that value when it is a positive int. DiscBackend and anything
         else (including mocks without an int disc_size) fall back to
         BDXL_DISC_BYTES, the largest BD medium this tool targets.
     """
@@ -331,6 +332,32 @@ def _ensure_staging_dir(root: Path, session_n: int) -> Path:
     return staging
 
 
+def _log_volume_pack_stop(
+    packed_count: int,
+    packed_bytes: int,
+    budget: int,
+    reason: str,
+) -> None:
+    """
+    Input:  packed_count - blobs placed in this volume bin
+            packed_bytes - sum of those blobs' encoded_size
+            budget       - packable budget for this bin
+            reason       - why this bin closed
+    Output: None
+    Details:
+        One INFO line so a volume rollover is diagnosable from the log
+        without a debugger. leftover is budget - packed_bytes, floored
+        at 0 so a skip-bin with a non-positive budget does not print a
+        negative leftover.
+    """
+    leftover = max(0, budget - packed_bytes)
+    _log.info(
+        "Volume pack stop: packed %d blob(s) %d bytes into budget %d "
+        "(%d bytes leftover); %s",
+        packed_count, packed_bytes, budget, leftover, reason,
+    )
+
+
 def _pack_blobs(
     blobs: list[_PreparedBlob],
     first_budget: int,
@@ -340,20 +367,23 @@ def _pack_blobs(
     Input:  blobs        - encoded blobs (ordinary and optional volume-split)
             first_budget - remaining_bytes * SPACE_SAFETY_MARGIN on the current medium
             full_budget  - fresh-medium bytes * SPACE_SAFETY_MARGIN
-    Output: list of bins; each bin is the blobs for one session directory
+    Output: list of bins. Each bin holds the blobs for one session directory
     Details:
         Volume-split blobs (volume_chunk is not None) each get their own
         dedicated bin, grouped by rel_path in first-seen order, then by
         ascending volume_chunk. Dedicated bins never share with another
         file or another chunk of the same file, so chunk N cannot land
         in an earlier bin than chunk N-1 even when encoded sizes tie.
-        If first_budget is 0 or negative, an empty first bin is kept so
-        the current medium is skipped. Ordinary blobs then pack with
-        full_budget after the split file's bins.
-        Ordinary blobs still use greedy largest-first fill (ties broken
-        by rel_path). A non-split blob larger than full_budget raises
-        RuntimeError naming that file. An empty first bin is kept when
-        nothing fits the current medium's remaining space.
+        If first_budget is 0 or negative, the code keeps an empty first
+        bin and skips the current medium. Ordinary blobs then pack with
+        full_budget after the bins of the split file.
+        Ordinary blobs still use greedy largest-first fill (the code
+        breaks ties by rel_path). A non-split blob larger than full_budget
+        raises RuntimeError naming that file. The code keeps an empty first
+        bin when nothing fits the remaining space of the current medium.
+        Each closed bin logs packed bytes, leftover budget, and why packing
+        stopped (no more source files, next file did not fit, dedicated
+        volume-split chunk, or the current medium had no packable space).
     """
     if not blobs:
         return [[]]
@@ -379,10 +409,21 @@ def _pack_blobs(
     chunks: list[list[_PreparedBlob]] = []
     if group_order:
         if first_budget <= 0:
+            _log_volume_pack_stop(
+                0, 0, first_budget,
+                "current medium has no remaining packable space",
+            )
             chunks.append([])
         for rel_path in group_order:
             for item in groups[rel_path]:
                 chunks.append([item])
+                chunk_n = (item.volume_chunk or 0) + 1
+                chunk_of = item.volume_chunk_count or 1
+                _log_volume_pack_stop(
+                    1, item.encoded_size, item.encoded_size,
+                    f"dedicated volume-split chunk {item.rel_path!r} "
+                    f"({chunk_n}/{chunk_of})",
+                )
         ordinary_budget = full_budget
     else:
         ordinary_budget = first_budget
@@ -404,11 +445,30 @@ def _pack_blobs(
             else:
                 deferred.append(item)
         if not bin_items:
+            nxt = remaining[0]
+            _log_volume_pack_stop(
+                0, 0, budget,
+                f"next file {nxt.rel_path!r} is {nxt.encoded_size} bytes "
+                f"and does not fit ({len(remaining)} blob(s) deferred)",
+            )
             chunks.append([])
             budget = full_budget
             continue
+        leftover_files = deferred
+        if leftover_files:
+            smallest = min(
+                leftover_files, key=lambda b: (b.encoded_size, b.rel_path),
+            )
+            reason = (
+                f"next file {smallest.rel_path!r} is "
+                f"{smallest.encoded_size} bytes and does not fit "
+                f"({len(leftover_files)} blob(s) deferred)"
+            )
+        else:
+            reason = "no more source files"
+        _log_volume_pack_stop(len(bin_items), used, budget, reason)
         chunks.append(bin_items)
-        remaining = deferred
+        remaining = leftover_files
         budget = full_budget
     return chunks
 
@@ -437,23 +497,24 @@ def partition_by_staging_budget(
 ) -> list[list[str]]:
     """
     Input:  paths        - source-relative new/changed paths to partition
-            source       - directory being archived
+            source       - archive source directory
             staging_root - override staging root (default: _default_staging_root())
-    Output: list of groups; each group is a sorted list of source-relative paths
+    Output: list of groups. Each group is a sorted list of source-relative paths
     Details:
-        Greedily bin-packs paths, sorted for determinism, by
-        (source / p).stat().st_size, into groups whose running total
-        stays under shutil.disk_usage(staging_root or
-        _default_staging_root()).free * SPACE_SAFETY_MARGIN. An empty
-        input returns [[]]. A changeset that fits in one group returns
-        [sorted(paths)]. That is indistinguishable from the ungrouped
-        path this replaces: no split, one session, unchanged output.
-        The staging budget is fixed across groups. This differs from
-        _pack_blobs' disc-capacity chunks, where a fresh medium grants
-        fresh headroom on every later chunk. A single path whose own
-        size exceeds the whole budget therefore raises RuntimeError
-        naming that file, rather than ever being routed to a group of
-        its own.
+        Greedily bin-packs paths by (source / p).stat().st_size into
+        groups whose running total stays under
+        shutil.disk_usage(staging_root or _default_staging_root()).free
+        * SPACE_SAFETY_MARGIN. The sort is source-relative path order,
+        for determinism. An empty input returns [[]]. A changeset that
+        fits in one group returns [sorted(paths)]. That is
+        indistinguishable from the ungrouped path this replaces: no
+        split, one session, unchanged output.
+        The same fixed staging budget applies to every group. This
+        differs from the disc-capacity chunks of _pack_blobs, where a
+        fresh medium grants fresh headroom on every later chunk. A
+        single path whose own size exceeds the whole budget therefore
+        raises RuntimeError naming that file. The code never routes
+        that path to a group of its own.
     """
     if not paths:
         return [[]]
@@ -568,7 +629,7 @@ def _prepare_streamed_blob(
     Output: _PreparedBlob with streamed=True and blob_path set
     Details:
         Encrypts abs_path to a scratch file via encrypt_file. blob stays
-        empty; encoded_size is the on-disk ciphertext size.
+        empty. encoded_size is the on-disk ciphertext size.
     """
     scratch_path = scratch_dir / _blob_id(session_n, rel_path)
     crypto.encrypt_file(abs_path, scratch_path)
@@ -653,45 +714,48 @@ def build_staging(
     Input:  session_n      - first session number to build (e.g. 1 for first sync)
             source         - directory being archived
             disc_state     - {path: result_checksum} from manifest.build_disc_state()
-            disc_origin    - {path: session} from manifest.build_disc_origin(); the
+            disc_origin    - {path: session} from manifest.build_disc_origin(). The
                               session that last wrote each path currently in
-                              disc_state, used to fetch a changed file's prior blob
-                              from its true origin session rather than session_n - 1
+                              disc_state, used to fetch the prior blob
+                              of a changed file from its true origin session
+                              rather than session_n - 1
             backend        - BurnBackend for disc reads on cache miss and for
                               remaining / full-medium capacity
             cache          - CacheManager for encrypted blob retrieval
             crypto         - CryptoBackend for encrypt/decrypt
             _staging_root  - override staging root (default: _default_staging_root)
             _current_state - pre-computed {path: sha256} to skip re-scanning source
-            manifests      - optional already-loaded Manifest list (23f); passed
-                              to the cache-fallback path so origin sessions are
-                              not re-extracted per changed file
+            manifests      - optional already-loaded Manifest list (23f). Passed
+                              to the cache-fallback path so the code does not
+                              re-extract origin sessions per changed file
     Output: list of (staging_path, session_n, is_new_volume) tuples
     Details:
         Encodes every changed/new file to its final on-disc blob before
-        choosing a session directory. Blobs are then greedily packed, sorted
-        by path, into as many session_NNN staging directories as needed.
-        The first chunk's budget is remaining_bytes * SPACE_SAFETY_MARGIN
-        on the current medium, minus MERGE_OVERHEAD_PER_PRIOR_FILE_BYTES for
-        every path already in disc_state when session_n > 0 (appending onto
-        an existing session chain costs real space to rebuild the disc's
-        cumulative directory tree. A fresh medium at session_n == 0 has no
-        prior session to merge with, so nothing is deducted there). Every
+        choosing a session directory. The code then greedily packs the
+        blobs, sorted by path, into as many session_NNN staging
+        directories as needed.
+        The first chunk budget is remaining_bytes * SPACE_SAFETY_MARGIN
+        on the current medium, minus MERGE_OVERHEAD_PER_PRIOR_FILE_BYTES
+        for every path already in disc_state when session_n > 0 (appending
+        onto an existing session chain costs real space to rebuild the
+        cumulative directory tree of the disc. A fresh medium at
+        session_n == 0 has no prior session to merge with, so the code
+        deducts nothing there). Every
         later chunk uses a full fresh medium (backend.disc_size when that is
         a positive int, else BDXL_DISC_BYTES) times SPACE_SAFETY_MARGIN, with
         no merge-overhead deduction, since every chunk after the first is
         always a fresh -Z init, never a -M append. A changeset that fits
         returns exactly one tuple with is_new_volume=False. A split returns
-        2+ tuples: the first
-        is_new_volume=False, every later one True, with contiguous session
-        numbers. Combined file content covers each changed/new file exactly
-        once. A file whose encoded size would exceed full_budget is
-        range-encrypted into dedicated-bin volume chunks (volume_chunk /
+        2+ tuples. The first tuple has is_new_volume=False. Every later
+        tuple has True, with contiguous session numbers.
+        Combined file content covers each changed/new file exactly
+        once. The code range-encrypts a file whose encoded size would
+        exceed full_budget into dedicated-bin volume chunks (volume_chunk /
         volume_chunk_count on each ManifestEntry) instead of raising.
-        Disc budgets are computed before any encrypt_file call so an
-        oversized file is chunked in one pass.
-        Uses a deterministic named staging dir so a crash-left dir can be
-        detected and removed on the next run. Before removing an existing
+        The code computes the disc budgets before any encrypt_file call,
+        so the code chunks an oversized file in one pass.
+        Uses a deterministic named staging dir so the next run can
+        detect and remove a dir left by a crash. Before removing an existing
         dir, checks a PID lockfile via _check_staging_lock(): if the PID
         that created it is still alive, raises RuntimeError instead of
         deleting live data out from under another in-flight build (see
@@ -699,21 +763,21 @@ def build_staging(
         The source scan excludes the staging tree itself (including that
         lockfile) if staging happens to be nested inside source. Example:
         the home-directory fallback staging root when syncing a source
-        tree that contains the user's home directory. Staging bookkeeping
-        is then never mistaken for archive content.
-        Files larger than STREAM_CHUNK_SIZE (and every volume-split chunk)
-        are encrypt_file'd to a scratch directory under the staging root,
-        then moved into the packed session directory. Scratch is removed
-        on every exit path.
+        tree that contains the home directory of the user. The code then
+        never mistakes staging bookkeeping for archive content.
+        The code encrypts files larger than STREAM_CHUNK_SIZE (and every
+        volume-split chunk) to a scratch directory under the staging root
+        via encrypt_file, then moves them into the packed session
+        directory. The code removes scratch on every exit path.
         Installs a SIGINT handler at entry. The handler only sets a flag.
         Raises SystemExit(1) if the staging filesystem space check fails.
-        On BaseException every staging dir created by this call is removed
-        before re-raising.
-        Each changed file's prior blob is fetched from disc_origin[rel_path]
-        (its true last-written session), not session_n - 1. A file left
-        unchanged across intervening syncs was never restaged, so its blob
-        may live several sessions further back than the immediately prior
-        one.
+        On BaseException the code removes every staging dir created by
+        this call before re-raising.
+        The code fetches the prior blob of each changed file from
+        disc_origin[rel_path] (its true last-written session), not
+        session_n - 1. The code does not restage a file left unchanged
+        across intervening syncs, so its blob may live several sessions
+        further back than the immediately prior one.
     """
     global _sigint_received
     _sigint_received = False
@@ -772,10 +836,10 @@ def build_staging(
         # packing further below. Staging commonly lives on a small, RAM-backed
         # tmpfs (see _default_staging_root / XDG_RUNTIME_DIR), which can run
         # out long before the real disk or the target disc/ISO does. Uses a
-        # worst-case estimate: source size for every new or changed file. A
-        # changed file's actual delta-vs-full size is not known until it is
-        # diffed. This fails fast, before any file is hashed for a blob or
-        # staged, instead of dying mid-job after hours of work.
+        # worst-case estimate: source size for every new or changed file. The
+        # actual delta-vs-full size of a changed file stays unknown until the
+        # code diffs it. This check fails fast, before any code hashes a file
+        # for a blob or stages it, instead of dying mid-job after hours of work.
         estimated_bytes = sum(
             (source / p).stat().st_size for p in list(new_files) + list(changed)
         )
@@ -797,7 +861,7 @@ def build_staging(
         print("Checking available disc space...", flush=True)
         disc_info = backend.mediainfo()
         # ISO9660 multisession append (session_n > 0, growisofs -M) rebuilds
-        # the whole disc's cumulative directory tree, so it costs real space
+        # the whole cumulative directory tree of the disc, so it costs real space
         # beyond the new files' own bytes. A fresh medium (session_n == 0,
         # growisofs -Z) has no prior session to merge with, so no deduction
         # applies there. See MERGE_OVERHEAD_PER_PRIOR_FILE_BYTES above.
@@ -807,7 +871,21 @@ def build_staging(
         )
         effective_remaining = max(0, disc_info.remaining_bytes - merge_overhead)
         first_budget = _volume_budget(effective_remaining)
-        full_budget = _volume_budget(_full_medium_bytes(backend))
+        full_medium = _full_medium_bytes(backend)
+        full_budget = _volume_budget(full_medium)
+        _log.info(
+            "Packing budget: remaining=%d merge_overhead=%d "
+            "effective_remaining=%d first_budget=%d full_medium=%d "
+            "full_budget=%d safety_margin=%.2f prior_files=%d",
+            disc_info.remaining_bytes,
+            merge_overhead,
+            effective_remaining,
+            first_budget,
+            full_medium,
+            full_budget,
+            SPACE_SAFETY_MARGIN,
+            len(disc_state) if session_n > 0 else 0,
+        )
 
         prepared: list[_PreparedBlob] = []
         split_blobs: list[_PreparedBlob] = []
@@ -871,8 +949,8 @@ def build_staging(
             print()
 
         # Encode ordinary changed files as delta or full (23f/23g).
-        # Origin blobs are prefetched per origin session, then every
-        # non-streamed changed file is handed to delta.process_files once.
+        # The code prefetches origin blobs per origin session, then hands
+        # every non-streamed changed file to delta.process_files once.
         if ordinary_changed:
             print(f"Staging {len(ordinary_changed)} changed file(s)...", flush=True)
         staged_changed: dict[str, _PreparedBlob] = {}

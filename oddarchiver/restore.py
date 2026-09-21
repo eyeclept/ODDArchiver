@@ -5,24 +5,30 @@ Email:  eyeclept@pm.me
 
 Description:
     Reconstruct a version of the source directory from disc or ISO.
-    Skip dest files that already match the target checksum unless force is True.
-    Marked multi-volume archives restore one disc per invocation, oldest first,
-    using a restore-state file under the oddarchiver state directory to skip
-    already-applied volumes. --skip-volume N marks a volume permanently gone
-    and activates recovery mode: files land in restored, stale, or missing.
+    Skip dest files that already match the target checksum unless
+    force is True. Marked multi-volume archives restore one disc per
+    invocation, oldest first, with a restore-state file under the
+    oddarchiver state directory tracking already-applied volumes.
 
-    Session-ordered replay (TODO 23c/23d): the engine below (run_session_replay,
-    _FileTask and friends) visits disc sessions in ascending order exactly once
-    each, via a SessionSource (oddarchiver.diskread) that batch-materializes
-    each session's blobs locally before any file needing them is reconstructed.
+    --skip-volume N marks a volume permanently gone and activates
+    recovery mode: files land in restored, stale, or missing.
+
+    Session-ordered replay (TODO 23c/23d): the engine below
+    (run_session_replay, _FileTask and friends) visits disc sessions
+    in ascending order exactly once each. A SessionSource
+    (oddarchiver.diskread) batch-materializes the blobs of each
+    session locally before the engine reconstructs any file that
+    needs them.
+
     This replaces the old "build a per-path chain, iterate every path
-    alphabetically, pull blobs on demand" loop, whose disc-access pattern
-    jumped around the medium once per file instead of streaming forward. The
-    per-file reconstruction rules themselves (skip-if-already-current,
-    deleted-path handling, delta chains, recovery-mode stale/missing
-    bucketing, the streamed fast path) are unchanged from the prior
-    implementation. Only the order and batching of the underlying reads is
-    different. verify.py's --level full check reuses this same engine.
+    alphabetically, pull blobs on demand" loop. That pattern jumped
+    around the medium once per file instead of streaming forward.
+
+    Per-file reconstruction rules are the same as before
+    (skip-if-already-current, deleted-path handling, delta chains,
+    recovery-mode stale/missing bucketing, streamed fast path). Only
+    the order and batching of the underlying reads differ. The
+    verify.py --level full check also uses this engine.
 """
 # Imports
 from __future__ import annotations
@@ -77,10 +83,10 @@ class RestoreResult:
     restore() return value.
 
     Unpacks as (restored, failures) so existing call sites keep working.
-    needed is set when an earlier volume is still required; it is not a
-    failure. Legacy (unmarked) archives always have needed=None.
-    stale and missing are recovery-mode buckets (--skip-volume). They
-    do not unpack and they do not count as failures.
+    restore sets needed when the archive still needs an earlier volume.
+    That is not a failure, and legacy (unmarked) archives always have
+    needed=None. stale and missing are recovery-mode buckets
+    (--skip-volume): they do not unpack and do not count as failures.
     """
 
     restored: int
@@ -116,15 +122,18 @@ class _FileTask:
     """
     Per-file replay state carried across the session-ordered pass (23c).
 
-    entries is the ordered (session, ManifestEntry) list this task still
-    needs to apply. In recovery mode it is the full chain, so a broken
-    later entry can still fall back to an earlier full snapshot.
+    entries is the ordered (session, ManifestEntry) list this task
+    still needs to apply. In recovery mode it is the full chain, so a
+    broken later entry can still fall back to an earlier full snapshot.
+
     Otherwise it is just the tail from the last full entry onward,
     matching the prior per-file trimming rule. idx tracks the next
-    entry to apply. current / has_full / last_valid_session / stopped
-    mirror the running state the old _reconstruct() /
-    _reconstruct_verified() functions used to build up inside a single
-    call. Here they persist across session boundaries instead.
+    entry to apply.
+
+    current / has_full / last_valid_session / stopped mirror the
+    running state the old _reconstruct() / _reconstruct_verified()
+    functions built up in one call. Here they persist across session
+    boundaries instead.
     """
 
     rel_path: str
@@ -213,37 +222,37 @@ def restore(
             force        - write dest files even when the existing checksum matches
             paths        - if set, restore only these exact paths or dir prefixes
             skip_volumes - volume indexes marked permanently unavailable
-            read_mode    - "sequential" (default) or "full-copy"; see
+            read_mode    - "sequential" (default) or "full-copy", see
                            oddarchiver.diskread.make_session_source
-            manifests    - optional already-loaded Manifest list; skips a
+            manifests    - optional already-loaded Manifest list, skips a
                            second load_session_manifests() disc scan
     Output: RestoreResult (restored_count, failure_count, needed volume or None)
     Details:
         Loads manifests from disc in session order via load_session_manifests,
         then slices to --session locally. Builds a SessionSource (23d) that
-        batch-materializes each disc session's blobs locally in ascending
-        order, and replays every file's manifest.entries chain against dest
-        through that source (23c). Verifies sha256 of each result against
-        result_checksum. On checksum mismatch, logs ERROR. Does not
-        write corrupt data. SUSPECT manifests are skipped with a WARNING
-        in _build_chains. Rejects dest paths that escape dest via
+        batch-materializes the blobs of each disc session locally in
+        ascending order, and replays the manifest.entries chain of every
+        file against dest through that source (23c). Verifies sha256 of
+        each result against result_checksum. On checksum mismatch, logs
+        ERROR. Does not write corrupt data. _build_chains skips SUSPECT
+        manifests with a WARNING. Rejects dest paths that escape dest via
         safe_join_under. Skips a path deleted after its last entry when
-        that delete is in range. When paths is set, only matching keys
-        are restored. Unmatched requested paths are printed as warnings.
-        Zero matches across every requested path increments failures by 1.
-        If read_volume_marker returns None, this is a legacy archive:
-        restore-state is not read or written and behaviour matches the
-        single-volume path. A present marker loads dest restore-state,
-        reconstructs every chain resolvable from applied volumes plus the
-        current disc, records the current volume as applied on a clean
-        pass, and reports the next earlier volume still needed. An
-        unresolved file (delta with no prior full from applied volumes)
-        is not a failure. A non-empty skip_volumes list activates recovery
-        mode: a skipped volume is never reported as needed, and a chain
-        that cannot reach its target checksum becomes stale or missing
-        instead of failed.
-        The SessionSource's scratch directory is torn down when restore()
-        returns, regardless of mode.
+        that delete is in range. With a paths filter, restore applies
+        only matching keys. restore prints unmatched requested paths as
+        warnings. Zero matches across every requested path increments
+        failures by 1. If read_volume_marker returns None, this is a
+        legacy archive: restore does not read or write restore-state, and
+        behaviour matches the single-volume path. A present marker loads
+        dest restore-state, reconstructs every chain resolvable from
+        applied volumes plus the current disc, records the current volume
+        as applied on a clean pass, and reports the next earlier volume
+        still needed. An unresolved file (delta with no prior full from
+        applied volumes) is not a failure. A non-empty skip_volumes list
+        activates recovery mode: restore never reports a skipped volume
+        as needed, and a chain that cannot reach its target checksum
+        becomes stale or missing instead of failed.
+        restore() tears down the scratch directory of the SessionSource
+        on return, regardless of mode.
     """
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
@@ -283,7 +292,8 @@ def _restore_legacy(
     Details:
         Unmarked-archive path. Does not touch restore-state. Session
         slicing is the original list prefix so single-volume behaviour
-        is unchanged. skip_volumes still gates recovery-mode stale/missing.
+        stays the same. skip_volumes still gates recovery-mode
+        stale/missing.
     """
     if session is not None:
         manifests = manifests[: session + 1]
@@ -320,19 +330,22 @@ def _restore_multivolume(
     """
     Input:  dest, source, backend, crypto, manifests, marker, session, force,
             paths, skip_volumes
-    Output: RestoreResult, with needed set when an earlier volume is missing
+    Output: RestoreResult, with needed set when restore still needs an
+            earlier volume
     Details:
-        Restore-state is keyed by archive_id and --session. Already-applied
-        volumes are not re-read. File chains come from the current disc
-        only; dest plus the replay dict supplies the base for a delta
-        whose full blob lived on an earlier applied volume. A gap before
-        this volume's first_session with no matching dest base leaves
-        the file unresolved and names the previous volume by label.
-        skip_volumes indexes are treated as permanently gone: they are
-        never reported as needed, and unresolved files that only needed
-        a skipped volume become missing so this volume can still commit.
-        backend is used only for _commit_volume's mediainfo() label read;
-        every blob read goes through source.
+        The restore-state key combines archive_id and --session.
+        restore does not re-read already-applied volumes. File chains
+        come from the current disc only. dest plus the replay dict
+        supplies the base for a delta whose full blob lived on an
+        earlier applied volume. A gap before the first_session of this
+        volume, with no matching dest base, leaves the file unresolved
+        and names the previous volume by label.
+        restore treats skip_volumes indexes as permanently gone: it
+        never reports them as needed, and unresolved files that only
+        needed a skipped volume become missing so this volume can still
+        commit.
+        restore uses backend only for the mediainfo() label read in
+        _commit_volume. Every blob read goes through source.
     """
     state = _load_or_init_state(dest, marker, session)
     needed = _needed_earlier_volume(marker, state, skip_volumes)
@@ -477,10 +490,12 @@ def _needed_earlier_volume(
     Output: NeededVolume for the nearest unapplied predecessor, or None
     Details:
         Walks backward via previous_volume_label / volume_index. Does not
-        look forward. Session range is filled in when volume 0 is needed
-        or when a later applied/current volume's first_session bounds it.
-        Indexes in skip_volumes are treated as gone: the walk continues
-        past them to an earlier still-needed volume, or stops if none.
+        look forward. The walk fills in the session range when restore
+        needs volume 0 or when the first_session of a later applied or
+        current volume bounds it.
+        restore treats indexes in skip_volumes as gone: the walk
+        continues past them to an earlier still-needed volume, or stops
+        if none.
     """
     skipped = set(skip_volumes or [])
     applied = set(state.applied_volumes)
@@ -660,8 +675,9 @@ def _tail_volume_chunks(
     Output: tail entries that carry volume_chunk fields, oldest first
     Details:
         Walks backward from the last entry while volume_chunk and
-        volume_chunk_count stay set and the count is unchanged. An empty
-        result means this chain's terminal encoding is not volume-split.
+        volume_chunk_count stay set and the count does not change. An
+        empty result means the terminal encoding of this chain is not
+        volume-split.
     """
     items: list[tuple[int, ManifestEntry]] = []
     for session_n, entry in reversed(chain):
@@ -686,7 +702,7 @@ def _start_volume_split_task(
     allow_unresolved: bool,
 ) -> "_FileTask | _FileResult":
     """
-    Input:  rel_path, chain - file identity and this volume's entries
+    Input:  rel_path, chain - file identity and entries from this volume
             dest_file, target_checksum, force, recover, last_entry_session
             prior - replay from already-applied volumes
             allow_unresolved - True on marked multi-volume restore
@@ -784,14 +800,14 @@ def _apply_volume_split_chunk(
 ) -> _FileResult | None:
     """
     Input:  task   - a volume-split _FileTask (entries are consecutive chunks)
-            reader - extract_path_to_file() scoped to this chunk's session
+            reader - extract_path_to_file() scoped to the session of this chunk
             crypto - CryptoBackend for decrypt_file
     Output: terminal _FileResult, or None if more chunks remain
     Details:
         Decrypts the current chunk independently and concatenates its
-        plaintext onto dest_file. A complete 0..count-1 group is
-        checksummed against target_checksum. An in-progress prefix is
-        recorded via volume_chunk on the result. Recovery mode reports
+        plaintext onto dest_file. restore checksums a complete
+        0..count-1 group against target_checksum. The result records an
+        in-progress prefix via volume_chunk. Recovery mode reports
         missing on decrypt or checksum failure and does not leave dest
         as a partial file.
     """
@@ -879,20 +895,21 @@ def _apply_task_entry(
 ) -> None:
     """
     Input:  task    - in-flight _FileTask (mutated in place)
-            session_n, entry - the chain entry being applied now
+            session_n, entry - the chain entry that restore applies now
             reader  - read_path()/extract_path_to_file() scoped to
-                      session_n's locally materialized blobs
+                      the locally materialized blobs of session_n
             crypto  - CryptoBackend for decryption
     Output: None (mutates task.current / has_full / last_valid_session / stopped)
     Details:
-        Non-recover: mirrors the prior _reconstruct()'s per-step
-        behaviour. It stops (task.stopped=True) on any read/apply
-        failure, with no intermediate checksum checks. The final
-        checksum is checked once, by the caller, after the last entry.
-        Recover: mirrors the prior _reconstruct_verified()'s per-step
-        behaviour. Every full/delta result is checksum-verified before
-        being accepted, so task.current/last_valid_session only advance
-        on a verified step and a broken chain keeps the last good state.
+        Non-recover: mirrors the per-step behaviour of the prior
+        _reconstruct(). It stops (task.stopped=True) on any read/apply
+        failure, with no intermediate checksum checks. The caller
+        checks the final checksum once, after the last entry.
+        Recover: mirrors the per-step behaviour of the prior
+        _reconstruct_verified(). Every step verifies the checksum of
+        each full/delta result before the step accepts it, so
+        task.current/last_valid_session only advance on a verified step
+        and a broken chain keeps the last good state.
     """
     if entry.type == "full":
         data, ok = _read_full(task.rel_path, entry, reader, crypto)
@@ -947,9 +964,9 @@ def _apply_streamed_task(
 ) -> _FileResult:
     """
     Input:  task   - a streamed _FileTask (single entry, already validated
-                     to not be followed by a delta)
-            reader - read_path()/extract_path_to_file() scoped to this
-                     task's one entry's session
+                     to have no delta after it)
+            reader - read_path()/extract_path_to_file() scoped to the
+                     session of this single entry
             crypto - CryptoBackend for decrypt_file
     Output: _FileResult
     Details:
@@ -990,14 +1007,14 @@ def _apply_streamed_task(
 
 def _finalize_task(task: _FileTask) -> _FileResult:
     """
-    Input:  task - _FileTask after its last scheduled entry (or an earlier
-                   stop) has been applied
+    Input:  task - _FileTask after the code applied its last scheduled
+                   entry (or an earlier stop)
     Output: _FileResult, matching the prior _process_file()'s tail exactly
     Details:
         Non-recover: a final checksum mismatch (or an earlier stop) is
-        "failed"; a match writes dest_file and is "restored".
-        Recover: no validated prefix at all is "missing"; a validated
-        prefix short of the target session is "stale"; a validated
+        "failed". A match writes dest_file and is "restored".
+        Recover: no validated prefix at all is "missing". A validated
+        prefix short of the target session is "stale". A validated
         prefix matching the target checksum is "restored".
     """
     if not task.recover:
@@ -1052,19 +1069,20 @@ def run_session_replay(
     Output: (restored, failures, updated_files, empty_filter,
              unresolved_paths, stale, missing)
     Details:
-        Shared session-ordered replay engine (23c) used by restore() and by
-        verify.py's --level full check. Every file whose outcome is knowable
-        without a disc read (already deleted, already at target checksum,
-        unresolved with no prior volume, or an invalid streamed+delta chain)
-        is resolved in _start_file_task with zero I/O. Every remaining file
-        becomes a _FileTask scheduled against the sessions its own
-        (possibly trimmed) chain still needs. Sessions are then visited in
-        strictly ascending order exactly once each via source.open_session(),
-        using a min-heap so a file's second, third, ... entry is scheduled
-        correctly even though it was not known when the walk began. That
-        entry is discovered only once its prior entry has been applied.
-        Every task at a given session shares that session's one
-        source.open_session() call.
+        Shared session-ordered replay engine (23c). restore() and the
+        verify.py --level full check use it. _start_file_task resolves,
+        with zero I/O, every file whose outcome is knowable without a
+        disc read (already deleted, already at target checksum,
+        unresolved with no prior volume, or an invalid streamed+delta
+        chain). Every remaining file becomes a _FileTask scheduled
+        against the sessions its own (possibly trimmed) chain still
+        needs. The loop then visits sessions in strictly ascending
+        order, exactly once each, via source.open_session(). A min-heap
+        orders the visits, so the second, third, and later entries of a
+        file schedule correctly even though the walk did not know them
+        when it began. The walk discovers each entry only after it
+        applies the prior entry. Every task at a given session shares
+        that one source.open_session() call.
     """
     from oddarchiver.session import _print_bar
 
@@ -1256,7 +1274,7 @@ def _replay_from_chain(
     """
     Input:  chain - ordered (session, entry) list for one path
             prior - replay from already-applied volumes, if any
-    Output: FileReplay at the chain's last entry
+    Output: FileReplay at the last entry of the chain
     Details:
         has_full is True if this chain contains a full blob or a prior
         applied volume already reconstructed one (dest holds those bytes).
@@ -1281,7 +1299,7 @@ def _build_chains(
             file_chains - {path: [(session_n, entry), ...]}
             deleted_at  - {path: last_session_that_deleted_it}
     Details:
-        SUSPECT manifests are skipped with a WARNING log.
+        Skips SUSPECT manifests with a WARNING log.
     """
     file_chains: dict[str, list[tuple[int, ManifestEntry]]] = {}
     deleted_at: dict[str, int] = {}
@@ -1308,7 +1326,7 @@ def _read_full(
     Output: (plaintext_bytes, success_bool)
     Details:
         Validates entry.file with validate_blob_path before the disc read.
-        backend needs only read_path(); a _LocalDirReader satisfies this.
+        backend needs only read_path(). A _LocalDirReader satisfies this.
     """
     try:
         validate_blob_path(entry.file)
@@ -1332,7 +1350,8 @@ def _apply_delta_entry(
     Output: (patched_bytes, success_bool)
     Details:
         Validates entry.delta_file with validate_blob_path before the disc
-        read. backend needs only read_path(); a _LocalDirReader satisfies this.
+        read. backend needs only read_path(). A _LocalDirReader satisfies
+        this.
     """
     try:
         validate_blob_path(entry.delta_file)

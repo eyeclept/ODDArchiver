@@ -53,7 +53,7 @@ def _fmt_bytes(n: int) -> str:
 def setup_logging(log_file: Path, level: int = logging.INFO) -> None:
     """
     Input:  log_file - the path to the append-only log file. The function creates
-                        parent directories if they are missing.
+                        missing parent directories.
             level    - the minimum log level. The default is INFO.
     Output: None
     Details:
@@ -123,7 +123,7 @@ def check_capacity(
     Input:  used_pct        - percentage of disc capacity in use (0 to 100)
             remaining_bytes - bytes still free on the disc or ISO
             logger          - logger for the message. If not given, the
-                              function uses this module's logger.
+                              function uses the logger of this module.
     Output: None
     Details:
         Thresholds:

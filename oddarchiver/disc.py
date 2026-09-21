@@ -4,12 +4,14 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    BurnBackend abstract interface plus DiscBackend (dvd+rw-mediainfo
-    for capacity, growisofs plus genisoimage to write DVD/BD, xorriso
-    for direct SG_IO reads; CD media is refused) and
-    ISOBackend (genisoimage) implementations. ISOBackend is used for
-    --test-iso mode and all automated testing. DiscBackend targets
-    physical optical drives.
+    BurnBackend abstract interface plus DiscBackend and
+    ISOBackend (genisoimage) implementations.
+
+    DiscBackend uses dvd+rw-mediainfo for capacity, growisofs
+    plus genisoimage to write DVD/BD, and xorriso for direct
+    SG_IO reads. It refuses CD media.
+    ISOBackend serves --test-iso mode and all automated
+    testing. DiscBackend targets physical optical drives.
 """
 # Imports
 from __future__ import annotations
@@ -34,9 +36,10 @@ DVD_DL_DISC_BYTES = 8_547_991_552  # ~8.5 GB dual-layer DVD usable capacity
 # Same GiB-floor headroom as bd-r (23 GiB) and bdxl (93 GiB): floor(50_050_629_632 / 2**30).
 BD_DL_DISC_BYTES = 46 * 2**30      # 50 GB dual-layer BD-R usable headroom (~46 GiB)
 BDXL_DISC_BYTES = 93 * 2**30       # 100 GB BDXL usable headroom (~93 GiB)
-# Fixed, root-owned path, never the invoking user's own PATH. See
-# usb_reauth.py's module docstring and SETUP.md for why this must be a
-# manual `sudo install` target, not something `pip install -e .` creates.
+# Fixed, root-owned path, never the PATH of the invoking user. See
+# the module docstring of usb_reauth.py and SETUP.md for why this must
+# be a manual `sudo install` target, not something
+# `pip install -e .` creates.
 _USB_REAUTH_HELPER = "/usr/local/sbin/oddarchiver-usb-reauth"
 _log = logging.getLogger(__name__)
 # Text growisofs prints when the drive stops answering mid-write. Captured
@@ -45,8 +48,9 @@ _log = logging.getLogger(__name__)
 #   :-( write failed: Input/output error
 #   :-( unable to FLUSH CACHE: Input/output error
 #   :-( unable to SYNCHRONOUS FLUSH CACHE: Input/output error
-# These phrases alone do not prove a disconnect; a dying disc raises I/O
-# errors too. _is_disconnect() pairs them with the device node vanishing.
+# These phrases alone do not prove a disconnect. A dying disc raises
+# I/O errors too. _is_disconnect() pairs them with the device node
+# vanishing.
 _DISCONNECT_SIGNATURES = (
     "input/output error",
     "no such device",
@@ -80,9 +84,9 @@ class BurnInterrupted(RuntimeError):
     Input:  message - human-readable burn-failure description
     Output: N/A (exception)
     Details:
-        Distinct from a plain growisofs refusal. Raised when the
-        growisofs subprocess was killed by a signal (POSIX returncode
-        < 0) or its output matched a hardware-level I/O fault
+        Distinct from a plain growisofs refusal. Raised when a signal
+        kills the growisofs subprocess (POSIX returncode
+        < 0) or when its output matches a hardware-level I/O fault
         (Power on / bus device reset / SCSI Unit Attention). Callers
         must not treat this as an ordinary command error.
     """
@@ -108,8 +112,8 @@ class BurnBackend(abc.ABC):
         Output: None
         Details:
             Write the first session to the target medium.
-            Aborts if the archive session count changed since
-            expected_session_count was recorded, or if expected identity
+            Aborts if the archive session count changed since the
+            code recorded expected_session_count, or if expected identity
             does not match the disc.
         """
 
@@ -131,8 +135,8 @@ class BurnBackend(abc.ABC):
         Output: None
         Details:
             Append a new session to an already-initialized medium.
-            Aborts if the archive session count changed since
-            expected_session_count was recorded, or if expected identity
+            Aborts if the archive session count changed since the
+            code recorded expected_session_count, or if expected identity
             does not match the disc.
         """
 
@@ -152,8 +156,8 @@ class BurnBackend(abc.ABC):
         Output: dict mapping each found path to its raw bytes
         Details:
             Read many files from the target medium in one operation.
-            Missing paths are omitted from the result, not raised.
-            A drive/medium failure raises RuntimeError.
+            The function omits missing paths from the result and does
+            not raise. A drive/medium failure raises RuntimeError.
         """
 
     @abc.abstractmethod
@@ -185,10 +189,11 @@ class DiscBackend(BurnBackend):
     Output: N/A (class)
     Details:
         Wraps dvd+rw-mediainfo for capacity, growisofs plus genisoimage
-        for DVD and BD writes, and xorriso for reads. CD media is
-        refused; see _raise_cd_unsupported. All of those talk to the drive directly over
-        SG_IO, not through the kernel block device layer. Reads never
-        depend on the OS's own capacity revalidation. That revalidation
+        for DVD and BD writes, and xorriso for reads. This class refuses
+        CD media. See _raise_cd_unsupported.
+        All of those tools talk to the drive directly over SG_IO, not
+        through the kernel block device layer. Reads never depend on
+        the OS to revalidate capacity. That cached capacity
         stayed stale for 5+ minutes after a real multi-minute burn, well
         past any bounded retry. There is no way to force it short of a
         physical eject/reinsert or root.
@@ -210,11 +215,12 @@ class DiscBackend(BurnBackend):
                 expected_archive_id, expected_volume_index
         Output: None
         Details:
-            Burns session 0 with growisofs -Z plus genisoimage. CD
-            profiles (MMC 0x0008/0x0009/0x000A) are refused, because a
-            CD cannot be kept appendable; see _raise_cd_unsupported. Progress is streamed as a single in-place bar.
-            A disc-full signature raises a capacity error, not a bare
-            exit code.
+            Burns session 0 with growisofs -Z plus genisoimage. This
+            tool refuses CD profiles (MMC 0x0008/0x0009/0x000A),
+            because a CD cannot stay appendable. See
+            _raise_cd_unsupported. Progress streams as a single
+            in-place bar. A disc-full signature raises a capacity
+            error, not a bare exit code.
         """
         self._guard(
             expected_session_count,
@@ -257,19 +263,20 @@ class DiscBackend(BurnBackend):
                 expected_archive_id, expected_volume_index
         Output: None
         Details:
-            Appends a session with growisofs -M. CD profiles are
-            refused, because a CD cannot be kept appendable; see
-            _raise_cd_unsupported. Progress is streamed the same way
+            Appends a session with growisofs -M. This tool refuses
+            CD profiles, because a CD cannot stay appendable. See
+            _raise_cd_unsupported. Progress streams the same way
             as init().
-            On the growisofs stale-kernel-block-layer failure, attempts
-            one automatic recovery (USB re-enumeration via
-            _attempt_usb_reauth()) and retries once before giving up.
-            See the "Environment-specific hardware limitation" section of
-            STATE_OF_THE_PROGRAM.md for why this failure happens and why
-            the retry works. That
-            recovery stays on the growisofs path only. A disc-full
-            signature re-verifies prior sessions and raises a diagnosed
-            error instead of a bare exit code.
+
+            On the growisofs stale-kernel-block-layer failure, this
+            method attempts one automatic recovery (USB
+            re-enumeration via _attempt_usb_reauth()) and retries
+            once before giving up. See the "Environment-specific
+            hardware limitation" section of STATE_OF_THE_PROGRAM.md
+            for why this failure happens and why the retry works.
+            That recovery stays on the growisofs path only. A
+            disc-full signature re-verifies prior sessions and
+            raises a diagnosed error instead of a bare exit code.
         """
         self._guard(
             expected_session_count,
@@ -401,8 +408,8 @@ class DiscBackend(BurnBackend):
         Output: None
         Details:
             Raises RuntimeError when the writer printed the growisofs
-            disc-full signature. xorriso's writer was removed in commit
-            c2c8ba7, so no code path can produce xorriso disc-full
+            disc-full signature. Commit c2c8ba7 removed the xorriso
+            writer, so no code path can produce xorriso disc-full
             wording. Init explains a packing/capacity miss and does not
             re-verify prior sessions. Append re-verifies prior sessions
             and folds that result into the message. Returns without
@@ -454,9 +461,9 @@ class DiscBackend(BurnBackend):
         Input:  attempted_session - session number that just failed to burn
         Output: bool - True if every session below attempted_session is readable
         Details:
-            Reads each prior session's manifest.enc then manifest.json.
-            Used to annotate BurnInterrupted and disc-full append errors.
-            Does not repair anything.
+            Reads manifest.enc then manifest.json from each prior
+            session. Used to annotate BurnInterrupted and disc-full
+            append errors. Does not repair anything.
         """
         if attempted_session <= 0:
             return True
@@ -494,15 +501,15 @@ class DiscBackend(BurnBackend):
             Invokes _USB_REAUTH_HELPER via `sudo -n` (non-interactive:
             fails immediately instead of hanging on a password prompt in
             an unattended cron job). That path is a fixed, root-owned
-            system location, never the invoking user's own PATH. It
-            must be installed with a manual `sudo install` step (see
-            SETUP.md), not via `pip install -e .`, because sudoers trusts
-            an exact path string, not who currently controls the file
-            living there. Logs a warning, not an exception. This is an
+            system location, never the PATH of the invoking user. A
+            manual `sudo install` step (see SETUP.md) must install it,
+            not `pip install -e .`, because sudoers trusts an exact
+            path string, not who currently controls the file living
+            there. Logs a warning, not an exception. This is an
             expected, recoverable condition when the one-time root
-            install/sudoers setup has not been done yet. The warning
-            names exactly why it did not run, so a cron job's logs show
-            the real reason.
+            install/sudoers setup is still missing. The warning
+            names exactly why it did not run, so the logs of a cron
+            job show the real reason.
         """
         if not Path(_USB_REAUTH_HELPER).is_file():
             _log.warning(
@@ -533,13 +540,13 @@ class DiscBackend(BurnBackend):
         Details:
             A successful "authorized" write returns well before the
             kernel finishes destroying and recreating the USB device.
-            This race is confirmed live: an immediate growisofs retry
-            right after _attempt_usb_reauth() reported success hit
-            "unable to open64(...): No such file or directory". The
-            device node came back correctly (and readable at the right
-            capacity) moments later with no further action. Polls for
-            the node's existence with a bounded wait instead of
-            retrying immediately into that race.
+            A live test confirmed this race: an immediate growisofs
+            retry right after _attempt_usb_reauth() reported success
+            hit "unable to open64(...): No such file or directory".
+            The device node came back correctly (and readable at the
+            right capacity) moments later with no further action.
+            This function polls for the node with a bounded wait
+            instead of retrying immediately into that race.
         """
         for _ in range(retries):
             if Path(self.device).exists():
@@ -558,14 +565,15 @@ class DiscBackend(BurnBackend):
             after a burn while the drive reloads the tray (often 5 to 30
             seconds).
 
-            dvd+rw-mediainfo is used rather than xorriso -toc because
-            growisofs formats BD-R for Pseudo OverWrite. xorriso reports
-            such a medium as "is unsuitable" and prints no session count,
-            so a BD-R holding one session parsed as zero sessions. That
-            would let init treat a written archive as blank and overwrite
-            it. dvd+rw-mediainfo reports the same disc correctly as
-            "appendable" with "Number of Sessions: 1". Confirmed on real
-            M-DISC BD-R hardware.
+            This class calls dvd+rw-mediainfo rather than xorriso -toc
+            because growisofs formats BD-R for Pseudo OverWrite.
+            xorriso reports such a medium as "is unsuitable" and
+            prints no session count, so a BD-R holding one session
+            parsed as zero sessions. That would let init treat a
+            written archive as blank and overwrite it.
+            dvd+rw-mediainfo reports the same disc correctly as
+            "appendable" with "Number of Sessions: 1". Confirmed on
+            real M-DISC BD-R hardware.
 
             dvd+rw-mediainfo refuses CD with "non-DVD media mounted". That
             error is the CD detector: it raises the unsupported-media
@@ -610,14 +618,17 @@ class DiscBackend(BurnBackend):
         Details:
             Extracts every requested file in one
             `xorriso -indev DEVICE -osirrox on` invocation with multiple
-            `-extract src dest` pairs, so the ISO volume descriptor is
-            parsed once. `-abort_on NEVER` keeps a missing member from
-            aborting the rest of the batch; omitted paths are absent
-            from the result. Drive-not-ready and busy-device retries
-            match the previous single-file read_path() behavior.
+            `-extract src dest` pairs, so the backend parses the ISO
+            volume descriptor once. `-abort_on NEVER` keeps a missing
+            member from aborting the rest of the batch. Omitted paths
+            stay absent from the result.
+
+            Drive-not-ready and busy-device retries match the previous
+            single-file read_path() behavior.
+
             Raises ValueError if any path is not a known-safe blob or
-            manifest path. Raises RuntimeError if the drive/medium
-            itself cannot be read after retries.
+            manifest path. Raises RuntimeError if the backend still
+            cannot read the drive/medium after retries.
         """
         from oddarchiver.manifest import validate_disc_read_path
 
@@ -777,9 +788,10 @@ class DiscBackend(BurnBackend):
                 expected_volume_index  - volume_index to continue, or None
         Output: None
         Details:
-            When expected_archive_id is set, re-reads volume.json and
-            refuses a mismatched or missing marker. Then compares the
-            archive session count (VolumeMarker.first_session plus the
+            When the caller sets expected_archive_id, re-reads volume.json and
+            refuses a mismatched or missing marker.
+
+            Then compares the archive session count (VolumeMarker.first_session plus the
             sessions on this volume) to expected. MMC session_count is
             not that number: BD-R SRM+POW reports 1 after the first
             burn, because growisofs appends tracks inside one MMC
@@ -790,9 +802,10 @@ class DiscBackend(BurnBackend):
             control files. It uses mediainfo().session_count, which is
             0 on empty media and becomes 1 after the first session.
             That call also refuses CD media. The BD-R stuck-at-1
-            failure only starts after that first session. expected
-            != 0 still calls mediainfo() so CD media is refused, then
-            re-reads the archive session count.
+            failure only starts after that first session.
+
+            expected != 0 still calls mediainfo() so this tool refuses
+            CD media, then re-reads the archive session count.
         """
         if expected_archive_id is not None:
             check_volume_identity(
@@ -823,9 +836,9 @@ class ISOBackend(BurnBackend):
     Details:
         Wraps genisoimage to build UDF ISOs for --test-iso mode and CI.
         Sessions accumulate in a sibling directory that replaces the .iso
-        suffix with .d. The ISO is rebuilt from that tree on every write.
-        read_paths()/read_path() read from that directory. No loop mount
-        is required.
+        suffix with .d. The backend rebuilds the ISO from that tree on
+        every write. read_paths()/read_path() read from that directory.
+        The code needs no loop mount.
     """
 
     DEFAULT_DISC_BYTES = 23 * 2**30   # 23 GiB (~25 GB BD-R usable headroom)
@@ -896,8 +909,8 @@ class ISOBackend(BurnBackend):
         Output: None
         Details:
             Records simulated used space in a metadata file so mediainfo()
-            reports reduced remaining_bytes. No real data is written to disc.
-            Used with --prefill to test capacity warning paths.
+            reports reduced remaining_bytes. The backend writes no real
+            data to disc. Used with --prefill to test capacity warning paths.
         """
         self._meta_path.write_text(json.dumps({"prefill_bytes": prefill_bytes}))
 
@@ -935,9 +948,9 @@ class ISOBackend(BurnBackend):
         Input:  paths - relative paths within the disc filesystem
         Output: dict mapping each found path to its raw bytes
         Details:
-            Reads from the sessions_root directory tree. Missing paths are
-            omitted. Raises ValueError if a path is not a known-safe blob
-            or manifest path.
+            Reads from the sessions_root directory tree. The function
+            omits missing paths. Raises ValueError if a path is not a
+            known-safe blob or manifest path.
         """
         from oddarchiver.manifest import validate_disc_read_path
 
@@ -969,8 +982,8 @@ class ISOBackend(BurnBackend):
         Output: None (writes dest)
         Details:
             Copies from the sessions_root tree. Raises FileNotFoundError
-            if the source is missing. Raises ValueError if path is not a
-            known-safe blob or manifest path.
+            if the source does not exist. Raises ValueError if path is
+            not a known-safe blob or manifest path.
         """
         from oddarchiver.manifest import validate_disc_read_path
 
@@ -996,9 +1009,10 @@ class ISOBackend(BurnBackend):
                 expected_volume_index  - volume_index to continue, or None
         Output: None
         Details:
-            When expected_archive_id is set, re-reads volume.json and
-            refuses a mismatched or missing marker. Then compares the
-            archive session count (VolumeMarker.first_session plus the
+            When the caller sets expected_archive_id, re-reads volume.json and
+            refuses a mismatched or missing marker.
+
+            Then compares the archive session count (VolumeMarker.first_session plus the
             sessions on this volume) to expected. MMC session_count is
             not that number: BD-R SRM+POW reports 1 after the first
             burn, because growisofs appends tracks inside one MMC
@@ -1009,12 +1023,13 @@ class ISOBackend(BurnBackend):
             not scan control files. It uses mediainfo().session_count,
             which is 0 when the session tree is empty and becomes 1
             after the first session. The BD-R stuck-at-1 failure only
-            starts after that first session. ISOBackend.session_count
-            itself does increment per archive session (it counts
-            session_* directories), but callers pass the archive
-            session count, and a BD-R-like wrapper can lie about
-            mediainfo().session_count, so this guard still uses
-            archive_session_count when expected != 0.
+            starts after that first session.
+
+            ISOBackend.session_count itself does increment per archive
+            session (it counts session_* directories), but callers
+            pass the archive session count, and a BD-R-like wrapper
+            can lie about mediainfo().session_count, so this guard
+            still uses archive_session_count when expected != 0.
         """
         if expected_archive_id is not None:
             check_volume_identity(
@@ -1042,11 +1057,11 @@ class ISOBackend(BurnBackend):
         Output: None
         Details:
             Calls genisoimage to build a UDF ISO from sessions_root.
-            -allow-limited-size is required alongside -udf. Verified
-            directly: genisoimage still refuses a 4 GiB+ file with
-            "-allow-limited-size was not specified" in UDF mode without
-            it, so -udf alone is not sufficient. Writes to a .tmp file
-            then renames to avoid a partial ISO.
+            genisoimage needs -allow-limited-size alongside -udf.
+            Verified directly: genisoimage still refuses a 4 GiB+ file
+            with "-allow-limited-size was not specified" in UDF mode
+            without it, so -udf alone does not suffice. Writes to a
+            .tmp file then renames to avoid a partial ISO.
         """
         tmp = self.iso_path.with_suffix(".tmp")
         cmd = [
@@ -1091,16 +1106,17 @@ class ISOBackend(BurnBackend):
 
 # --- module-level helpers ---
 
-# growisofs's own progress line, straight from its usage strings:
+# The growisofs progress line, straight from the growisofs usage strings:
 # "%11lld/%lld (%4.1f%%) @%.1fx, remaining %d:%02d RBU %5.1f%% UBU %5.1f%%"
 # (or "@0x, remaining ??:??" when speed/ETA are not yet known).
 _GROWISOFS_PROGRESS_RE = re.compile(
     r"^\s*(\d+)/(\d+)\s+\(\s*([\d.]+)%\)\s+@([^,]+),\s*remaining\s+(\S+):(\S+)"
 )
-# The mkisofs/xorriso child process's own build-phase update, e.g.
+# The build-phase update from the mkisofs/xorriso child process, e.g.
 # "xorriso : UPDATE :       8 files added in 1 seconds".
 _XORRISO_FILES_ADDED_RE = re.compile(r"UPDATE\s*:\s*(\d+)\s+files added")
-# xorriso's own percentage-based progress line for long-running scans/writes
+
+# The percentage-based progress line from xorriso for long-running scans/writes
 # on a large tree, e.g.
 # "xorriso : UPDATE : 62.29% done, estimate finish Sun Apr 09 10:35:29 2023".
 # It repeats once per ~0.15-0.2% on a large real archive and floods the
@@ -1108,16 +1124,18 @@ _XORRISO_FILES_ADDED_RE = re.compile(r"UPDATE\s*:\s*(\d+)\s+files added")
 _XORRISO_PERCENT_DONE_RE = re.compile(
     r"UPDATE\s*:\s*([\d.]+)%\s+done,\s*estimate finish\s+(.+)"
 )
-# genisoimage's own percentage-based progress line for the same phase, when
-# growisofs shells out to it via MKISOFS=genisoimage (forced unconditionally
-# in _run_growisofs, because genisoimage, not xorriso, handles a 4 GiB+
-# file). genisoimage prints the bare line with no "UPDATE :" tag, e.g.
-# "  0.67% done, estimate finish Mon Sep 21 11:15:49 2026". Anchored at the
-# start of the line (after optional whitespace) so it can never match the
-# xorriso line above, which always starts with "xorriso : UPDATE :". Without
-# this, every line falls through to the raw-print path and floods the
-# terminal with one new line per ~0.15-0.2%, the same complaint the xorriso
-# regex above was written for, on the tool that is actually invoked here.
+# genisoimage prints the same percentage-based progress line for this
+# phase, when growisofs shells out to it via MKISOFS=genisoimage
+# (forced unconditionally in _run_growisofs, because genisoimage, not
+# xorriso, handles a 4 GiB+ file). genisoimage prints the bare line
+# with no "UPDATE :" tag, e.g.
+# "  0.67% done, estimate finish Mon Sep 21 11:15:49 2026". Anchored
+# at the start of the line (after optional whitespace) so it can
+# never match the xorriso line above, which always starts with
+# "xorriso : UPDATE :". Without this, every line falls through to
+# the raw-print path and floods the terminal with one new line per
+# ~0.15-0.2%, the same complaint that motivated the xorriso regex
+# above, on the tool that this file actually invokes.
 _GENISOIMAGE_PERCENT_DONE_RE = re.compile(
     r"^\s*([\d.]+)%\s+done,\s*estimate finish\s+(.+)$"
 )
@@ -1154,7 +1172,7 @@ def _run_burn_cmd(
 ) -> tuple[int, list[str]]:
     """
     Input:  cmd - full writer argv (growisofs or xorriso)
-            env - optional child environment; None inherits the parent
+            env - optional child environment. None inherits the parent
     Output: (returncode, output_lines) - process return code and every raw
             line printed (stdout+stderr merged, one entry per line, in
             order), so callers can recognize a known failure signature.
@@ -1162,16 +1180,18 @@ def _run_burn_cmd(
         Streams the writer live instead of letting it dump raw output.
         growisofs repeats a
         "<written>/<total> (<pct>%) @<speed>x, remaining M:SS ..." line
-        very frequently during the actual write. The mkisofs child it
-        shells out to (genisoimage in this project, forced by
-        MKISOFS=genisoimage; xorriso if invoked directly) repeats either
+        very frequently during the actual write.
+
+        The mkisofs child it shells out to (genisoimage in this
+        project, forced by MKISOFS=genisoimage. Xorriso if invoked
+        directly) repeats either
         "<n> files added in <n> seconds" for a moderate source tree or
         "<pct>% done, estimate finish <timestamp>" for a large one.
-        genisoimage prints that last line bare; xorriso tags it
-        "UPDATE :". Both forms are matched.
-        Recognized progress lines are re-rendered as a single in-place
-        updating line. Anything else prints through unchanged so nothing
-        real is ever swallowed.
+        genisoimage prints that last line bare, and xorriso tags it
+        "UPDATE :". The function matches both forms. It re-renders
+        recognized progress lines as a single in-place updating line.
+        Anything else prints through unchanged so nothing real is
+        ever swallowed.
     """
     from oddarchiver.session import _print_bar
 
@@ -1248,16 +1268,18 @@ def _run_growisofs(cmd: list[str]) -> tuple[int, list[str]]:
             failure signature in the text growisofs already printed.
     Details:
         Streams growisofs through _run_burn_cmd. Forces
-        MKISOFS=genisoimage in the child's environment. growisofs looks
-        for a binary literally named 'mkisofs' unless overridden. On a
-        system where that name resolves to xorriso's own
-        mkisofs-emulation layer (a common packaging choice), neither
-        -udf nor -allow-limited-size is accepted there ("Unsupported
-        option"), so any file 4 GiB or larger fails the ISO9660 size
-        field regardless of the -udf flag passed on this cmd. genisoimage
-        is a real, separate mkisofs-family binary that honors both flags
-        and represents such a file as UDF-only, verified directly against
-        this failure signature before shipping this fix.
+        MKISOFS=genisoimage in the child environment. growisofs looks
+        for a binary literally named 'mkisofs' unless overridden.
+
+        On a system where that name resolves to the
+        mkisofs-emulation layer of xorriso (a common packaging
+        choice), that layer accepts neither -udf nor
+        -allow-limited-size ("Unsupported option"), so any file 4 GiB
+        or larger fails the ISO9660 size field regardless of the -udf
+        flag passed on this cmd. genisoimage is a real, separate
+        mkisofs-family binary that honors both flags and represents
+        such a file as UDF-only, verified directly against this
+        failure signature before shipping this fix.
     """
     env = {**os.environ, "MKISOFS": "genisoimage"}
     return _run_burn_cmd(cmd, env=env)
@@ -1282,10 +1304,10 @@ def _is_disc_full_signature(output_lines: list[str]) -> bool:
     Input:  output_lines - captured growisofs stdout/stderr lines
     Output: bool - True if output matches growisofs disc-full text
     Details:
-        growisofs prints "<free> blocks are free, <needed> to be written"
-        (optional trailing "!") then "write failed: No space left on
-        device". Requires all three phrases so a lone ENOSPC line does
-        not match.
+        growisofs prints `"<free> blocks are free, <needed> to be
+        written"` (optional trailing "!") then `write failed: No space
+        left on device`. Requires all three phrases so a lone ENOSPC
+        line does not match.
     """
     blob = "\n".join(output_lines).lower()
     return (
@@ -1309,11 +1331,13 @@ def archive_session_count(backend: BurnBackend) -> int:
 
         A missing volume marker treats first_session as 0 (legacy or
         single-volume). DiscBackend counts manifests from
-        first_session via load_session_manifests; encrypted manifests
-        still occupy a slot. ISOBackend counts session_* directories
-        in the session tree. That matches the manifest count when
-        every session has a manifest, and it still increments when a
-        test ISO omits manifests.
+        first_session via load_session_manifests. Encrypted manifests
+        still occupy a slot.
+
+        ISOBackend counts session_* directories in the session tree.
+        That matches the manifest count when every session has a
+        manifest, and it still increments when a test ISO omits
+        manifests.
     """
     from oddarchiver.volume import read_volume_marker
     from oddarchiver.manifest import load_session_manifests
@@ -1341,9 +1365,10 @@ def check_volume_identity(
     Output: None
     Details:
         Reads volume.json immediately before a burn. Raises RuntimeError
-        naming expected vs found identity when they differ, or when a
-        marker is missing. Callers with no expected identity skip this
-        function, so blank-disc init does not pay an extra disc read.
+        that names expected vs found identity when they differ, or when
+        the marker does not exist. Callers with no expected identity
+        skip this function, so blank-disc init does not pay an extra
+        disc read.
     """
     from oddarchiver.volume import read_volume_marker
 
@@ -1397,30 +1422,32 @@ def resolve_usb_device_sysfs_path(
 ) -> Path | None:
     """
     Input:  device         - block device path, e.g. "/dev/sr0"
-            sys_class_block - root of the sysfs block-class tree; override
+            sys_class_block - root of the sysfs block-class tree. Override
                               in tests to point at a fake tree
-    Output: Path to the device's USB sysfs directory (the one whose
-            "authorized" attribute controls whether the kernel treats it
-            as plugged in), or None if it cannot be resolved (not a USB
-            device, or the block device does not exist).
+    Output: Path to the USB sysfs directory of the device (the one
+            whose "authorized" attribute controls whether the kernel
+            treats it as plugged in), or None if resolution fails
+            (not a USB device, or the block device does not exist).
     Details:
         Walks <sys_class_block>/<name>/device (a symlink into the real
         device tree) up through its ancestors until it finds a directory
         that has both "idVendor" and "authorized". That combination
         uniquely identifies the actual USB device node, as opposed to a
         USB interface (has neither), a SCSI target, or a SCSI host
-        underneath it. This makes no assumption about bus number, port
-        number, or hub depth. It works for any USB optical drive on any
-        machine's topology.
+        underneath it.
+
+        This makes no assumption about bus number, port number, or hub
+        depth. It works for any USB optical drive on the topology of
+        any machine.
 
         Confirmed live (see STATE_OF_THE_PROGRAM.md,
         "Environment-specific hardware limitation"):
         deauthorizing then reauthorizing the path this resolves to
         forces a full USB re-enumeration, including the real capacity
-        probe that growisofs -M's own kernel-block-layer read otherwise
-        never gets after an in-place burn. This fixes the append
-        failure with no tray action and no interactive session. Used by
-        DiscBackend._attempt_usb_reauth() and the standalone
+        probe that the kernel-block-layer read inside growisofs -M
+        otherwise never gets after an in-place burn. This fixes the
+        append failure with no tray action and no interactive session.
+        Used by DiscBackend._attempt_usb_reauth() and the standalone
         oddarchiver-usb-reauth helper script (oddarchiver/usb_reauth.py).
     """
     class_path = sys_class_block / Path(device).name
@@ -1437,7 +1464,7 @@ def resolve_usb_device_sysfs_path(
 
 # Named media-size presets for parse_disc_size(), matched case-insensitively
 # before the raw-suffix/int fallback. "bd-r" aliases ISOBackend.DEFAULT_DISC_BYTES
-# so there is exactly one definition of that size.
+# so the code defines that size in exactly one place.
 _DISC_SIZE_PRESETS: dict[str, int] = {
     "cd": CD_DISC_BYTES,
     "dvd-sl": DVD_SL_DISC_BYTES,
@@ -1458,10 +1485,10 @@ def parse_disc_size(size_str: str) -> int:
         Supports decimal (kb/mb/gb/tb) and binary (kib/mib/gib/tib) suffixes,
         the named media presets in _DISC_SIZE_PRESETS ("cd", "dvd-sl",
         "dvd-dl", "bd-r", "bd-dl", "bdxl"), or a raw integer byte count.
-        Presets are matched before the unit-suffix parse; none of the
-        preset names collide with a recognized size suffix. A string with
-        no suffix and no matching preset is parsed as a raw integer byte
-        count.
+        Presets match before the unit-suffix parse. None of the
+        preset names collide with a recognized size suffix. The code
+        parses a string with no suffix and no matching preset as a
+        raw integer byte count.
     """
     s = size_str.lower().strip()
     if s in _DISC_SIZE_PRESETS:
@@ -1514,14 +1541,15 @@ def _is_no_media_text(text: str) -> bool:
 def _is_disconnect(output_lines: list[str], device: str) -> bool:
     """
     Input:  output_lines - captured growisofs stdout and stderr
-            device       - device path that was being written
+            device       - device path under an in-progress write
     Output: True if the drive vanished from the bus mid-write
     Details:
-        Requires BOTH an I/O-error-class phrase in the output AND the
-        device node being gone. The phrases alone are ambiguous: failing
+        Requires BOTH an I/O-error-class phrase in the output AND a
+        missing device node. The phrases alone are ambiguous: failing
         media raises "Input/output error" while the drive stays present.
         A missing device node separates an unplug from bad media, and it
-        is also why prior sessions cannot be re-read for reassurance.
+        is also why the backend cannot re-read prior sessions for
+        reassurance.
     """
     blob = "\n".join(output_lines).lower()
     if not any(s in blob for s in _DISCONNECT_SIGNATURES):
@@ -1532,12 +1560,12 @@ def _is_disconnect(output_lines: list[str], device: str) -> bool:
 def _raise_disconnected(device: str, attempted_session: int | None) -> None:
     """
     Input:  device            - device path that disappeared
-            attempted_session - session number being written, or None
+            attempted_session - session number the write targets, or None
     Output: never returns
     Details:
         Raises the diagnosed error for a mid-write disconnect. Unlike a
-        disc-full or SCSI-reset failure, prior sessions CANNOT be
-        re-verified here, because the drive is gone. The message says so
+        disc-full or SCSI-reset failure, re-verifying prior sessions
+        is impossible here, because the drive is gone. The message says so
         instead of claiming the data is safe, and warns that the device
         path can change when the drive comes back.
     """
@@ -1567,15 +1595,17 @@ def _raise_cd_unsupported() -> None:
     Output: never returns
     Details:
         Refuses a CD burn. ODDArchiver appends sessions to write-once
-        media, and CD cannot be kept appendable through this toolchain.
-        Two blank CD-Rs were burned on real hardware and both came back
-        "is written , is closed" with 0 writable blocks, once with
-        xorriso -outdev and again with -dev plus -close off, which is
-        the documented growing method. A single session writes fine, so
-        the refusal is about append, not about writing.
+        media, and CD cannot stay appendable through this toolchain.
+        Two real-hardware test burns on blank CD-Rs both came back
+        `is written , is closed` with 0 writable blocks, once with
+        xorriso -outdev and again with -dev plus -close off, the
+        documented growing method.
+
+        A single session writes fine, so the refusal is about append,
+        not about writing.
 
         growisofs cannot substitute here: dvd+rw-tools targets DVD and
-        BD only. DVD and BD are unaffected and remain supported.
+        BD only. DVD and BD stay supported.
     """
     raise RuntimeError(
         "CD media is not supported. ODDArchiver appends sessions to "
@@ -1591,9 +1621,9 @@ def _parse_mediainfo(stdout: str) -> DiscInfo:
     Output: DiscInfo
     Details:
         Extracts session count, remaining blocks (2KB units), total capacity,
-        and label. Remaining and capacity blocks are multiplied by 2048.
+        and label. The parser multiplies remaining and capacity blocks by 2048.
         Blank BD-R discs report "Number of Sessions: 1" with an implicit empty
-        session. Those discs are treated as 0 written sessions.
+        session. The parser treats those discs as 0 written sessions.
     """
     session_match = re.search(r"Sessions:\s+(\d+)", stdout)
     # dvd+rw-mediainfo uses *2KB for DVD and *2048 for BD. Accept both.
@@ -1610,8 +1640,8 @@ def _parse_mediainfo(stdout: str) -> DiscInfo:
 
     # Prefer the explicit Remaining: field. Fall back to the last Free
     # Blocks entry: the invisible/writable track on BD-R SRM, which holds
-    # the actual remaining capacity. Earlier tracks show 0 and must be
-    # ignored.
+    # the actual remaining capacity. Earlier tracks show 0, so the
+    # parser must ignore them.
     if remaining_match:
         remaining_bytes = int(remaining_match.group(1)) * 2048
     elif free_blocks_all:

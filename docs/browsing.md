@@ -20,12 +20,13 @@ oddarchiver ls --test-iso archive.iso --show-deleted
 
 Columns: Path, Size, Origin Session, Last Modified.
 
-Origin Session is the session that last wrote the path. Size is that
-entry's `full_size_bytes`. Last Modified is that session's timestamp,
-or the deleting session's timestamp when the row is a tombstone.
+Origin Session is the session that last wrote the path. Size is
+`full_size_bytes` of that entry. Last Modified is the timestamp of that
+session, or the timestamp of the deleting session when the row is a
+tombstone.
 
-Default view: live paths as of the latest session. Deleted paths are
-omitted.
+Default view: live paths as of the latest session. The listing omits
+deleted paths.
 
 ## `--path`, `--session`, `--show-deleted`
 
@@ -40,8 +41,8 @@ starts with `P` with trailing slashes stripped plus `/`. So `--path a/b.txt`
 selects that file. `--path d/` (or `--path d`) selects every path under
 `d/`.
 
-`--session N` freezes the tree at session N. Files added later are
-absent. A file updated later shows its content as of N.
+`--session N` freezes the tree at session N. Files added later do not
+appear. A file updated later shows its content as of N.
 
 `--show-deleted` applies to `ls` and `browse` only. Tombstones print
 with a trailing ` [DELETED at session NNN]` marker. BD-R is write-once,
@@ -58,7 +59,7 @@ oddarchiver restore /tmp/out --test-iso archive.iso \
     --path gone.txt --session 0
 ```
 
-`--force` is unchanged: overwrite dest files even when checksums match.
+`--force` is the same as elsewhere: overwrite dest files even when checksums match.
 
 If a requested path matches nothing at the target session, stdout gets:
 
@@ -75,11 +76,11 @@ oddarchiver browse --test-iso archive.iso
 oddarchiver browse --device /dev/sr0 --show-deleted
 ```
 
-Plain `input()` loop. No extra TUI library. The live tree is built once
-via `build_disc_tree()`. The listing shows direct children of the
+Plain `input()` loop. No extra TUI library. `build_disc_tree()` builds
+the live tree once. The listing shows direct children of the
 current prefix. Directories end with `/`. A `*` marks a selected path.
 
-Start at archive root (`/`). Selection is a set of relative paths and
+Start at archive root (`/`). Selection holds a set of relative paths and
 survives directory changes in the same process.
 
 Commands:

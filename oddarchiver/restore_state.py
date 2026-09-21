@@ -8,8 +8,8 @@ Description:
     The file records which volumes of a marked archive the restore
     applied to dest. It also records the per-file checksums replayed
     from those volumes. A later invocation can then skip volumes it
-    already applied, and can apply deltas that rest on dest's
-    reconstructed bytes.
+    already applied, and can apply deltas that rest on the
+    reconstructed bytes in dest.
 """
 # Imports
 from __future__ import annotations
@@ -59,7 +59,7 @@ class RestoreState:
     files is a compact replay dict (path -> last checksum / session /
     has_full), in the same spirit as manifest.build_disc_state. The
     state does not store blobs. dest holds the reconstructed bytes. A
-    later volume's delta applies on top of dest when dest matches the
+    delta from a later volume applies on top of dest when dest matches the
     stored checksum. deleted maps path -> last deleting session.
     """
 
@@ -83,13 +83,14 @@ def state_path(dest: Path, archive_id: str) -> Path:
             state directory (ledger.ledger_dir()). The path is never
             inside dest.
     Details:
-        The file lives outside dest. A marked archive's restore then
-        never adds a bookkeeping file to the reconstructed tree. dest
+        The file lives outside dest. A restore of a marked archive
+        then never adds a bookkeeping file to the reconstructed tree. dest
         stays a byte-for-byte mirror of the source. This matches the
-        legacy (unmarked) restore path and the expectation of every
-        existing restore test. The key combines archive_id and dest's
-        resolved path, hashed for a stable filesystem-safe name. This
-        mirrors ledger_path()'s (label, backend_id) keying rationale.
+        legacy (unmarked) restore path, and every existing restore
+        test expects this. The key combines archive_id and the
+        resolved path of dest, hashed for a stable filesystem-safe
+        name. This mirrors the keying rationale of ledger_path()
+        (label, backend_id).
     """
     key = f"{archive_id}:{Path(dest).resolve()}"
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
@@ -130,7 +131,7 @@ def write_restore_state(dest: Path, state: RestoreState) -> None:
     """
     Input:  dest  - restore destination directory (used only for the key,
                     matching state_path())
-            state - RestoreState to persist; state.archive_id supplies
+            state - RestoreState to persist. state.archive_id supplies
                     the other half of the key
     Output: None
     Details:

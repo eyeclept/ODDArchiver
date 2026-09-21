@@ -5,8 +5,8 @@ Email:  eyeclept@pm.me
 
 Description:
     Integrity checks at three levels: fast (manifest checksum),
-    checksum (raw blob hashes), full (session-ordered reconstruction of
-    every file's latest state, compared against result_checksum).
+    checksum (raw blob hashes), full (session-ordered rebuild of the
+    latest state of every file, compared against result_checksum).
     --level full (TODO 23c) reuses the raw encrypted blobs that the
     checksum pass already read this run. It does not take a second
     optical pass through restore(). One disc scan total, not two.
@@ -41,12 +41,12 @@ _BLOB_ERRORS = (OSError, ValueError, RuntimeError)
 
 class _CaptureSource:
     """
-    Input:  root - directory _check_blobs has been capturing raw blobs into
+    Input:  root - directory _check_blobs captures raw blobs into
     Output: N/A (class)
     Details:
         Minimal SessionSource-shaped wrapper (see oddarchiver.diskread)
-        over the blobs _check_blobs already read this run. Every
-        session's content lives under the same root (entry.file /
+        over the blobs _check_blobs already read this run. The
+        content of every session lives under the same root (entry.file /
         entry.delta_file already embed their own "session_NNN/"
         prefix). open_session() ignores its argument and always
         returns root. This lets --level full drive
@@ -100,7 +100,7 @@ def verify(
             read_mode     - "sequential" (default) or "full-copy" for blob reads
             skip_disc_io  - if True, do not scan the disc or probe incomplete
                             slots (post-burn in-memory path). Default True
-                            when manifests is provided, False otherwise.
+                            when the caller passes manifests, False otherwise.
             control_raw   - optional already-fetched session control files
     Output: bool - True if all checks passed. Raises SystemExit(1) if total_errors != 0.
     Details:
@@ -249,7 +249,7 @@ def _read_all_manifests(
 ) -> dict[int, Manifest]:
     """
     Input:  backend  - BurnBackend to read from
-            tmp_path - unused; kept so existing call sites stay valid
+            tmp_path - unused. Kept so existing call sites stay valid
             crypto   - CryptoBackend for encrypted manifests (None = plaintext)
             raw      - optional already-fetched control-file bytes
     Output: dict mapping session index -> Manifest
@@ -270,7 +270,7 @@ def detect_incomplete_session(
     Output: int session index of a dangling trailing slot, or None
     Details:
         A trailing slot beyond the last cleanly-parsed manifest is
-        INCOMPLETE when its manifest is truncated/unreadable (blank
+        INCOMPLETE when code cannot fully read its manifest (blank
         suspect with session < 0) or a session directory exists with
         no readable manifest. A fully-parsed trailing suspect
         (checksum mismatch) stays FAIL. A lone unreadable session 0
@@ -382,25 +382,26 @@ def _check_blobs(
             backend     - BurnBackend for blob reads
             crypto      - CryptoBackend for decryption
             errors      - list to append error strings to
-            capture_dir - when set (--level full only), every raw
-                          (still-encrypted) blob this call reads is also
-                          written under capture_dir at its own disc path,
-                          so --level full can reconstruct without a
-                          second disc read (see _check_full)
-            source      - optional SessionSource; when set, blobs are read
-                          from source.open_session() instead of backend
+            capture_dir - when set (--level full only), the call also
+                          writes every raw (still-encrypted) blob it
+                          reads under capture_dir at its own disc
+                          path, so --level full can reconstruct
+                          without a second disc read (see _check_full)
+            source      - optional SessionSource. When set, the code
+                          reads blobs from source.open_session()
+                          instead of backend
             split_progress - session-ordered running concat state for
-                          volume-split files; shared across _check_blobs
-                          calls so a complete 0..count-1 group hashes
-                          once, at the last chunk
+                          volume-split files. Callers share it across
+                          _check_blobs calls so a complete 0..count-1
+                          group hashes once, at the last chunk
     Output: None (appends to errors)
     Details:
         For "full" entries: decrypt the blob, then compare sha256 to result_checksum.
         For "delta" entries: decrypt the blob to check readability. No hash check.
-        A volume-split streamed entry is decrypted for readability only;
-        result_checksum is the whole file, so the concat hash runs when
-        this session holds the last chunk and every prior chunk was
-        already folded in session order.
+        For a volume-split streamed entry the code checks readability
+        only. result_checksum covers the whole file, so the concat
+        hash runs when this session holds the last chunk and the
+        replay already folded in every prior chunk in session order.
         The code records path-validation failures, read errors, auth
         failures, and hash mismatches.
     """
@@ -544,18 +545,20 @@ def _check_full(
     tmp_path: Path,
 ) -> int:
     """
-    Input:  manifests   - ascending-session Manifest list already loaded
-                          and, for every session that reached this check,
-                          checksum-verified by _check_blobs this run
+    Input:  manifests   - ascending-session Manifest list already
+                          loaded. For every session that reached this
+                          check, _check_blobs already verified the
+                          checksum this run
             crypto      - CryptoBackend for decryption
-            capture_dir - raw encrypted blobs _check_blobs already wrote
-                          for every entry it read; reused here instead of
-                          a second disc read
+            capture_dir - raw encrypted blobs _check_blobs already
+                          wrote for every entry it read. The code
+                          reuses them here instead of a second disc
+                          read
             tmp_path    - temp directory for the throwaway restore dest
     Output: number of reconstruction failures (0 on a clean archive)
     Details:
         Replaces the old restore()-as-black-box second full disc pass
-        (23c). The code reconstructs every file's latest state
+        (23c). The code reconstructs the latest state of every file
         directly from the blobs _check_blobs already captured this
         run, through the same session-ordered replay engine that
         restore() uses (restore.run_session_replay), fed by
@@ -563,10 +566,10 @@ def _check_full(
         This makes zero additional
         backend.read_path/read_paths/extract_path_to_file calls. A
         session _check_blobs never reached (its own fast check already
-        failed, so checksum-level blob checks were skipped for it) has
-        no captured blobs. Any file whose chain needs one of its
-        entries fails to reconstruct here, consistent with that
-        session already being counted as an error.
+        failed, so the code skipped checksum-level blob checks for it)
+        has no captured blobs. Any file whose chain needs one of its
+        entries fails to reconstruct here. The error count for that
+        session already covers it.
     """
     from oddarchiver.restore import _build_chains, run_session_replay
 

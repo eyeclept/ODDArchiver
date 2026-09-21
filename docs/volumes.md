@@ -30,7 +30,7 @@ Volume 1 then starts at session 42 (`first_session=42`).
 trust `dvd+rw-mediainfo` session count. BD-R SRM+POW always reports
 `session_count=1`.
 
-`read_volume_marker` returns `None` when `volume.json` is missing or
+`read_volume_marker` returns `None` when `volume.json` is absent or
 unreadable. That disc is a legacy single-volume archive. Restore does not
 read or write restore-state for it.
 
@@ -41,7 +41,7 @@ blobs, sorted by path, into as many session directories as needed.
 - Later chunks use a full fresh medium times the same margin.
 - `ISOBackend.disc_size` (`--disc-size`) is that fresh budget when it is a positive int.
 - Otherwise the budget is `disc.BDXL_DISC_BYTES` (93 GiB).
-- Named presets and write engines are listed in [media.md](media.md).
+- [media.md](media.md) lists named presets and write engines.
 
 A blob larger than its chunk budget raises `RuntimeError` and names the file.
 One file never spans two discs. The first chunk records deletions on its
@@ -99,7 +99,7 @@ earlier applied volume uses dest bytes plus the replay dict as the base.
 
 Restore-state does not live inside dest. The path is
 `$XDG_STATE_HOME/oddarchiver/restore-<digest>.state.json`, or
-`~/.local/state/oddarchiver/` when `XDG_STATE_HOME` is unset. The digest
+`~/.local/state/oddarchiver/` when `XDG_STATE_HOME` has no value. The digest
 is `sha256("{archive_id}:{resolved dest}")[:16]`. dest stays a
 byte-for-byte mirror of the source.
 
@@ -168,7 +168,7 @@ exit code. Restore does not raise on a missing file.
 `RestoreResult` still unpacks as `(restored, failures)`. `stale` and
 `missing` are attributes only.
 
-When every earlier unapplied volume is skipped, a file that 21d would
+When `--skip-volume` names every earlier unapplied volume, a file that 21d would
 leave `unresolved` becomes `missing` so the current volume can still
 commit.
 
@@ -207,7 +207,7 @@ oddarchiver restore /tmp/out --test-iso vol2.iso --skip-volume 1
 - `missing.txt` has no dest base. Its only full blob was on volume 1.
   The file has no recoverable version and stays absent from `/tmp/out`.
 
-`failures` is 0. `needed` is `None` because volume 1 is skipped and
-volume 0 is applied. The same restore without `--skip-volume` still
+`failures` is 0. `needed` is `None` because `--skip-volume` named volume 1 and
+volume 0 already sits in `applied_volumes`. The same restore without `--skip-volume` still
 reports `Restore needs volume 1` and treats the unreadable delta as
 failed or unresolved, matching 21d.

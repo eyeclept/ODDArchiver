@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     Output: argparse.ArgumentParser - fully configured top-level parser
     Details:
         Builds the parser with all subcommands and their flags.
-        --dry-run and --test-iso may be used together.
+        --dry-run and --test-iso may appear together.
     """
     parser = argparse.ArgumentParser(
         prog="oddarchiver",
@@ -381,8 +381,8 @@ def _make_mirror_backend(args: argparse.Namespace) -> "BurnBackend | None":
     Input:  args - parsed namespace with optional --mirror and backend flags
     Output: BurnBackend for the mirror drive, or None if --mirror not given
     Details:
-        Matches the primary backend type: ISOBackend when --test-iso is set,
-        DiscBackend otherwise.
+        Matches the primary backend type: ISOBackend when the user sets
+        --test-iso, DiscBackend otherwise.
     """
     mirror = getattr(args, "mirror", None)
     if not mirror:
@@ -416,9 +416,9 @@ def _read_disc_manifests(
     Output: list of Manifest objects in ascending session order (may be empty)
     Details:
         Delegates to manifest.load_session_manifests(). Kept as a named
-        helper so call sites stay one assignment of list[Manifest].
-        Marker-aware: a disc whose VolumeMarker.first_session is not 0
-        (a later volume of a multi-volume archive) is probed starting
+        helper so call sites stay one statement assigning list[Manifest].
+        Marker-aware: for a disc whose VolumeMarker.first_session is not 0
+        (a later volume of a multi-volume archive), probing starts
         there, not at session 0. Otherwise its own coverage check
         would see session 0 "missing" on a medium that never had one.
     """
@@ -439,7 +439,7 @@ def _check_loaded_manifests(
 ) -> None:
     """
     Input:  manifests          - already-loaded session list
-            backend            - BurnBackend the list was read from
+            backend            - BurnBackend source of the list
             args               - parsed CLI namespace (recover_scan, label)
             disc_session_count - mediainfo session_count
             command            - caller name for log context
@@ -447,7 +447,7 @@ def _check_loaded_manifests(
     Details:
         Runs the 22a/22c ledger coverage check against the loaded list.
         Does not rescan manifests. Raises RuntimeError on a shortfall
-        unless --recover-scan is set.
+        unless the user passes --recover-scan.
     """
     from oddarchiver.ledger import check_session_coverage
 
@@ -481,23 +481,23 @@ def _crypto_for_disc(
             key_path      - path to keyfile (required when disc is keyfile-encrypted)
             rescue_key    - printable rescue code, or "" to prompt via getpass
             raw           - optional already-fetched control-file bytes
-            first_session - optional VolumeMarker.first_session; avoids a
+            first_session - optional VolumeMarker.first_session. Avoids a
                             second marker read when the caller already has it
     Output: CryptoBackend matching the encryption mode stored on disc
     Details:
-        Reads session_{first:03d}/enc_mode.json (and falls back to that
-        session's plaintext manifest.json) from the shared control-file
+        Reads session_{first:03d}/enc_mode.json (and falls back to the
+        plaintext manifest.json of that session) from the shared control-file
         batch produced by session_control_paths(), not a separate two-path
-        read_paths() of its own. first is this disc's own
-        VolumeMarker.first_session (0 for volume 0 and every
-        legacy/single-volume disc with no marker). Hardcoding session_000
+        read_paths() of its own. first is the VolumeMarker.first_session
+        of this disc (0 for volume 0 and every legacy/single-volume disc
+        with no marker). Hardcoding session_000
         here silently misdetected every volume after the first as
-        unencrypted, since that path never exists on a later volume's own
-        physical disc. Falls back to the plaintext manifest.json
-        encryption field for discs written before encrypted-manifest
-        support was added. When rescue_key is not None, unwraps
-        enc_mode.json's rescue blob via scrypt and builds the backend from
-        the recovered secret.
+        unencrypted, since that path never exists on the physical disc
+        of a later volume. Falls back to the plaintext manifest.json
+        encryption field on discs that predate encrypted-manifest
+        support. When rescue_key is not None, unwraps the
+        rescue blob of enc_mode.json via scrypt and builds the backend
+        from the recovered secret.
     """
     from oddarchiver.volume import read_volume_marker
     if first_session is None:
@@ -609,7 +609,7 @@ def _make_init_crypto(args: argparse.Namespace) -> "CryptoBackend":
     Output: CryptoBackend for the requested mode
     Details:
         For passphrase: reads ODDARCHIVER_PASSPHRASE env var or prompts twice
-        (confirmation loop) to catch typos before any data is written.
+        (confirmation loop) to catch typos before any write.
         For keyfile: reads the file at args.key.
         For passphrase and keyfile, generates a rescue code, wraps the
         persistent secret with scrypt, and hangs _rescue_block/_rescue_code
@@ -696,14 +696,14 @@ def _patch_manifest(
             label      - disc label to apply
             encryption - encryption block dict
             drives     - list of drive/ISO identifiers that will hold this session
-            crypto     - if provided (and non-null), rewrite manifest encrypted
+            crypto     - if set (and non-null), rewrite manifest encrypted
     Output: updated Manifest (also written to staging atomically)
     Details:
         Reads the provisional plaintext manifest written by build_staging.
         Sets label, encryption, and drives, then rewrites the file atomically
         in the staging session directory.
         If crypto is non-null, the output is manifest.enc plus enc_mode.json
-        and the provisional manifest.json is removed.
+        and write_manifest removes the provisional manifest.json.
     """
     session_dir = staging / f"session_{session_n:03d}"
     manifest = read_manifest(session_dir / "manifest.json", crypto=None)
@@ -724,12 +724,12 @@ def _update_cache(
     """
     Input:  cache     - CacheManager to update
             staging   - staging directory root
-            session_n - session that was just burned
+            session_n - session this call just burned
             entries   - ManifestEntry list from the session manifest
     Output: None
     Details:
         Copies each encrypted blob from staging into the cache after a
-        successful burn. Cache is updated only after burn succeeds.
+        successful burn. The cache updates only after burn succeeds.
     """
     for entry in entries:
         blob_rel = entry.file if entry.type == "full" else entry.delta_file
@@ -827,10 +827,11 @@ def _run_dry_run(args: argparse.Namespace, is_init: bool = False) -> int:
     Output: exit code 0, or 1 if a non-init run finds an uninitialized disc
     Details:
         Scans the source, diffs it, and estimates delta sizes for changed files.
-        Prints an rsync-style report. Space overage is reported but does not
-        cause exit 1. Does not burn and does not write a new session.
+        Prints an rsync-style report. The report shows a space overage
+        but does not cause exit 1. Does not burn and does not write a new session.
         Fallback reads of prior blobs may fill the local cache.
-        Hashing progress is shown inline. The file list is printed after.
+
+        Hashing progress shows inline. The code prints the file list after.
     """
     import hashlib
     from oddarchiver.delta import process_files
@@ -1043,8 +1044,8 @@ def _swap_after_full_volume(
     Details:
         ISOBackend skips the interactive prompt and opens original.vol{k}.iso
         with the same disc_size. DiscBackend prompts on stdin. 'q' (or EOF)
-        returns None so already-committed chunks stay durable. After the
-        medium is selected, mediainfo() must report session_count == 0 or
+        returns None so already-committed chunks stay durable. After this
+        function selects the medium, mediainfo() must report session_count == 0 or
         this raises RuntimeError.
     """
     info = backend.mediainfo()
@@ -1123,13 +1124,13 @@ def _burn_verify_commit(
             use_init               - True to call backend.init, else append
             expected_session_count - archive session count at run start
             mirror_backend         - optional mirror, first chunk only
-            marker_first_session   - first_session of this volume's marker
+            marker_first_session   - first_session of the marker of this volume
             expected_archive_id    - archive_id to continue, or None to skip
             expected_volume_index  - volume_index to continue, or None
             slow                   - True to post-burn verify at checksum level
     Output: 0 on success, 1 on burn/verify/mirror failure
     Details:
-        When expected_archive_id is set, re-reads volume.json immediately
+        When the caller sets expected_archive_id, re-reads volume.json immediately
         before init/append. That is the 31d check: _guard() already does
         mediainfo(), and this marker read runs only on the continue path.
         Blank-disc init skips it. init/append call signatures stay
@@ -1138,8 +1139,10 @@ def _burn_verify_commit(
         post-burn verify. Default level is fast (manifest only).
         --slow sets checksum, which reads every blob from the medium.
         Then records the per-volume ledger count and updates the cache.
+
         On BurnInterrupted, runs the same verify level then returns 1.
-        Cache and ledger are not updated unless verify passes.
+        Unless verify passes, this function does not update the cache
+        and ledger.
     """
     from oddarchiver.ledger import record_confirmed
 
@@ -1252,7 +1255,7 @@ def _burn_volume_chunks(
             crypto                       - CryptoBackend
             cache                        - CacheManager
             verify_mod                   - oddarchiver.verify module
-            mirror_backend               - optional; forbidden with 2+ chunks
+            mirror_backend               - optional mirror. Forbidden with 2+ chunks
             archive_id                   - id written onto new VolumeMarkers
             base_volume_index            - volume_index of the current disc
             chunk0_first_session         - first_session of the current volume
@@ -1270,9 +1273,10 @@ def _burn_volume_chunks(
             queries a medium this call already swapped away from
     Details:
         Burns every chunk, swapping media between them. ISOBackend auto-opens
-        the next .vol{k}.iso; DiscBackend prompts. 'q' stops the loop with
-        already-committed chunks left intact. Every staging dir is removed
-        in finally. Multi-volume plus --mirror raises RuntimeError.
+        the next .vol{k}.iso. DiscBackend prompts. 'q' stops the loop with
+        already-committed chunks left intact. This function removes every
+        staging dir in finally. Multi-volume plus --mirror raises RuntimeError.
+
         Append of an existing volume passes expected identity into
         _burn_verify_commit. Blank-disc init (use_init) does not.
     """
@@ -1408,18 +1412,18 @@ def _mask_diff_to_group(
                             init/sync run started
             group_paths   - new/changed paths assigned to this pass
             group_index   - 0 for the first automatic pass, 1+ for later ones
-    Output: a disc_state view scoped to this pass's own changeset
+    Output: a disc_state view scoped to the changeset of this pass
     Details:
-        build_staging diffs current_state against whichever disc_state it is
-        given. Passing the real disc_state to every pass would make each
-        later pass re-see every earlier pass's files as new or changed
-        again. A path outside group_paths is faked as already matching
+        build_staging diffs current_state against whichever disc_state it
+        receives. Passing the real disc_state to every pass would make each
+        later pass re-see the files of every earlier pass as new or changed
+        again. The mask fakes a path outside group_paths as already matching
         current_state, hiding it from this pass. A path inside group_paths
-        keeps its true prior value, or is left absent if it is genuinely
-        new. A deleted path (present in disc_state, absent from
-        current_state) keeps its true value only on group 0; every later
-        pass omits it entirely so the deletion lands in exactly one
-        session's manifest instead of being replayed or dropped.
+        keeps its true prior value, or stays absent if the file is
+        genuinely new. A deleted path (present in disc_state, absent from
+        current_state) keeps its true value only on group 0. Every later
+        pass omits it entirely, so the deletion lands in exactly one
+        session manifest. No later pass replays it or drops it.
     """
     masked: dict[str, str] = {}
     for path in current_state:
@@ -1445,13 +1449,14 @@ def _run_init(args: argparse.Namespace) -> int:
         the local staging budget (session.partition_by_staging_budget). One
         group is the common case and behaves exactly as a single build_staging
         call always has. Two or more groups burn as automatic sequential
-        sessions on one volume, session 0 through init's own parameters and
+        sessions on one volume, session 0 through the parameters of init and
         every later group as an ordinary sync-style append, with no user
-        interaction. A changeset that additionally spans discs within one
-        group still burns each chunk then swaps media (ISOBackend auto-opens
-        .vol{k}.iso); that disc-capacity split is orthogonal and unchanged.
+        interaction. A changeset that also spans discs within one
+        group still burns each chunk and then swaps media (ISOBackend auto-opens
+        .vol{k}.iso). That disc-capacity split is orthogonal and unchanged.
         Every fresh init writes a VolumeMarker on chunk 0 of group 0 even
         when nothing splits. Exits 0 with a warning if already initialized.
+
         After a successful encrypted init, prints the rescue code once
         to stdout. The code is never logged or written to disc.
     """
@@ -1502,8 +1507,8 @@ def _run_init(args: argparse.Namespace) -> int:
     cache = CacheManager()
     source = Path(args.source)
 
-    # Scan source with progress bar, mirroring _run_sync's scan block: this
-    # pass needs a full path set and sizes before any staging directory
+    # Scan source with progress bar, mirroring the scan block of _run_sync:
+    # this pass needs a full path set and sizes before any staging directory
     # exists, so it cannot delegate the scan to build_staging as before.
     import hashlib
     from oddarchiver.session import _print_bar
@@ -1620,10 +1625,11 @@ def _run_sync(args: argparse.Namespace) -> int:
         (session.partition_by_staging_budget). One group is the common case
         and behaves exactly as a single build_staging call always has. Two
         or more groups burn as automatic sequential sessions on one volume
-        with no user interaction: every group, including group 0, is
-        appended with today's sync parameters. A changeset that
-        additionally spans discs within one group still burns each chunk
-        then swaps media, verifies, and updates the cache; that
+        with no user interaction. The run appends every group, including
+        group 0, with the sync parameters of this run.
+
+        A changeset that also spans discs within one group still burns
+        each chunk, then swaps media, verifies, and updates the cache. That
         disc-capacity split is orthogonal and unchanged.
         New volumes get a VolumeMarker before init.
     """
@@ -1805,7 +1811,8 @@ def _run_restore(args: argparse.Namespace) -> int:
     Output: exit code (0 success, 1 on any failure)
     Details:
         Calls restore.restore() and translates failure_count to exit code.
-        A needed earlier volume is printed and is not treated as a failure.
+        The function prints a needed earlier volume and does not treat it
+        as a failure.
         Recovery-mode stale/missing files print as a per-file listing and
         do not change the exit code.
         --rescue-key unwraps the enc_mode.json blob and skips the primary

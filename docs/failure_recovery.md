@@ -1,29 +1,88 @@
 # Partial and failed write recovery
 
 A session interrupted mid-write on BD-R SRM+POW cannot be resumed. The next
-successful `append()` starts a new session. The interrupted session's
-partially written blocks are wasted, unrecoverable capacity, like any
-write-once medium.
+successful `append()` starts a new session.
+
+The interrupted session leaves partially written blocks behind. Those blocks
+add wasted, unrecoverable capacity, like any write-once medium.
 
 This document is about never compounding that loss. The failure modes
 below exist so oddarchiver does not miscount already-good sessions or
 re-burn them as if they were new.
 
+## Verified 2026-09-21: this is a protocol limit, not a missing feature
+
+The team proposed a per-file recovery design and evaluated it: write the
+session manifest first, copy each blob atomically, then verify and record a
+per-file good/broken/unwritten status after the write.
+
+The goal was to recover files that landed successfully before an interruption
+(for example, files 1-5 of a 10-file session killed partway through file 6),
+instead of writing off the whole session.
+
+That design is not achievable for a real BD-R burn through `growisofs`,
+and this is a hardware/protocol constraint, not a gap in the current
+oddarchiver code. This conclusion comes from primary sources, not from
+this document or from prior assumptions of oddarchiver:
+
+- `growisofs` streams the whole new session to the next writable address on
+  the disc, then, as its literal last step, copies the new ISO9660 Primary
+  Volume Descriptor back to the fixed root location (LBA 16) that every
+  reader checks first, logging `copying volume descriptor(s)`.
+  Source: `growisofs.c` and `growisofs_mmc.cpp` (Andy Polyakov,
+  dvd+rw-tools).
+
+- Until that one write lands, LBA 16 still names the *previous* session.
+  A kill during file 6 happens before that write. No reader (a normal
+  mount, `xorriso`, or the `read_paths()` call inside oddarchiver) can
+  then see file 1, file 5, or any other file from the killed session.
+  Their raw bytes may still sit in an unindexed region of the disc.
+
+- There is no footer or manifest scheme that runs after the fact, on the
+  host side, that can make those unindexed bytes filesystem-visible
+  again.
+
+- UDF 2.60 SS 6.15 and 6.16.3 describe the same all-or-nothing
+  publication rule for Pseudo-OverWrite media. Thomas Schmitt
+  (libburnia/xorriso) independently confirms it: on POW BD-R, the
+  on-disc superblock points at the newer tree only once that tree has
+  been fully written and overwrites the old pointer.
+
+- This is the same mechanism, not a separate one, that keeps sessions
+  `000` through `N-1` safe from a failed append. The published state of
+  the disc flips atomically from "session N-1 is current" to "session N
+  is current" at that one write.
+
+- That is exactly why a failed append can never corrupt a prior session,
+  and exactly why it can never expose a partial one either. The two
+  guarantees are the same guarantee.
+
+This limitation applies to `DiscBackend` (real optical media) only.
+`--test-iso` (`ISOBackend`) has no such barrier: it copies files into an
+ordinary directory with no commit step, so a per-file good/broken/
+unwritten check after an interrupted copy is valid there.
+
+Do not treat `--test-iso` behavior in this area as evidence for what real
+media can do, in either direction.
+
 ## What a power cut or USB reset leaves behind
 
-growisofs `-M` was writing session N. The process died from a signal, or
+growisofs `-M` wrote session N. The process died from a signal, or
 the drive reported a SCSI Unit Attention / "Power on, reset, or bus
 device reset" fault.
 
-- Sessions `000` through `N-1` are still on the disc. They were closed
-  before this burn started.
+- Sessions `000` through `N-1` are still on the disc. This burn started
+  after the previous burn closed them.
+
 - Session N may have a directory, a truncated manifest, or nothing the
-  ISO tree can name. Those blocks cannot be reused.
+  ISO tree can name. No write can reuse those blocks.
+
 - The drive can then return a torn read of an *earlier* session. That
   looks like `FileNotFoundError` on `session_000/manifest.enc` even
   though the file is there.
 
 The 2026-09-16 incident was this last case. Session 002 failed mid-append.
+
 The next `sync` scanned manifests, treated a torn read of session 000 as
 "this archive has zero sessions", and was about to restage all 7578 source
 files as new. A follow-up `history` and a scratch restore both showed
@@ -59,8 +118,8 @@ Path: `~/.local/state/oddarchiver/<label>.ledger.json`
 {"confirmed_sessions": 2, "last_verified": "2026-09-16T12:00:00Z", "label": "ARCHIVE"}
 ```
 
-The file is written only after a session's post-burn fast verify passes.
-It is not the cache. `--no-cache` and a cache wipe do not remove it.
+oddarchiver writes the file only after the post-burn fast verify of a
+session passes. It is not the cache. `--no-cache` and a cache wipe do not remove it.
 
 If a later scan returns fewer readable sessions than `confirmed_sessions`,
 that is a read failure, not a new archive. `sync`, `init`, `status`,
@@ -69,9 +128,10 @@ from-scratch diff.
 
 A missing or corrupt ledger does not crash. It degrades to cautious: an
 initialized disc that yielded zero readable manifests is still a loud
-failure. The ledger does not protect against a first-ever run on a
-machine that has never verified this disc, if the disc also looks blank
-to `mediainfo`.
+failure.
+
+The ledger does not protect against a first-ever run on a machine that has
+never verified this disc, if the disc also looks blank to `mediainfo`.
 
 The ledger does not resume a torn write. It only stops you from treating
 already-confirmed sessions as absent.
@@ -92,14 +152,17 @@ Eject, reinsert, and retry first.
 1. Sessions 000 and 001 were on the disc (1244 files / 2.0 GiB, then
    5260 files / 5.0 GiB). The ledger, after those verifies, held
    `confirmed_sessions: 2`.
+
 2. `sync` for session 002 died mid-`growisofs -M` from a power/USB reset.
    oddarchiver now raises `BurnInterrupted`, re-reads sessions 000-001,
    logs ERROR for session 002, and runs `verify --level fast` before it
    returns.
+
 3. The next `sync` hit a torn read of `session_000/manifest.enc`. The
    old scanner caught `FileNotFoundError` and returned an empty list.
    `build_disc_state` then saw no files, so every source path looked new.
-4. With this recovery path, that empty list is compared to the ledger.
+
+4. With this recovery path, `sync` compares that empty list to the ledger.
    Coverage is short of 2. `sync` exits nonzero:
 
    ```
@@ -108,7 +171,8 @@ Eject, reinsert, and retry first.
    ```
 
    No staging, no third burn, no rewrite of the 7 GiB already on the disc.
+
 5. After an eject/reinsert (or a later clean read), `history` and
    `verify --level fast` see both confirmed sessions again. The next
-   `sync` writes session 003, not a replay of 000-001. Session 002's
-   partial blocks stay wasted.
+   `sync` writes session 003, not a replay of 000-001. Partial blocks
+   from session 002 stay wasted.

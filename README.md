@@ -4,13 +4,15 @@ Incremental, delta-compressed backups to write-once optical media (DVD, BD-R, M-
 
 ## What it does
 
-ODDArchiver treats a BD-R disc as an append-only history. Each `sync` command scans a source directory and computes an xdelta3 binary delta for every changed file, then burns a new session that holds only the deltas. `restore` rebuilds the source tree at any point in history, using only the disc and `xdelta3`.
+ODDArchiver treats a BD-R disc as an append-only history. Each `sync` command scans a source directory and computes an xdelta3 binary delta for every changed file.
+It then burns a new session that holds only the deltas.
+`restore` rebuilds the source tree at any point in history, using only the disc and `xdelta3`.
 
 The tool works with no configuration for a first-time user. It adds encryption, multi-drive redundancy, and cron automation for advanced use. No feature requires the others.
 
 ## Key properties
 
-- **Self-describing.** Every session carries a manifest. No external database or state file is needed to reconstruct history.
+- **Self-describing.** Every session carries a manifest. ODDArchiver needs no external database or state file to reconstruct history.
 - **Write-once safe.** ODDArchiver only appends. It never rewrites a burned session.
 - **Idempotent.** Running `init` or `sync` twice with no source changes produces no extra session and no side effects. Ctrl+C at any point leaves the disc and cache in a consistent state.
 - **Encryption is optional.** Choose `none`, `passphrase` (Argon2id plus ChaCha20-Poly1305), or `keyfile` at `init` time. Later commands read the mode from the disc automatically.
@@ -73,7 +75,10 @@ oddarchiver init <source> [--device DEV] [--label LABEL]
                           [--mirror DEV_OR_PATH] [--dry-run] [--slow]
 ```
 
-`--encrypt` and `--key` apply only to `init`. The chosen mode is stored in the disc manifest and used automatically by every later command. Running `init` on a disc that already has session 0 exits 0 with a warning, and no second session is written.
+`--encrypt` and `--key` apply only to `init`.
+`init` stores the chosen mode in the disc manifest.
+Every later command uses it automatically.
+Running `init` on a disc that already has session 0 exits 0 with a warning. ODDArchiver writes no second session.
 
 ### `sync`
 
@@ -83,7 +88,10 @@ oddarchiver sync <source> [--device DEV] [--test-iso PATH]
                           [--no-cache] [--mirror DEV_OR_PATH] [--dry-run] [--slow]
 ```
 
-Exits 0 with no output when nothing changed. `--no-cache` bypasses the local cache and reads every prior blob straight from disc. `--slow` on `init` and `sync` checksums every blob after the burn. Default post-burn verify is `fast` and does not read blob bytes.
+Exits 0 with no output when nothing changed.
+`--no-cache` bypasses the local cache and reads every prior blob straight from disc.
+`--slow` on `init` and `sync` checksums every blob after the burn.
+Default post-burn verify is `fast` and does not read blob bytes.
 
 ### `restore`
 
@@ -92,7 +100,12 @@ oddarchiver restore <dest> [--device DEV] [--test-iso PATH]
                            [--session N] [--force]
 ```
 
-Restore is non-destructive by default. A file already at `dest` whose SHA-256 matches the target session is not rewritten. `--force` overwrites unconditionally. `--session N` stops replay at session N for a point-in-time restore. A file whose reconstructed checksum does not match its manifest entry is never written. ODDArchiver logs the error and continues to process the remaining files.
+Restore is non-destructive by default.
+ODDArchiver does not rewrite a file already at `dest` whose SHA-256 matches the target session.
+`--force` overwrites unconditionally.
+`--session N` stops replay at session N for a point-in-time restore.
+ODDArchiver never writes a file whose reconstructed checksum does not match its manifest entry.
+ODDArchiver logs the error and continues to process the remaining files.
 
 ### `history`, `verify`, `status`
 
@@ -126,16 +139,16 @@ A failed session never invalidates the others. `verify` reports pass or fail per
 
 | Preset | Nominal | Usable bytes | Write engine |
 |---|---|---|---|
-| `cd` | 700 MB | 737,280,000 | none; simulation only |
+| `cd` | 700 MB | 737,280,000 | none (simulation only) |
 | `dvd-sl` | 4.7 GB | 4,700,372,992 | growisofs plus genisoimage |
 | `dvd-dl` | 8.5 GB | 8,547,991,552 | growisofs plus genisoimage |
 | `bd-r` | 25 GB | 24,696,061,952 | growisofs plus genisoimage |
 | `bd-dl` | 50 GB | 49,392,123,904 | growisofs plus genisoimage |
 | `bdxl` | 100 GB | 99,857,989,632 | growisofs plus genisoimage |
 
-CD media is refused. A CD burn works, but a CD cannot be kept appendable, so an
-archive on one could never take a second session. The `cd` preset remains for
-`ISOBackend` simulation. See [docs/media.md](docs/media.md) for the evidence.
+ODDArchiver refuses CD media. A CD burn works, but ODDArchiver cannot keep a CD appendable.
+An archive on one could never take a second session.
+The `cd` preset remains for `ISOBackend` simulation. See [docs/media.md](docs/media.md) for the evidence.
 
 Millennial Disc (M-DISC) uses the matching DVD or BD preset. ODDArchiver has no M-DISC flag. Writing M-DISC needs a drive that supports M-DISC.
 
@@ -151,9 +164,9 @@ Encryption is optional and chosen once, at `init`.
 |---|---|---|
 | `none` | `--encrypt none` (default) | Plaintext on disc. Readable decades from now with only `xdelta3`. |
 | `passphrase` | `--encrypt passphrase` | Key derived with Argon2id, data encrypted with ChaCha20-Poly1305. Passphrase comes from `ODDARCHIVER_PASSPHRASE` or an interactive prompt. |
-| `keyfile` | `--encrypt keyfile --key PATH` | A 32-byte keyfile wraps a fresh per-file data key. `--key` is required on every command after `init`, not only on `init`. |
+| `keyfile` | `--encrypt keyfile --key PATH` | A 32-byte keyfile wraps a fresh per-file data key. Every command after `init` requires `--key`, and `init` does too. |
 
-Later commands read the encryption mode from the disc automatically. The key material itself is never stored on disc. Blob filenames are opaque SHA-256 hashes, and the manifest itself is encrypted. Mounting an encrypted disc reveals no file names, paths, or content.
+Later commands read the encryption mode from the disc automatically. ODDArchiver never stores the key material on disc. Blob filenames are opaque SHA-256 hashes, and ODDArchiver encrypts the manifest itself. Mounting an encrypted disc reveals no file names, paths, or content.
 
 All encryption and decryption works on data held in memory. Delta computation feeds the previous file version to `xdelta3` through an anonymous memory file (`os.memfd_create`). Plaintext never touches a temp file on disk.
 
@@ -163,9 +176,10 @@ See [SETUP.md](SETUP.md) for generating a keyfile and setting the passphrase env
 
 `--mirror DEV_OR_PATH` on `init` or `sync` writes each session to a second drive or ISO after the primary succeeds.
 
-- If the primary burn fails, the command exits 1 and the mirror is never attempted.
-- If the primary succeeds but the mirror fails, the command exits 1 and the cache is not updated. `status` reports the mirror as `MISSING`.
-- A missing mirror is not backfilled automatically. Recovering one requires a full restore from the intact primary, followed by a fresh `init` against the replacement drive.
+- If the primary burn fails, the command exits 1 and never attempts the mirror.
+- If the primary succeeds but the mirror fails, the command exits 1 and does not update the cache.
+`status` reports the mirror as `MISSING`.
+- ODDArchiver does not backfill a missing mirror automatically. Recovering one requires a full restore from the intact primary, followed by a fresh `init` against the replacement drive.
 
 ## Idempotency
 
@@ -176,7 +190,7 @@ See [SETUP.md](SETUP.md) for generating a keyfile and setting the passphrase env
 | `sync` after an interrupted burn | Cache is left unchanged. The next run re-diffs from the last confirmed disc state |
 | `restore` to an already-correct destination | Skips files whose checksum already matches |
 
-Ctrl+C during a run is safe at every stage. Staging directories are removed in a `finally` block. Any session whose disc write did not complete is simply absent on the next read.
+Ctrl+C during a run is safe at every stage. ODDArchiver removes staging directories in a `finally` block. Any session whose disc write did not complete is simply absent on the next read.
 
 ## Architecture
 
@@ -205,25 +219,35 @@ session_NNN/
     deltas/<sha256-blob-id>     # xdelta3 patches for changed files
 ```
 
-`sync` decides delta versus full per file. If a delta exceeds 90% of the full file's size, ODDArchiver stores the full file instead. Blob names are `sha256(session_n:relative_path)`, so file names and directory structure never appear on disc.
+`sync` decides delta versus full per file. If a delta exceeds 90% of the full file size, ODDArchiver stores the full file instead. Blob names are `sha256(session_n:relative_path)`, so file names and directory structure never appear on disc.
 
 ## What to archive
 
-ODDArchiver is built for small, critical, slow-changing data: secrets, keys, infrastructure-as-code, DNS zones, and config exports. A 2.7 GB source with infrequent small changes fits years of weekly syncs on a single 25 GB disc.
+ODDArchiver targets small, critical, slow-changing data: secrets, keys, infrastructure-as-code, DNS zones, and config exports. A 2.7 GB source with infrequent small changes fits years of weekly syncs on a single 25 GB disc.
 
 It is the wrong tool for large or fast-changing data. That includes database indices, VM disk images, container images, log archives, and media libraries.
 
 ## Troubleshooting
 
-**`disc already initialized; skipping init`**. `init` found an existing session 0. This is expected and safe. No second session was written.
+**`disc already initialized; skipping init`**. `init` found an existing session 0. This message is normal and safe. ODDArchiver wrote no second session.
 
 **"Decryption failed: authentication error"**. The passphrase or keyfile does not match the one used at `init`. Check `ODDARCHIVER_PASSPHRASE`, or confirm the `--key` path.
 
-**SUSPECT sessions in `status`**. A manifest failed its checksum check. That session is skipped during restore and disc-state reconstruction. The other sessions remain usable. Check `~/logs/oddarchiver.log` for details.
+**SUSPECT sessions in `status`**. A manifest failed its checksum check. Restore and disc-state reconstruction skip that session. The other sessions remain usable. Check `~/logs/oddarchiver.log` for details.
 
 **Stale staging directory warning**. Normal after an interrupted run. ODDArchiver removes the old directory and rebuilds it.
 
-**"Staging space check failed"**. The staging area (`$XDG_RUNTIME_DIR/oddarchiver`, a RAM-backed tmpfs on most systems, capped well below a machine's real disk space -- 6.2 GiB on a workstation with 61 GiB of RAM) does not have enough free room for this run. `init` stages every file in the source as a full blob, so the whole source tree has to fit there at once, regardless of how much space the target disc or `/home` has. ODDArchiver checks this before staging any file and fails fast with a clear message instead of crashing partway through. Options: run from a session with a larger `$XDG_RUNTIME_DIR` (or a larger `RuntimeDirectorySize` for your login session), or split a very large source directory into smaller batches synced one at a time.
+**"Staging space check failed"**. The staging area (`$XDG_RUNTIME_DIR/oddarchiver`) does not have enough free room for this run.
+On most systems it is a RAM-backed tmpfs, capped well below the real disk space of the machine.
+An example: 6.2 GiB on a workstation with 61 GiB of RAM.
+
+`init` stages every source file as a full blob, so the whole source tree has to fit there at once.
+This applies regardless of free space on the target disc or in `/home`.
+ODDArchiver checks this before staging any file.
+It fails fast with a clear message instead of crashing partway through.
+
+Options: run from a session with a larger `$XDG_RUNTIME_DIR` (or a larger `RuntimeDirectorySize` for your login session).
+Or split a very large source directory into smaller batches, and sync one batch at a time.
 
 **Cache looks wrong after an interrupted burn**. The cache is left at the last confirmed state. Nothing is lost. To force a rebuild from disc reads, delete the cache directory (see SETUP.md).
 
@@ -232,4 +256,4 @@ It is the wrong tool for large or fast-changing data. That includes database ind
 - [SETUP.md](SETUP.md): install, system dependencies, configuration file, environment variables
 - [docs/media.md](docs/media.md): media presets, write engines, M-DISC, hardware vs ISO tests
 - [docs/verify.md](docs/verify.md): verify levels and post-burn `--slow`
-- [STATE_OF_THE_PROGRAM.md](STATE_OF_THE_PROGRAM.md): what is done, what is left, known issues
+- [STATE_OF_THE_PROGRAM.md](STATE_OF_THE_PROGRAM.md): what is complete, what is left, known issues

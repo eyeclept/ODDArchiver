@@ -4,10 +4,10 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Volume identity for multi-disc archives. A VolumeMarker is written as
-    plaintext volume.json at the staging root (sibling to session_NNN/)
-    so later waves can number sessions across physical discs. A parallel
-    volume_baseline.json sidecar carries checksum/origin maps from earlier
+    Volume identity for multi-disc archives. The code writes a
+    VolumeMarker as plaintext volume.json at the staging root (sibling
+    to session_NNN/) so later waves can number sessions across physical
+    discs. A parallel volume_baseline.json sidecar carries checksum/origin maps from earlier
     volumes so sync on the latest disc can classify untouched files.
 """
 # Imports
@@ -64,12 +64,12 @@ def read_volume_marker(backend: "BurnBackend") -> VolumeMarker | None:
     Input:  backend - BurnBackend to read volume.json from
     Output: VolumeMarker, or None when the disc has no usable marker
     Details:
-        Calls backend.read_paths(["volume.json"]). Missing paths are
-        omitted by the backend, not raised; None is the signal for a
+        Calls backend.read_paths(["volume.json"]). The backend omits
+        missing paths and does not raise. None signals a
         legacy/single-volume archive. Callers apply archive_id=None,
         volume_index=0, first_session=0 themselves. Decode failures
-        also return None. A genuine backend/transport failure is
-        logged and re-raised.
+        also return None. The code logs a genuine backend/transport
+        failure and re-raises it.
     """
     try:
         found = backend.read_paths(["volume.json"])
@@ -131,11 +131,12 @@ def read_volume_baseline(
     Input:  backend - BurnBackend to read volume_baseline.json from
     Output: (state, origin) tuple, or None when the disc has no usable sidecar
     Details:
-        Calls backend.read_paths(["volume_baseline.json"]). Missing paths
-        are omitted by the backend, not raised; None is the signal for a
+        Calls backend.read_paths(["volume_baseline.json"]). The backend
+        omits missing paths and does not raise. None signals a
         volume-0 or legacy disc that never received a baseline. Decode
-        failures also return None and are logged at warning level only.
-        A genuine backend/transport failure is logged and re-raised.
+        failures also return None and get a warning-level log entry.
+        The code logs a genuine backend/transport failure and
+        re-raises it.
     """
     try:
         found = backend.read_paths(["volume_baseline.json"])

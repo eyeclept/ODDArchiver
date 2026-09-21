@@ -5,55 +5,63 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    This is a standalone privileged helper script. A user runs it through
-    sudo. The script destroys and recreates a USB optical drive's kernel
-    device object (it deauthorizes the device, then reauthorizes it). This
-    forces a full USB re-enumeration, including a real capacity probe.
+    This is a standalone privileged helper script that a user runs through
+    sudo, then destroys and recreates the kernel device object of a USB
+    optical drive (it deauthorizes the device, then reauthorizes it).
+    This forces a full USB re-enumeration, including a real capacity probe.
 
-    The probe fixes a specific case. growisofs -M reads the previous
-    session's volume descriptor through the kernel block layer, and that
-    read fails. It fails because the kernel never got an accurate capacity
-    for the disc in the drive. This behavior is confirmed live. See the
-    "Environment-specific hardware limitation" section of
-    STATE_OF_THE_PROGRAM.md.
+    The probe fixes a specific case.
+    growisofs -M reads the volume descriptor of the previous session
+    through the kernel block layer, and that read fails because the
+    kernel never got an accurate capacity for the disc in the drive.
+    This behavior is confirmed live.
+    See the "Environment-specific hardware limitation" section of STATE_OF_THE_PROGRAM.md.
 
     Security model: this script is the only part of the program that needs
-    root access, and it does exactly one narrow task. It takes exactly one
+    root access, and it does exactly one narrow task. It takes one
     argument, a bare block device name (for example "sr0"). The script
-    validates this name against a strict "sr<N>" pattern. The kernel itself
-    enforces this naming convention only for SCSI CD-ROM devices, so the
-    script can never target another class of hardware. It never accepts a
-    raw sysfs path from the caller. Instead it re-derives the USB device's
-    sysfs path itself, by walking from a real, existing block device,
-    exactly like disc.resolve_usb_device_sysfs_path() does for the
-    unprivileged caller. It then writes only "0" and then "1" to that one
-    resolved 'authorized' file.
+    validates the name against a strict "sr<N>" pattern.
+
+    The kernel itself enforces this naming convention only for SCSI CD-ROM
+    devices, so the script can never target another class of hardware. The
+    script never accepts a raw sysfs path from the caller.
+
+    Instead, the script re-derives the sysfs path of the USB device itself.
+    It walks from a real, existing block device.
+    disc.resolve_usb_device_sysfs_path() does the same for the
+    unprivileged caller. The script then writes only "0" and then "1" to
+    that one resolved 'authorized' file.
 
     This script is deliberately self-contained: it uses only the standard
-    library, with no `from oddarchiver import ...`. The script runs as
-    root through sudo. Meanwhile, `oddarchiver` itself is installed into
-    the invoking user's writable site-packages, through a normal
-    `pip install --user -e .`. If this script imported that package, root
-    would dynamically run code from a location the unprivileged user can
-    modify. That is a real privilege-escalation risk, of the kind a
-    reviewed setuid binary must never allow. For this reason, the roughly
-    15 lines of resolution logic below duplicate oddarchiver/disc.py's
-    resolve_usb_device_sysfs_path(), instead of importing it.
+    library, with no `from oddarchiver import ...`.
+    The script runs as root through sudo.
+    Also, pip installs `oddarchiver` itself into the writable site-packages
+    of the invoking user, through a normal `pip install --user -e .`.
+
+    If this script imported that package, root would dynamically run code
+    from a location the unprivileged user can modify. That is a real
+    privilege-escalation risk, of the kind a reviewed setuid binary must
+    never allow.
+
+    For this reason, the roughly 15 lines of resolution logic below
+    duplicate resolve_usb_device_sysfs_path() in oddarchiver/disc.py,
+    instead of importing it.
     tests/test_usb_reauth.py checks that both copies resolve to the same
     result, so they cannot silently drift apart.
 
-    Do not install this script through `pip install -e .` or
-    `[project.scripts]`. Anything pip puts on the unprivileged user's own
-    PATH is, by definition, writable by that same user. That would bring
-    back the same problem, one level up, that the self-contained-imports
-    design above solves. Sudoers trusts an exact path string, not whoever
-    currently controls the file at that path. Instead, an administrator
-    copies this source file directly, once, to a root-owned system path,
-    with a manual `sudo install` step (see SETUP.md):
+    Do not install this script through `pip install -e .` or `[project.scripts]`.
+    Anything pip puts on the PATH of the unprivileged user is, by definition,
+    writable by that same user, so pip would bring back the same problem,
+    one level up, that the self-contained-imports design above solves.
+    Sudoers trusts an exact path string, not whoever currently controls the
+    file at that path.
+
+    Instead, an administrator copies this source file once, directly to a
+    root-owned system path, with a manual `sudo install` step (see SETUP.md):
     `sudo install -o root -g root -m 0755 oddarchiver/usb_reauth.py
-    /usr/local/sbin/oddarchiver-usb-reauth`. The sudoers NOPASSWD grant
-    and `DiscBackend._attempt_usb_reauth()` both reference that same
-    fixed, root-owned path directly.
+    /usr/local/sbin/oddarchiver-usb-reauth`.
+    The sudoers NOPASSWD grant and `DiscBackend._attempt_usb_reauth()` both
+    reference that same fixed, root-owned path directly.
 """
 # Imports
 from __future__ import annotations
@@ -75,20 +83,20 @@ _DEVICE_NAME_RE = re.compile(r"^sr[0-9]+$")
 def _resolve_usb_device_sysfs_path(device_name: str) -> Path | None:
     """
     Input:  device_name - bare block device name, e.g. "sr0"
-    Output: Path to the device's USB sysfs directory. This directory's
-            "authorized" attribute controls whether the kernel treats
-            the device as plugged in. The function returns None if it
-            cannot resolve the path.
+    Output: Path to the USB sysfs directory of the device. The
+            "authorized" attribute in this directory controls whether
+            the kernel treats the device as plugged in. The function
+            returns None if it cannot resolve the path.
     Details:
-        This function duplicates disc.py's
-        resolve_usb_device_sysfs_path(). See the module docstring for
+        This function duplicates resolve_usb_device_sysfs_path() in
+        disc.py. See the module docstring for
         the reason this file does not import the oddarchiver package.
         The function walks up from /sys/class/block/<name>/device, a
         symlink into the real device tree, through its ancestors. It
         stops at the first directory that has both an "idVendor" file
-        and an "authorized" file. Keep this function in sync with the
-        copy in disc.py. tests/test_usb_reauth.py checks that both
-        copies agree.
+        and an "authorized" file.
+        Keep this function in sync with the copy in disc.py.
+        tests/test_usb_reauth.py checks that both copies agree.
     """
     class_path = Path("/sys/class/block") / device_name
     try:
@@ -112,9 +120,9 @@ def main(argv: list[str] | None = None) -> int:
         It writes "0" and then "1" to the "authorized" attribute at that
         path.
         Each failure path logs a warning that names the exact reason.
-        The function then returns a non-zero code. This lets a cron job's
-        log show the real reason instead of a silent failure with no
-        output.
+        The function then returns a non-zero code. This lets the log of
+        a cron job show the real reason instead of a silent failure with
+        no output.
     """
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
     parser = argparse.ArgumentParser(

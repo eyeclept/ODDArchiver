@@ -84,10 +84,11 @@ def write_manifest(
     crypto: "CryptoBackend | None" = None,
 ) -> None:
     """
-    Input:  staging_path - directory where the manifest will be written
+    Input:  staging_path - directory that receives the manifest
             manifest     - Manifest dataclass instance
-            crypto       - if provided (and not NullCrypto), write manifest.enc
-                           and enc_mode.json. Otherwise write manifest.json
+            crypto       - optional CryptoBackend. When set and not
+                           NullCrypto, write manifest.enc and
+                           enc_mode.json. Otherwise write manifest.json
     Output: None
     Details:
         Writes atomically. It first writes a .tmp file and then calls
@@ -151,7 +152,7 @@ def read_manifest(
 ) -> Manifest:
     """
     Input:  path   - path to manifest.json (or manifest.enc)
-            crypto - required when the manifest is encrypted. Ignored otherwise
+            crypto - required when the manifest uses encryption. Ignored otherwise
     Output: Manifest - parsed and checksum-validated manifest
     Details:
         If path is manifest.json but the file does not exist, the code
@@ -226,20 +227,21 @@ def load_session_manifests(
             crypto        - CryptoBackend for encrypted manifests (None means plaintext only)
             start_session - first session number to probe (default 0)
             raw           - optional already-fetched control-file bytes from
-                            session_control_paths(); skips a second read_paths()
+                            session_control_paths(), which skips a second
+                            read_paths()
     Output: list of Manifest objects in ascending session order (may be empty)
     Details:
         Batch-extracts session_*/manifest.* and session_*/enc_mode.json
-        through one backend.read_paths() call (unless raw is provided).
-        Per session, it prefers manifest.enc over manifest.json. It
+        through one backend.read_paths() call (unless the caller passes
+        raw). Per session, it prefers manifest.enc over manifest.json. It
         stops at the first missing session at or after start_session.
         A session missing at start_session counts exactly like any
         other gap, not as a silent skip. A torn or failed read of the
-        archive's first session therefore never counts as "nothing
+        first session of the archive therefore never counts as "nothing
         here yet." start_session exists only so a multi-volume disc
         whose real first session is not 0 (per its
         VolumeMarker.first_session) can tell this function where its
-        own sessions legitimately begin. Callers must never pass it to
+        own sessions start. Callers must never pass it to
         cover an unexplained gap. The function does not use
         dvd+rw-mediainfo session count. On BD-R SRM+POW that count is
         always 1.
@@ -310,7 +312,7 @@ def build_disc_state(
 ) -> dict[str, str]:
     """
     Input:  manifests - list of Manifest objects in ascending session order
-            seed      - optional starting {path: checksum}; None treated as {}
+            seed      - optional starting {path: checksum}. None means {}
     Output: dict mapping relative path -> result_checksum
     Details:
         Replays manifests in order, starting from a copy of seed (or
@@ -340,18 +342,19 @@ def build_disc_origin(
 ) -> dict[str, int]:
     """
     Input:  manifests - list of Manifest objects in ascending session order
-            seed      - optional starting {path: session}; None treated as {}
+            seed      - optional starting {path: session}. None means {}
     Output: dict mapping relative path -> session number that last wrote it
     Details:
         Uses the same replay, skip-suspect, and pop-on-delete logic as
         build_disc_state(), starting from a copy of seed (or {}). It
-        records which manifest's session most recently set each path,
-        instead of the checksum it set. A file left unchanged across
-        several syncs keeps the session number of its last real write,
-        not the immediately preceding session. session.build_staging()
-        uses this to pick the correct cache session for a changed
-        file's prior blob. That blob may live several sessions back if
-        the file was untouched in between.
+        records the session of the manifest that most recently set
+        each path, instead of the checksum it set. A file left
+        unchanged across several syncs keeps the session number of
+        its last real write, not the immediately preceding session.
+        session.build_staging() uses this to pick the correct cache
+        session for the prior blob of a changed file. That blob may
+        live several sessions back when no sync touched the file in
+        between.
     """
     origin: dict[str, int] = dict(seed) if seed is not None else {}
     for m in manifests:
@@ -377,8 +380,8 @@ def build_disc_tree(
         Replays like build_disc_state/build_disc_origin, but a delete
         marks the path deleted=True instead of dropping it. BD-R is
         write-once, so the blob is still on the disc. last_modified on
-        a tombstone is the deleting manifest's timestamp.
-        deleted_session is that manifest's session number. The code
+        a tombstone is the timestamp of the deleting manifest.
+        deleted_session is the session number of that manifest. The code
         skips SUSPECT manifests with a WARNING. origin_session and
         size come from the last write.
     """

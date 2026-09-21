@@ -7,9 +7,11 @@ Description:
     Local ledger of the last known good session count. It records how
     many sessions a post-burn fast verify has confirmed. The key is
     the pair of archive label and backend identity, so a later torn
-    read cannot look like an empty disc. The label alone is not a
-    safe key. Two different discs or ISOs can share a label that a
-    user chose (this tool's own --label default is "ARCHIVE").
+    read cannot look like an empty disc.
+
+    The label alone is not a safe key. Two different discs or ISOs
+    can share a label that a user chose (the --label default of this
+    tool is "ARCHIVE").
 """
 # Imports
 from __future__ import annotations
@@ -73,7 +75,7 @@ def ledger_dir() -> Path:
     Output: Path - directory that holds <label>.ledger.json files
     Details:
         The function uses $XDG_STATE_HOME/oddarchiver when the
-        XDG_STATE_HOME variable is set. Otherwise, it uses
+        XDG_STATE_HOME variable has a value. Otherwise, it uses
         ~/.local/state/oddarchiver, as specified in Assist/TODO.md 22c.
     """
     xdg = os.environ.get("XDG_STATE_HOME")
@@ -104,7 +106,7 @@ def ledger_path(label: str, backend_id: str) -> Path:
 def load_ledger(label: str, backend_id: str) -> Ledger | None:
     """
     Input:  label, backend_id - archive label and physical medium identity
-    Output: Ledger, or None if the file is missing or corrupt
+    Output: Ledger, or None when the file is absent or corrupt
     Details:
         A missing or corrupt ledger is only advisory. The caller uses a
         cautious baseline instead of failing. A corrupt file logs a
@@ -191,21 +193,22 @@ def check_session_coverage(
     Output: None
     Details:
         This function raises RuntimeError when the manifest list is shorter
-        than the ledger's confirmed_sessions value. This means a read
+        than the confirmed_sessions value of the ledger. This means a read
         failure below the known-good count, not a new archive.
         A gap above confirmed_sessions is a normal end of scan. It does not
         raise an error.
         A missing or corrupt ledger makes the function maximally cautious.
-        If the disc is initialized (disc_session_count > 0) and yields zero
-        readable manifests, the function still raises a loud failure. It
+        If disc_session_count > 0 (an initialized disc) and the scan
+        yields zero readable manifests, the function still raises a loud
+        failure. It
         does not treat this case as an empty archive.
         disc_session_count is an initialized-or-blank signal, not an
         archive session count. On BD-R with SRM+POW formatting, mediainfo
         reports session_count=1 no matter how many archive sessions the
         disc holds. growisofs appends each new session as a track inside
         one MMC session.
-        When the ledger is missing and no manifest is readable, the true
-        archive session count is unknown. The function does not invent a
+        When the ledger does not exist and the scan reads no manifest, the
+        true archive session count is unknown. The function does not invent a
         count or a missing-index list from disc_session_count.
         The --recover-scan option skips the raise. When a known-good count
         exists, it logs which sessions the function could not confirm.
@@ -242,22 +245,22 @@ def _handle_shortfall(
     source: str,
 ) -> None:
     """
-    Input:  readable - how many manifests were read
+    Input:  readable - the number of manifests the scan read
             expected - known-good session count, or None when the count is unknown
-            missing  - gap indexes when expected is known; empty when unknown
+            missing  - gap indexes when expected has a value, empty when it does not
             label, recover_scan, backend, source - report context
     Output: None
     Details:
-        If recover_scan is set, this function logs a WARNING message and
-        returns. Otherwise, it raises a RuntimeError.
-        When expected is None, the ledger is missing and no manifest was
-        readable. The function does not invent a session count or a
+        If the caller sets recover_scan, this function logs a WARNING message
+        and returns. Otherwise, it raises a RuntimeError.
+        When expected is None, the ledger does not exist and the scan read
+        no manifest. The function does not invent a session count or a
         missing-index list. MMC session_count is not an archive session
-        count, so the true count cannot be recovered from mediainfo.
-        When expected is set, the error names the gap and the known-good
-        session count. It also states the next step: retry after eject
-        and reinsert, or use --recover-scan if the missing sessions are
-        confirmed gone.
+        count, so mediainfo cannot recover the true count.
+        When expected has a value, the error names the gap and the
+        known-good session count. It also states the next step: retry after
+        eject and reinsert, or use --recover-scan after you confirm the
+        missing sessions are gone.
     """
     if expected is None:
         if recover_scan:
@@ -306,10 +309,10 @@ def _describe_gap_error(backend: "BurnBackend", session_idx: int) -> str:
     """
     Input:  backend     - BurnBackend to re-probe
             session_idx - first missing session index
-    Output: str - one-line description of why that session is unreadable
+    Output: str - one line that states why that session is unreadable
     Details:
-        This function tells apart two errors. The first is xorriso's
-        message 'Cannot determine attributes of', which means the disc
+        This function tells apart two errors. The first is the message of
+        xorriso, 'Cannot determine attributes of', which means the disc
         tree lacks the entry. The second is a RuntimeError after the
         retries run out. The original scan caught and discarded both
         errors. This function re-probes only to get the error text,

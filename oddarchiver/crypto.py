@@ -8,9 +8,10 @@ Description:
     PassphraseCrypto (Argon2id + ChaCha20-Poly1305), and KeyfileCrypto
     (ChaCha20-Poly1305 DEK wrapping). Small blobs use encrypt()/decrypt()
     on bytes. Files above STREAM_CHUNK_SIZE use encrypt_file()/decrypt_file()
-    so plaintext and ciphertext are never fully materialized. Rescue-key
-    wrapping uses scrypt + ChaCha20-Poly1305 so a lost passphrase or
-    keyfile can be recovered without a second AEAD scheme.
+    so the program never fully materializes plaintext or
+    ciphertext. Rescue-key wrapping uses scrypt + ChaCha20-Poly1305
+    so recovery of a lost passphrase or keyfile works without a
+    second AEAD scheme.
 """
 # Imports
 from __future__ import annotations
@@ -29,7 +30,7 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 # Globals
 PASSPHRASE_ENV = "ODDARCHIVER_PASSPHRASE"
-STREAM_CHUNK_SIZE = 256 * 2**20  # 256 MiB; AEAD chunk size and large-file threshold
+STREAM_CHUNK_SIZE = 256 * 2**20  # 256 MiB, the AEAD chunk size and large-file threshold
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,8 @@ class CryptoBackend(abc.ABC):
         Input:  plaintext - raw bytes to encrypt
         Output: ciphertext bytes (nonce or salt embedded)
         Details:
-            Must be authenticated encryption. decrypt() raises ValueError on auth failure.
+            Use authenticated encryption. decrypt() raises ValueError on
+            authentication failure.
         """
 
     @abc.abstractmethod
@@ -91,7 +93,7 @@ class CryptoBackend(abc.ABC):
             file in memory. When offset/length select a byte range, dest
             is a complete, independently self-decryptable streamed blob
             for just that range. decrypt_file() needs no knowledge of
-            the range or the source file's total size. Omitting
+            the range or the total size of the source file. Omitting
             offset/length (or passing length=None) is identical to
             encrypting the whole file.
         """
@@ -129,9 +131,9 @@ class NullCrypto(CryptoBackend):
         Input:  src, dest, offset, length - see CryptoBackend.encrypt_file
         Output: None
         Details:
-            Identity crypto: the "streamed format" for a range is just that
-            raw byte range. Whole-file copy path is unchanged when
-            offset/length are omitted.
+            Identity crypto. The streamed format for a range is just
+            that raw byte range. When the caller omits offset/length,
+            the whole-file copy path stays the same.
         """
         if offset == 0 and length is None:
             shutil.copy2(src, dest)
@@ -222,8 +224,8 @@ class PassphraseCrypto(CryptoBackend):
         Output: None
         Details:
             Wire format: salt(16) + repeated[nonce(12) + ciphertext_chunk].
-            One Argon2id derivation for the whole file (or for the selected
-            range); fresh nonce per chunk. A range produces its own salt, so
+            One Argon2id derivation for the whole file or the selected
+            range. Fresh nonce per chunk. A range produces its own salt, so
             the resulting blob is fully self-decryptable.
         """
         salt = secrets.token_bytes(_SALT_LEN)
@@ -414,8 +416,9 @@ def _decrypt_chunks(key: bytes, inf, outf) -> None:
             outf - binary file for plaintext
     Output: None
     Details:
-        Loop: read 12-byte nonce (empty means EOF); read up to
-        STREAM_CHUNK_SIZE+tag ciphertext; decrypt; write plaintext.
+        Loop: read a 12-byte nonce. An empty read means EOF.
+        Read up to STREAM_CHUNK_SIZE+tag bytes of ciphertext.
+        Decrypt it and write the plaintext.
         Auth failure becomes ValueError, matching decrypt().
     """
     aead = ChaCha20Poly1305(key)

@@ -6,11 +6,11 @@
 - `xdelta3`: binary delta computation
 - `genisoimage`: builds ISO images for `--test-iso` mode and the test suite
 - `dvd+rw-tools` (`growisofs`, `dvd+rw-mediainfo`): writes and reads a physical BD-R drive
-- `xorriso`: reads files back off a physical BD-R drive directly over SG_IO
-  (never depends on the OS mounting the disc, which was found unreliable
-  for several minutes after a real, multi-GB burn -- see the
+- `xorriso`: reads files back off a physical BD-R drive directly over SG_IO.
+  It never depends on the OS mounting the disc. OS mounting was unreliable
+  for several minutes after a real, multi-GB burn. See the
   "Environment-specific hardware limitation" section of
-  `STATE_OF_THE_PROGRAM.md`)
+  `STATE_OF_THE_PROGRAM.md`
 - `udftools`: optional. Only needed to mount an individual session by hand
 
 Install the system tools:
@@ -41,27 +41,33 @@ oddarchiver --help
 
 ## Enable unattended recovery for a stuck USB optical drive (optional, recommended for cron)
 
-On some USB-bridged BD-R drives, `sync`'s append step can fail right
-after a burn with `unable to pread64(2) primary volume descriptor` --
-a stale kernel block-device capacity cache, not disc corruption or a
-code defect. Confirmed live and documented in the
+On some USB-bridged BD-R drives, the `sync` append step can fail right
+after a burn with `unable to pread64(2) primary volume descriptor`. The
+cause is a stale kernel block-device capacity cache, not disc corruption
+or a code defect. Live testing confirmed this failure. The
 "Environment-specific hardware limitation" section of
-`STATE_OF_THE_PROGRAM.md`. `append()` recovers
-from this automatically by deauthorizing then reauthorizing the drive's
-USB device, which forces the kernel to fully re-enumerate it (no tray
-action, no interactive session) -- but that toggle needs root, so it
-needs a one-time, narrowly-scoped `sudo` grant. Without this step,
-`sync` still works interactively (the error message tells you to
-physically eject and reinsert the disc), it just cannot self-heal
-inside an unattended cron job.
+`STATE_OF_THE_PROGRAM.md` documents it.
+
+`append()` recovers from this automatically. It deauthorizes and then
+reauthorizes the USB device of the drive. This forces the kernel to fully
+re-enumerate the device.
+
+That toggle needs no tray action and no interactive session. But that
+toggle needs root, so it needs a one-time, narrowly scoped `sudo` grant.
+
+Without this step, `sync` still works interactively. The error message
+tells you to physically eject and reinsert the disc. But `sync` cannot
+self-heal inside an unattended cron job.
 
 Install the helper script itself as a **root-owned** file at a fixed
-system path -- this is a separate, manual, `sudo`-run step, deliberately
-not something `pip install -e .` does for you. `pip install -e .` runs
-as your own unprivileged user, so anything it puts on your `PATH` is
-writable by that same user; a `sudo` grant trusts an exact path string,
-not who currently controls the file living there, so the actual
-privileged script must live somewhere your own account cannot modify:
+system path. This is a separate, manual, `sudo`-run step.
+`pip install -e .` deliberately does not do it for you.
+
+`pip install -e .` runs as your own unprivileged user, so anything it
+puts on your `PATH` is writable by that same user. A `sudo` grant trusts
+an exact path string, not who currently controls the file living there.
+So the actual privileged script must live somewhere your own account
+cannot modify:
 
 ```sh
 cd ODDArchiver   # this repo's root
@@ -76,17 +82,21 @@ Then add exactly this line via `sudo visudo` (or a new file under
 <you> ALL=(root) NOPASSWD: /usr/local/sbin/oddarchiver-usb-reauth
 ```
 
-The exact path above, with no wildcards and no argument pattern -- the
-helper only ever accepts one bare device name (e.g. `sr0`), validated
-against `^sr[0-9]+$`, and re-derives the drive's real USB sysfs path
-itself rather than trusting anything passed to it. The sudoers rule's
-job is only to let this one specific, already-validating, root-owned
-script run without a password; it is not the security boundary for what
-gets touched, and the script is deliberately self-contained (no
-`oddarchiver` package import) so root never dynamically loads code from
-your own writable site-packages. See `oddarchiver/usb_reauth.py`'s
-module docstring for the full security model. Re-run the `sudo install`
-command above any time `oddarchiver/usb_reauth.py` changes upstream.
+The exact path above has no wildcards and no argument pattern. The
+helper only ever accepts one bare device name (e.g. `sr0`). It validates
+it against `^sr[0-9]+$` and re-derives the real USB sysfs path of the
+drive itself. It trusts nothing passed to it.
+
+The job of the sudoers rule is only to let this one specific,
+already-validating, root-owned script run without a password. It is not
+the security boundary for what gets touched. The script is deliberately
+self-contained (no `oddarchiver` package import), so root never
+dynamically loads code from your own writable site-packages. See the
+module docstring of `oddarchiver/usb_reauth.py` for the full security
+model.
+
+Re-run the `sudo install` command above any time
+`oddarchiver/usb_reauth.py` changes upstream.
 
 ## Set up encryption
 
@@ -145,9 +155,9 @@ Precedence, lowest to highest: built-in default, then `config.toml`, then a CLI 
 | `device` | `/dev/sr0` | Physical drive path used when `--test-iso` is not given |
 | `cache_dir` | `~/.cache/oddarchiver` | Local encrypted-blob cache |
 | `staging_dir` | unset | Staging directory root. Unset uses the per-user default below |
-| `delta_threshold` | `0.90` | Store a full file instead of a delta once the delta exceeds this fraction of the full size |
-| `space_safety_margin` | `0.95` | Refuse to burn a session that would use more than this fraction of remaining disc space |
-| `log_file` | `~/logs/oddarchiver.log` | Structured log path. Parent directories are created automatically |
+| `delta_threshold` | `0.90` | Store a full file instead of a delta once the delta exceeds this share of the full size |
+| `space_safety_margin` | `0.95` | Refuse to burn a session that would use more than this share of remaining disc space |
+| `log_file` | `~/logs/oddarchiver.log` | Structured log path. The tool creates parent directories automatically |
 | `post_burn_verify` | `true` | Run `verify --level fast` automatically after every burn |
 | `disc_size` | `25gb` | Simulated capacity for `--test-iso` runs |
 | `encryption.mode` | `none` | `none`, `passphrase`, or `keyfile` |
@@ -161,17 +171,18 @@ Precedence, lowest to highest: built-in default, then `config.toml`, then a CLI 
 | `~/logs/` | Log file directory | `log_file` in `config.toml` |
 | `~/.config/oddarchiver/` | Configuration file | not overridable |
 
-\* Not currently wired through the CLI; setting it in `config.toml` has no
+\* Not currently wired through the CLI. Setting it in `config.toml` has no
 effect yet.
 
-`$XDG_RUNTIME_DIR` is usually a RAM-backed tmpfs sized well below a
-machine's real disk space (6.2 GiB on a 61 GiB workstation is typical). A
-session 0 `init` stages every source file as a full blob before burning,
-so the whole source tree has to fit there regardless of the target disc's
-or `/home`'s capacity. `init`/`sync` check for this before staging any
-file and fail fast with a clear message instead of crashing partway
-through -- see "Staging space check failed" in the README's
-Troubleshooting section.
+`$XDG_RUNTIME_DIR` is usually a RAM-backed tmpfs sized well below real
+disk space (6.2 GiB on a 61 GiB workstation is typical). A session 0
+`init` stages every source file as a full blob before burning. So the
+whole source tree has to fit there, regardless of the capacity of the
+target disc or `/home`.
+
+`init`/`sync` check for this before staging any file and fail fast with
+a clear message instead of crashing partway through. See "Staging space
+check failed" in the Troubleshooting section of the README.
 
 Clear the cache at any time:
 
@@ -197,4 +208,4 @@ pip install -r requirements.txt   # pytest, argon2-cffi, cryptography
 pytest tests/ -v
 ```
 
-`pytest tests/ -v` must exit 0 before any change is considered complete. All tests use `ISOBackend`. No physical drive is required to run the suite.
+Consider a change complete only when `pytest tests/ -v` exits 0. All tests use `ISOBackend`. The suite needs no physical drive.

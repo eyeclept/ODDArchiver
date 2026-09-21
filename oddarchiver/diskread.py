@@ -6,24 +6,25 @@ Email:  eyeclept@pm.me
 Description:
     Session-ordered disc-read acquisition for restore and verify (TODO 23d).
     SessionSource is the small interface both engines read blobs through:
-    open_session(n) returns a local directory holding session n's content,
-    materialized ahead of time in one batched backend.read_paths() call per
-    session instead of one xorriso launch per blob. Every ManifestEntry blob
-    path already embeds its own session number ("session_NNN/full/<hash>" or
-    "session_NNN/deltas/<hash>"), so every implementation here returns the
-    same kind of directory: a local mirror of the disc's own path layout,
-    read as `source.open_session(n) / entry.file`.
+    open_session(n) returns a local directory holding the content of
+    session n, materialized ahead of time in one batched backend.read_paths()
+    call per session instead of one xorriso launch per blob. Every
+    ManifestEntry blob path already embeds its own session number
+    ("session_NNN/full/<hash>" or "session_NNN/deltas/<hash>"), so every
+    implementation here returns the same kind of directory: a local mirror
+    of the disc path layout, read as `source.open_session(n) / entry.file`.
 
     Two modes trade local disk usage for I/O shape:
       FullImageSource  (--read-mode full-copy)  extracts every session up
-        front into one directory; needs local free space for the archive's
-        whole used capacity, checked before extracting anything.
+        front into one directory. It needs local free space for the whole
+        used capacity of the archive, checked before extracting anything.
       SequentialSource (--read-mode sequential, default) extracts one
         session at a time into a wipe-and-reuse scratch directory, bounding
         local disk usage to the largest single session regardless of how
         many sessions a restore or verify walks.
-    Both are backend-agnostic: ISOBackend's read_paths() is already a plain
-    local copy, so the same code exercises DiscBackend and ISOBackend alike.
+    Both are backend-agnostic: the read_paths() of ISOBackend is already a
+    plain local copy, so the same code exercises DiscBackend and ISOBackend
+    alike.
 """
 # Imports
 from __future__ import annotations
@@ -51,20 +52,20 @@ DEFAULT_READ_MODE = "sequential"
 def _session_blob_paths(manifests: "list[Manifest]") -> dict[int, list[str]]:
     """
     Input:  manifests - Manifest list (any order)
-    Output: {session_n: [blob paths referenced by that session's entries]}
+    Output: {session_n: [blob paths referenced by entries of that session]}
     Details:
-        Full entries (streamed or not) contribute entry.file; delta
-        entries contribute entry.delta_file. A blob path is always
-        under its own session's own "session_NNN/" prefix (see
-        session.py's _write_chunk), so grouping by manifest.session is
-        exact -- no entry ever points at another session's blob. A path
-        that fails validate_blob_path (e.g. a manifest with a
-        traversal attempt) is left out of the batch entirely rather
-        than handed to backend.read_paths() -- the per-file
-        reconstruction code (restore._read_full / _apply_delta_entry)
-        re-validates and fails that one file the same way it always
-        has; a batch source must never let one bad path abort every
-        other file's read.
+        Full entries (streamed or not) contribute entry.file. Delta
+        entries contribute entry.delta_file. A blob path always lives
+        under its own session "session_NNN/" prefix (see _write_chunk
+        in session.py), so grouping by manifest.session is exact.
+
+        No entry ever points at a blob of another session. A path that
+        fails validate_blob_path (e.g. a manifest with a traversal
+        attempt) stays out of the batch entirely, rather than reaching
+        backend.read_paths(). The per-file reconstruction code
+        (restore._read_full / _apply_delta_entry) re-validates and
+        fails that one file the same way it always has. A batch source
+        must never let one bad path abort the read of every other file.
     """
     from oddarchiver.manifest import validate_blob_path
 
@@ -95,11 +96,12 @@ def _materialize(backend: "BurnBackend", paths: list[str], root: Path) -> None:
             root    - local directory to write them under, preserving path
     Output: None (writes files under root)
     Details:
-        One backend.read_paths() call regardless of how many paths are
-        requested -- the whole point of session-ordered acquisition. A
-        path missing on the disc is silently absent locally too; a
-        reader built on top of root raises FileNotFoundError for it,
-        same as a direct backend.read_path() miss would.
+        One backend.read_paths() call regardless of how many paths the
+        caller requests. That is the whole point of session-ordered
+        acquisition. A path missing on the disc stays absent locally
+        too. A reader built on top of root then raises
+        FileNotFoundError for it, same as a direct backend.read_path()
+        miss would.
     """
     if not paths:
         return
@@ -111,14 +113,15 @@ def _materialize(backend: "BurnBackend", paths: list[str], root: Path) -> None:
 
 
 class SessionSource(abc.ABC):
-    """Shared interface restore's and verify's session-ordered replay engines read through."""
+    """Shared interface that the session-ordered replay engines of restore and verify read through."""
 
     @abc.abstractmethod
     def open_session(self, session_n: int) -> Path:
         """
         Input:  session_n - session index to make available locally
-        Output: local directory holding that session's extracted content;
-                entry.file / entry.delta_file resolve under it unchanged
+        Output: local directory holding the extracted content of that
+                session. entry.file / entry.delta_file resolve under
+                it unchanged
         """
 
 
@@ -136,12 +139,13 @@ class FullImageSource(SessionSource):
                 workdir            - local directory to extract into (created if absent)
         Output: N/A (class)
         Details:
-            Checks free space against the archive's total used capacity
-            (full_size_bytes for full entries, delta_size_bytes for delta
-            entries -- a worst-case, pre-encryption-overhead estimate,
-            same convention as session.py's own staging space check)
-            before extracting anything, so a shortfall is reported up
-            front instead of after a partial, wasted extraction. Raises
+            Checks free space against the total used capacity of the
+            archive (full_size_bytes for full entries, delta_size_bytes
+            for delta entries). This is a worst-case, pre-encryption-
+            overhead estimate, with the same convention as the staging
+            space check in session.py. The check runs before any
+            extraction, so the code reports a shortfall up front instead
+            of after a partial, wasted extraction. Raises
             SystemExit(1) naming the shortfall, matching the existing
             session.py space-check pattern, if the archive will not fit.
         """
@@ -172,7 +176,7 @@ class FullImageSource(SessionSource):
 
 
 class SequentialSource(SessionSource):
-    """--read-mode sequential (default): one session's blobs on local disk at a time."""
+    """--read-mode sequential (default): blobs of one session on local disk at a time."""
 
     def __init__(
         self,
@@ -193,14 +197,14 @@ class SequentialSource(SessionSource):
     def open_session(self, session_n: int) -> Path:
         """
         Input:  session_n - session to make locally available
-        Output: workdir, now holding only session_n's blobs
+        Output: workdir, now holding only the blobs of session_n
         Details:
             A no-op when session_n is already the open session, so a
             caller touching several files within one session pays one
-            batched read, not one per file. Any other session wipes and
-            re-extracts, bounding local disk to one session's worth of
-            blobs regardless of how many sessions a restore or verify
-            walks in total.
+            batched read, not one per file. Any other session wipes the
+            directory and re-extracts, bounding local disk to the blob
+            volume of one session regardless of how many sessions a
+            restore or verify walks in total.
         """
         if session_n == self._current:
             return self._workdir

@@ -4,7 +4,7 @@
 
 `ODDArchiver` is a command-line tool for incremental, delta-compressed backups to write-once optical media (BD-R / M-DISC). It presents rsync-like semantics to the user while managing the constraints of immutable multi-session UDF filesystems under the hood.
 
-The core insight: BD-R is not a random-access target, but it is an append target. Each session is a permanent, immutable snapshot of a delta. By storing xdelta3 binary patches rather than full file copies on each append, the disc becomes a self-describing, auditable history of a directory over time -- reconstructable with only the disc and `xdelta3` installed.
+The core insight: BD-R is not a random-access target, but it is an append target. Each session is a permanent, immutable snapshot of a delta. Each append stores xdelta3 binary patches instead of full file copies. The disc becomes a self-describing and auditable history of a directory over time. You can reconstruct that history with only the disc and `xdelta3` installed.
 
 **Design philosophy:** ODDArchiver is usable at any skill level. A first-time user can burn a directory with one command and no configuration. Advanced users can layer in encryption and automation. No tier requires the next.
 
@@ -17,7 +17,7 @@ The core insight: BD-R is not a random-access target, but it is an append target
 - Local cache as performance optimization, not requirement
 - rsync-like CLI (`oddarchiver sync`, `oddarchiver restore`, etc.)
 - Cron-friendly: silent on no changes, non-zero exit on failure
-- Robust against interrupted burns, missing cache, and disc-read errors
+- Recovers from interrupted burns, missing cache, and disc-read errors
 - Optional encryption with a clear complexity gradient -- usable without it
 - Idempotent: safe to run repeatedly, safe to Ctrl+C at any point
 - Dry run and ISO test modes to validate pipeline without consuming physical media
@@ -35,11 +35,11 @@ The core insight: BD-R is not a random-access target, but it is an append target
 
 | Constraint | Implication |
 |---|---|
-| BD-R sectors are write-once | No patching existing sessions; only append |
-| Max ~153 sessions per disc | Session overhead ~20MB each; budget accordingly |
-| UDF merges sessions into one logical view | Cannot rely on filesystem layer to distinguish sessions; must use manifests |
+| BD-R sectors are write-once | Append only. Existing sessions cannot be patched. |
+| Max ~153 sessions per disc | Session overhead ~20MB each. Budget accordingly. |
+| UDF merges sessions into one logical view | The filesystem layer cannot distinguish sessions. Use manifests. |
 | Reading disc is slow (~18MB/s at 4x) | Cache old file versions locally to avoid disc reads during diff computation |
-| xdelta3 is single-threaded | Large files will block; parallelize across files, not within |
+| xdelta3 is single-threaded | Large files will block. Parallelize across files, not within. |
 
 ---
 
@@ -47,16 +47,16 @@ The core insight: BD-R is not a random-access target, but it is an append target
 
 ```
 oddarchiver/
-├── __main__.py          # entry point
-├── cli.py               # argparse, command dispatch
-├── disc.py              # BurnBackend interface + DiscBackend + ISOBackend
-├── manifest.py          # session manifest read/write/merge
-├── delta.py             # xdelta3 wrapper, delta vs full decision
-├── session.py           # staging directory construction
-├── cache.py             # local cache management
-├── crypto.py            # encryption layer (optional); all modes share one interface
-├── restore.py           # reconstruct any version from disc or ISO
-└── verify.py            # integrity checking
+|-- __main__.py          # entry point
+|-- cli.py               # argparse, command dispatch
+|-- disc.py              # BurnBackend interface + DiscBackend + ISOBackend
+|-- manifest.py          # session manifest read/write/merge
+|-- delta.py             # xdelta3 wrapper, delta vs full decision
+|-- session.py           # staging directory construction
+|-- cache.py             # local cache management
+|-- crypto.py            # encryption layer (optional). All modes share one interface
+|-- restore.py           # reconstruct any version from disc or ISO
+`-- verify.py            # integrity checking
 ```
 
 ### External Dependencies
@@ -95,7 +95,7 @@ oddarchiver verify          [--device /dev/sr0] [--level fast|checksum|full]
 oddarchiver status          [--device /dev/sr0] [--test-iso /path/to/output.iso]
 ```
 
-Encryption flags only required on `init` -- the mode is stored in the disc manifest and used automatically on subsequent operations.
+Encryption flags only required on `init` -- the manifest stores the mode on disc and later operations use it automatically.
 
 `--dry-run` and `--test-iso` are mutually exclusive. `--test-iso` implies a real write, just not to a physical disc.
 
@@ -103,7 +103,7 @@ Encryption flags only required on `init` -- the mode is stored in the disc manif
 
 ## Dry Run Mode
 
-`--dry-run` mirrors rsync's `--dry-run`: the full pipeline executes except the actual `growisofs` call. No disc is written. No staging directory is committed. Cache is not updated.
+`--dry-run` mirrors the `--dry-run` option of rsync. The full pipeline executes except the actual `growisofs` call. No disc write happens. No staging directory commit happens. The cache stays untouched.
 
 What dry run does:
 - Scans source and computes checksums
@@ -118,7 +118,7 @@ What dry run does not do:
 - Write anything to disc or ISO
 - Update the cache or manifest on disc
 
-Output format mirrors rsync's `-n` output:
+Output format mirrors the `-n` output of rsync:
 
 ```
 $ oddarchiver sync ~/Documents/ToArchive --dry-run
@@ -129,7 +129,7 @@ Scanning source: /home/user/Documents/ToArchive (42 files, 2.7GB)
 Reading disc state: ARCHIVE-01, session 4
 
 Changes detected:
-  [delta]  passwords.kdbx          5.0MB → 4.1KB delta (99.9% reduction)
+  [delta]  passwords.kdbx          5.0MB -> 4.1KB delta (99.9% reduction)
   [full]   notes/new_note.md       2.0KB  (new file)
   [full]   report.pdf              3.2MB  (delta 97% of full -- storing full)
 
@@ -143,13 +143,13 @@ Would burn as: session_005 on ARCHIVE-01
 No disc written (dry run).
 ```
 
-Dry run is safe to run on any disc at any time -- it never touches the ODD beyond reading the manifest. Useful for verifying the pipeline is working before committing a session, and for checking how much space a sync would consume.
+Dry run is safe on any disc at any time. It never touches the ODD beyond reading the manifest. Use it to verify the pipeline before you commit a session. Use it to check how much space a sync would consume.
 
 ---
 
 ## Test ISO Mode
 
-`--test-iso /path/to/output.iso` runs the complete pipeline -- including the actual write -- but targets an ISO file on the local filesystem instead of a physical disc. The ISO is a valid UDF image that can be mounted, inspected, and used as the source for `restore` and `verify` commands.
+`--test-iso /path/to/output.iso` runs the complete pipeline, including the actual write. It targets an ISO file on the local filesystem instead of a physical disc. The ISO is a valid UDF image. You can mount it, inspect it, and use it as the source for `restore` and `verify` commands.
 
 This is the correct mode for:
 - Validating the full pipeline end-to-end without using a disc
@@ -224,14 +224,14 @@ oddarchiver init ~/ToArchive --test-iso test.iso --disc-size 100gb
 oddarchiver init ~/ToArchive --test-iso test.iso --disc-size 25gb --prefill 20gb
 ```
 
-`--prefill` writes synthetic padding sessions to the ISO to simulate a disc that already has N GB used, without having to actually run that many sync sessions. Useful for testing the 80%/95% capacity warning paths.
+`--prefill` writes synthetic padding sessions to the ISO. It simulates a disc that already has N GB used, without a real run of that many sync sessions. Use it to test the 80%/95% capacity warning paths.
 
 ### Configuration
 
 ```toml
 [test]
 default_disc_size = "25gb"    # disc size simulated by --test-iso
-iso_capacity_margin = 0.92    # simulate BD-R's actual usable capacity vs rated
+iso_capacity_margin = 0.92    # simulate the actual usable capacity of BD-R vs rated
 ```
 
 ---
@@ -259,7 +259,7 @@ oddarchiver init ~/ToArchive --encrypt passphrase
 
 - Key derived via **Argon2id** from the passphrase (memory-hard, GPU-resistant)
 - Cipher: **ChaCha20-Poly1305** (authenticated encryption, no padding oracle risk)
-- Salt stored in disc manifest; passphrase never stored anywhere
+- The manifest stores the salt on disc. The passphrase is never stored anywhere.
 - Passphrase prompted on each run (or read from env var `ODDARCHIVER_PASSPHRASE` for automation)
 - Offline forever -- no external services, no key files to lose
 
@@ -275,13 +275,13 @@ oddarchiver init ~/ToArchive --encrypt keyfile --key /path/to/archive.key
 - Generate: `age-keygen -o archive.key`
 - Key file lives on LUKS volume, Apricorn USB, or other secured storage
 - Suitable for automation without Vault -- no passphrase prompt needed
-- Lose the key file = lose access to disc permanently; keep multiple copies
+- Lose the key file = lose access to disc permanently. Keep multiple copies.
 
 ### Mode 3: Key File via ODDArchiver-server (enterprise)
 
-Vault is intentionally **not** an ODDArchiver encryption mode. Vault is an online service -- if it is unavailable or gone in 20 years, any disc whose decryption depends on Vault becomes unreadable permanently. This violates the core archival guarantee.
+Vault is intentionally **not** an ODDArchiver encryption mode. Vault is an online service. If Vault is unavailable or gone in 20 years, a disc that depends on Vault for decryption becomes unreadable permanently. This violates the core archival guarantee.
 
-Vault integration lives in ODDArchiver-server, which uses Vault to securely retrieve and supply a keyfile path or passphrase to ODDArchiver at burn time. From ODDArchiver's perspective, it always receives either a passphrase or a keyfile -- it has no awareness of Vault. See the ODDArchiver-server design document for details.
+Vault integration lives in ODDArchiver-server. The server uses Vault to retrieve a keyfile path or passphrase and supplies it to ODDArchiver at burn time. From the perspective of ODDArchiver, it always receives either a passphrase or a keyfile. It has no awareness of Vault. See the ODDArchiver-server design document for details.
 
 The highest encryption mode ODDArchiver itself supports is keyfile (Mode 2). Keep the keyfile on a LUKS volume, an Apricorn USB, or another physically secured medium -- not in an online service.
 
@@ -295,26 +295,26 @@ Regardless of mode, the pipeline is identical. The key insight: **xdelta3 always
 Disc (at rest):
   encrypted delta blob or encrypted full file
 
-  ↓ decrypt to memory only (ChaCha20-Poly1305)
+  -> decrypt to memory only (ChaCha20-Poly1305)
 
 xdelta3 sees:
   plaintext old file (from memory)
   plaintext new file (read from source)
 
-  ↓ xdelta3 via stdin/stdout pipes (no temp files)
+  -> xdelta3 via stdin/stdout pipes (no temp files)
 
 xdelta3 produces:
   plaintext delta (in memory)
 
-  ↓ encrypt from memory (ChaCha20-Poly1305, fresh nonce)
+  -> encrypt from memory (ChaCha20-Poly1305, fresh nonce)
 
 Disc (written):
   encrypted delta blob
 ```
 
-Implementation: xdelta3 is invoked with `subprocess.Popen` using `stdin=PIPE, stdout=PIPE`. Old file content is fed via stdin; delta is read from stdout. No temp files on disk at any point during the diff. The staging directory contains only encrypted blobs.
+Implementation: xdelta3 is invoked with `subprocess.Popen` using `stdin=PIPE, stdout=PIPE`. ODDArchiver feeds old file content via stdin. ODDArchiver reads delta from stdout. No temp files on disk at any point during the diff. The staging directory contains only encrypted blobs.
 
-The local cache stores encrypted blobs matching what is on disc. Decryption happens in memory when the cache is read for diffing. LUKS encryption of the cache directory is recommended but not required by ODDArchiver itself.
+The local cache stores encrypted blobs matching what is on disc. ODDArchiver decrypts in memory when it reads the cache for diffing. LUKS encryption of the cache directory is recommended but not required by ODDArchiver itself.
 
 ---
 
@@ -324,21 +324,21 @@ Each session written to disc contains a single directory:
 
 ```
 session_NNN/
-├── manifest.json
-├── full/
-│   └── <relative/path/to/new_file>         # new files (encrypted if mode != 0)
-└── deltas/
-    └── <relative/path/to/file>.xdelta      # patches for changed files (encrypted)
+|-- manifest.json
+|-- full/
+|   `-- <relative/path/to/new_file>         # new files (encrypted if mode != 0)
+`-- deltas/
+    `-- <relative/path/to/file>.xdelta      # patches for changed files (encrypted)
 ```
 
 The UDF filesystem merges all sessions into one logical view:
 
 ```
 /mnt/disc/
-├── session_000/
-├── session_001/
-├── session_002/
-└── ...
+|-- session_000/
+|-- session_001/
+|-- session_002/
+`-- ...
 ```
 
 ---
@@ -391,7 +391,7 @@ The UDF filesystem merges all sessions into one logical view:
 
 `manifest_checksum` is sha256 of the manifest with that field set to `""`. Allows `verify` to detect manifest corruption independently of file corruption.
 
-Checksums (`source_checksum`, `result_checksum`) are always of **plaintext content** regardless of encryption mode. This means verification requires decryption first -- it proves the full pipeline is intact, not just that bytes were stored.
+Checksums (`source_checksum`, `result_checksum`) are always of **plaintext content** regardless of encryption mode. Verification therefore requires decryption first. It proves the full pipeline is intact, not just that ODDArchiver stored bytes.
 
 ---
 
@@ -476,44 +476,47 @@ ODDArchiver is designed to be run repeatedly without side effects.
 
 | Operation | Idempotent? | Mechanism |
 |---|---|---|
-| `init` on already-initialized disc/ISO | Yes | Reads session count; if session 0 exists, exits 0 with warning |
-| `sync` with no changes | Yes | Checksum diff finds nothing; no staging, no burn |
-| `sync` run twice after same change | Yes | Second run: disc state matches source; diff empty |
-| `sync` after interrupted burn | Yes | Cache not updated on failure; re-diffs from last confirmed disc state |
-| `restore` to already-correct dest | Yes | Per-file checksum verified before overwrite; skip if match |
+| `init` on already-initialized disc/ISO | Yes | Reads session count. If session 0 exists, exits 0 with warning |
+| `sync` with no changes | Yes | Checksum diff finds nothing. No staging, no burn |
+| `sync` run twice after same change | Yes | Second run: disc state matches source. Diff is empty |
+| `sync` after interrupted burn | Yes | Cache not updated on failure. Re-diffs from last confirmed disc state |
+| `restore` to already-correct dest | Yes | Per-file checksum verified before overwrite. Skip if match |
 | `verify` | Yes | Read-only |
 | `history` | Yes | Read-only |
 
 **Additional idempotency protections:**
 
-- **Session index collision**: staging dir for N+1 is deleted and rebuilt if it already exists from a prior crashed run
-- **Double-burn guard**: disc/ISO session count re-read immediately before write; if it has advanced, abort
+- **Session index collision**: ODDArchiver deletes and rebuilds the staging dir for N+1 if it already exists from a prior crashed run
+- **Double-burn guard**: ODDArchiver re-reads the disc/ISO session count immediately before write. If it has advanced, abort.
 - **Authoritative state is always disc/ISO**: cache influences performance, never correctness
-- **`restore` is non-destructive by default**: files only overwritten if checksum doesn't match target session; pass `--force` to override
+
+**Restore behavior:**
+
+- **`restore` is non-destructive by default**: files are only overwritten if the checksum does not match the target session. Pass `--force` to override.
 
 ---
 
 ## Ctrl+C / SIGINT Safety
 
-ODDArchiver installs a SIGINT handler at startup. The handler sets a flag; cleanup runs in `finally` blocks. Ctrl+C can land at five points:
+ODDArchiver installs a SIGINT handler at startup. The handler sets a flag. Cleanup runs in `finally` blocks. Ctrl+C can land at five points:
 
 **1. During scan, diff, or staging (pre-burn)**
-No disc write has occurred. `finally` block cleans staging. Next run rebuilds from scratch. ✅
+No disc write has occurred. `finally` block cleans staging. Next run rebuilds from scratch. [OK]
 
 **2. During `growisofs` / `genisoimage` (mid-burn)**
 Backend process receives SIGINT. Two outcomes:
 
-- *Lead-out not written*: UDF does not surface the session. Next run re-diffs and retries. ✅
-- *Lead-out written, manifest corrupt or absent*: Session surfaced by UDF but manifest invalid. Next run reads manifest, validates checksum -- invalid sessions are logged as SUSPECT and ignored when computing disc state. ✅
+- *Lead-out not written*: UDF does not surface the session. Next run re-diffs and retries. [OK]
+- *Lead-out written, manifest corrupt or absent*: Session surfaced by UDF but manifest invalid. Next run reads manifest, validates checksum -- invalid sessions are logged as SUSPECT and ignored when computing disc state. [OK]
 
 **3. Between burn and post-burn verify**
-Next run reads disc/ISO, validates manifest, adopts session if valid, updates cache. ✅
+Next run reads disc/ISO, validates manifest, adopts session if valid, updates cache. [OK]
 
 **4. Between verify and cache update**
-Cache stale by one session. Next run: disc authoritative, diff shows no changes, cache brought forward. ✅
+Cache stale by one session. Next run: disc authoritative, diff shows no changes, cache brought forward. [OK]
 
 **5. During cache update**
-Cache partially written. Treated as cache miss on next run; falls back to disc/ISO read. ✅
+Cache partially written. Treated as cache miss on next run. Falls back to disc/ISO read. [OK]
 
 Worst case: one wasted burn and a SUSPECT entry in the log. Data already on disc is never modified.
 
@@ -561,7 +564,7 @@ Result: 1 error across 5 sessions.
 Exit code: 1
 ```
 
-A failed session does not invalidate others. `restore` skips corrupt delta files and uses the last known-good version of the affected file, logging at ERROR.
+A failed session does not invalidate others. `restore` skips corrupt delta files. It uses the last known-good version of the affected file and logs at ERROR.
 
 ---
 
@@ -573,15 +576,15 @@ A failed session does not invalidate others. `restore` skips corrupt delta files
 3. Build per-file chain: [full, delta, delta, ...]
 4. For each file:
    a. Apply session where type == "full":
-      decrypt blob → write to <dest>
+      decrypt blob -> write to <dest>
    b. For each subsequent delta in order:
-      decrypt blob → feed to xdelta3 with current file → write output
+      decrypt blob -> feed to xdelta3 with current file -> write output
    c. Verify sha256(<dest_file>) == result_checksum for that session
       abort on mismatch (unless --skip-corrupt, which uses last good version)
 5. Report files restored, verification failures
 ```
 
-`restore` is non-destructive by default -- existing files in `<dest>` are only overwritten if their checksum doesn't match. Pass `--force` to overwrite unconditionally.
+`restore` is non-destructive by default. Existing files in `<dest>` are only overwritten if their checksum does not match. Pass `--force` to overwrite unconditionally.
 
 ---
 
@@ -622,12 +625,12 @@ Default: `~/logs/oddarchiver.log`. Structured plaintext, one event per line:
 | Used | Level | Action |
 |---|---|---|
 | < 80% | INFO | Normal |
-| ≥ 80% | WARN | "~N sessions remaining at current delta size" |
-| ≥ 95% | ERROR | "Next sync may fail. Insert new disc soon." |
+| >= 80% | WARN | "~N sessions remaining at current delta size" |
+| >= 95% | ERROR | "Next sync may fail. Insert new disc soon." |
 
 Remaining-session estimate uses rolling average of last 3 session sizes, not a fixed number.
 
-At ≥80%, cron output contains a WARN line -- triggers email if cron is configured to mail on output. No external notification system required.
+At >=80%, cron output contains a WARN line. That triggers email if cron is configured to mail on output. No external notification system is required.
 
 ---
 
@@ -681,8 +684,8 @@ No output on no-change runs. Errors go to stderr and log file. Compatible with c
 | Sessions | Approx used | Notes |
 |---|---|---|
 | 1 (init) | ~2.7GB + 20MB | Full snapshot of 2.7GB source |
-| 2–5 | +10–50MB/session | Typical small-file deltas (kdbx, configs) |
-| 6–8 | approaching capacity | Depends on delta sizes |
+| 2-5 | +10-50MB/session | Typical small-file deltas (kdbx, configs) |
+| 6-8 | approaching capacity | Depends on delta sizes |
 
 Realistic lifespan for a Tier 1 homelab archive (keys, configs, small docs): **years of weekly syncs** before filling. A 2.7GB source with infrequent small changes may produce <10MB deltas per session.
 
@@ -739,60 +742,60 @@ These are the files where loss is catastrophic and reconstruction from scratch i
 - Fleet query packs and agent configs
 - Shuffle SOAR workflow exports
 
-**Estimated Tier 1 size: 1–5GB.** A single 25GB disc is generous.
+**Estimated Tier 1 size: 1-5GB.** A single 25GB disc is generous.
 
 ### Tier 2 -- Consider It (medium value, worth archiving if it fits)
 
 These are recoverable but painful to reconstruct manually.
 
-- Gitea / Forgejo database dump (SQLite = single file; small PostgreSQL installs)
+- Gitea / Forgejo database dump (SQLite = single file, small PostgreSQL installs)
 - Nextcloud `config.php` and encryption keys (not user data -- too large)
 - Home Assistant `/config/` (minus large media)
 - Wiki.js / BookStack database exports
 - Vaultwarden data directory
 - Paperless-ngx database and search index
-- Immich database dump (metadata only; photos go elsewhere)
+- Immich database dump (metadata only, photos go elsewhere)
 - Jellyfin metadata database
 
-**Estimated Tier 2 size: 2–20GB depending on installs.**
+**Estimated Tier 2 size: 2-20GB depending on installs.**
 
 - 25GB disc: Tier 1 + small Tier 2 installs
 - 100GB disc: Tier 1 + all Tier 2 + years of delta history
 
-### Tier 3 -- Wrong Medium (don't use BD-R for these)
+### Tier 3 -- Wrong Medium (do not use BD-R for these)
 
 | Data | Reason | Better medium |
 |---|---|---|
 | OpenSearch / Elasticsearch indices | Large, fast-changing, rebuilt from source | Object storage / cold HDD |
 | Ceph data | Ceph is already redundant | Ceph |
-| VM disk images | Too large; use hypervisor snapshots | SAN / NAS |
+| VM disk images | Too large. Use hypervisor snapshots | SAN / NAS |
 | Container images | Pull from registry | Registry with backup |
 | Log archives | Too large, append-only already | Object storage |
 | Nextcloud user data | Too large | NAS + Restic |
-| Jellyfin / Immich media | Too large; separate archival strategy | HDD / cold storage |
+| Jellyfin / Immich media | Too large. Needs separate archival strategy | HDD / cold storage |
 
 ---
 
 ## Implementation Notes
 
 - Python 3.10+
-- `pathlib` throughout; no `os.path`
+- `pathlib` throughout. No `os.path`.
 - `subprocess.Popen` with `stdin=PIPE, stdout=PIPE` for xdelta3 (no temp files)
 - `concurrent.futures.ThreadPoolExecutor` for per-file parallelism (I/O bound)
 - Staging uses `tempfile.mkdtemp` with cleanup in `finally`
-- All disc reads go through a single `BurnBackend` interface (mockable for tests; swapped for `ISOBackend` in test mode)
+- All disc reads go through a single `BurnBackend` interface (mockable for tests, swapped for `ISOBackend` in test mode)
 - Manifests written atomically (write to `.tmp`, rename)
-- `shutil.disk_usage` for staging space; `dvd+rw-mediainfo` stdout parsed with regex for disc space
+- `shutil.disk_usage` for staging space. `dvd+rw-mediainfo` stdout parsed with regex for disc space
 - `argon2-cffi` for Argon2id KDF (passphrase mode)
 - `pyage` or `age` CLI subprocess for age key operations
-- No Vault dependency -- Vault integration is ODDArchiver-server's concern
-- `BurnBackend` interface in `disc.py` abstracts real disc vs ISO; all pipeline code above the backend is mode-agnostic
+- No Vault dependency. Vault integration is a concern of ODDArchiver-server
+- `BurnBackend` interface in `disc.py` abstracts real disc vs ISO. All pipeline code above the backend is mode-agnostic
 
 ---
 
 ## Future Considerations
 
-- **Multi-drive redundancy** (`--mirror /dev/sr1`): burn identical sessions to two drives simultaneously; store one on-site, one off-site. Stretch goal.
+- **Multi-drive redundancy** (`--mirror /dev/sr1`): burn identical sessions to two drives simultaneously. Store one on-site, one off-site. Stretch goal.
 - **PAR2 recovery blocks**: write PAR2 data into each session for bit-rot correction beyond what verify detects
 - **`oddarchiver diff --session A --session B`**: show what changed between two sessions
 - **Shell completion**: bash/zsh/fish completions for all commands

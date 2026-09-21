@@ -53,7 +53,7 @@ the primary secret would have built and decrypts blobs as usual.
 Plumbing: `_make_init_crypto` hangs `_rescue_block` and `_rescue_code` on
 the crypto object. `_encryption_block` copies `_rescue_block` into the
 manifest `encryption` dict. `write_manifest` writes it onto
-`enc_mode.json`. `_patch_manifest` is unchanged.
+`enc_mode.json`. `_patch_manifest` stays the same.
 
 ## Why scrypt, not Argon2id
 
