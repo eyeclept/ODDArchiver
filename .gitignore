@@ -55,3 +55,4 @@ key.pem
 
 # --- sync_to_public.py state (never commit this) ---
 .sync_state.json
+message.txt

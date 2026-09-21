@@ -4,9 +4,9 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Configuration loading for oddarchiver.
-    Reads ~/.config/oddarchiver/config.toml with tomllib (3.11+) or tomli.
-    CLI flags from argparse.Namespace override file values when not None.
+    This module loads configuration for oddarchiver.
+    It reads ~/.config/oddarchiver/config.toml with tomllib (3.11+) or tomli.
+    CLI flags from argparse.Namespace override file values when the flag is not None.
 """
 # Imports
 import argparse
@@ -43,9 +43,10 @@ class Config:
 def _try_import_tomllib():
     """
     Input:  None
-    Output: tomllib module or None if unavailable
+    Output: The tomllib module, or None if not available.
     Details:
-        Prefers stdlib tomllib (Python 3.11+). Falls back to the tomli package.
+        The function uses the standard tomllib module first (Python 3.11 and later).
+        If that module is not available, the function uses the tomli package instead.
     """
     if sys.version_info >= (3, 11):
         import tomllib
@@ -64,13 +65,13 @@ def _try_import_tomllib():
 
 def load_config(path: Path | None = None) -> Config:
     """
-    Input:  path - path to config.toml. None uses DEFAULT_CONFIG_PATH
-    Output: Config with file values applied over defaults. Returns defaults if the file is absent
+    Input:  path - the path to config.toml. If path is None, the function uses DEFAULT_CONFIG_PATH.
+    Output: A Config object. File values override the defaults. If the file is absent, the function returns the defaults.
     Details:
-        The file is optional. A missing file or missing tomllib returns defaults.
-        Recognized top-level keys: device, cache_dir, staging_dir, delta_threshold,
-        space_safety_margin, log_file, post_burn_verify, disc_size.
-        Encryption sub-table: [encryption] with key mode.
+        The config file is optional. If the file is absent, or the tomllib module is not available, the function returns the defaults.
+        The function reads these top-level keys: device, cache_dir, staging_dir, delta_threshold,
+        space_safety_margin, log_file, post_burn_verify, and disc_size.
+        The function also reads an encryption sub-table, [encryption], with the key mode.
     """
     if path is None:
         path = DEFAULT_CONFIG_PATH
@@ -112,13 +113,13 @@ def load_config(path: Path | None = None) -> Config:
 
 def resolve_config(args: argparse.Namespace, path: Path | None = None) -> Config:
     """
-    Input:  args - parsed argparse.Namespace. Attributes that are not None override config
-            path - path to config.toml. None uses DEFAULT_CONFIG_PATH
-    Output: Config with CLI flag values applied on top of file or defaults
+    Input:  args - the parsed argparse.Namespace object. Attributes that are not None override the config.
+            path - the path to config.toml. If None, the function uses DEFAULT_CONFIG_PATH.
+    Output: A Config object with the CLI flag values applied on top of the file values or the defaults.
     Details:
-        Only attributes that are present and not None on args override the config.
-        argparse defaults are None so a user-supplied value is distinct from an
-        absent flag.
+        Only the attributes present and not None on args override the config.
+        The argparse defaults are None. This lets the function tell a user-supplied
+        value apart from an absent flag.
     """
     cfg = load_config(path)
 
@@ -143,7 +144,7 @@ def main() -> None:
     Input:  None
     Output: None
     Details:
-        Prints values from load_config() for debugging.
+        Shows each value from load_config(). Use this output to debug the program.
     """
     cfg = load_config()
     for attr, val in vars(cfg).items():

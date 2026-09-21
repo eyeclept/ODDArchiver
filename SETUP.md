@@ -8,8 +8,9 @@
 - `dvd+rw-tools` (`growisofs`, `dvd+rw-mediainfo`): writes and reads a physical BD-R drive
 - `xorriso`: reads files back off a physical BD-R drive directly over SG_IO
   (never depends on the OS mounting the disc, which was found unreliable
-  for several minutes after a real, multi-GB burn -- see
-  `Assist/HANDOVER_disc_read_mechanism.md`)
+  for several minutes after a real, multi-GB burn -- see the
+  "Environment-specific hardware limitation" section of
+  `STATE_OF_THE_PROGRAM.md`)
 - `udftools`: optional. Only needed to mount an individual session by hand
 
 Install the system tools:
@@ -43,8 +44,9 @@ oddarchiver --help
 On some USB-bridged BD-R drives, `sync`'s append step can fail right
 after a burn with `unable to pread64(2) primary volume descriptor` --
 a stale kernel block-device capacity cache, not disc corruption or a
-code defect. Confirmed live and root-caused in
-`Assist/HANDOVER_growisofs_append_kernel_limit.md`. `append()` recovers
+code defect. Confirmed live and documented in the
+"Environment-specific hardware limitation" section of
+`STATE_OF_THE_PROGRAM.md`. `append()` recovers
 from this automatically by deauthorizing then reauthorizing the drive's
 USB device, which forces the kernel to fully re-enumerate it (no tray
 action, no interactive session) -- but that toggle needs root, so it

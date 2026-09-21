@@ -125,6 +125,78 @@
       "name": "Security Review (Red Team)",
       "description": "H1: memfd delta, H2: path traversal validators, M1: private staging root, M2: keyfile CLI wiring; docs/security.md created",
       "passes": true
+    },
+    {
+      "id": 21,
+      "name": "21. Multi-Volume Spanning (Multi-Disc Archives)",
+      "description": "Source trees larger than one disc split across volumes, with volume markers and latest-volume-only manifest reads",
+      "passes": true
+    },
+    {
+      "id": 22,
+      "name": "22. Partial/Failed-Write Detection and Recovery",
+      "description": "SUSPECT session marking and interrupted-burn recovery keep the archive readable when a burn fails partway",
+      "passes": true
+    },
+    {
+      "id": 23,
+      "name": "23. Linear/Batched Disc I/O and Redundant-Read Elimination",
+      "description": "Batched read_paths(), one shared manifest load per command, session-ordered replay for restore and verify, and full-copy versus sequential read modes",
+      "passes": true
+    },
+    {
+      "id": 24,
+      "name": "24. Archive Browser and Selective Restore",
+      "description": "ls and browse subcommands list archive contents from disc or ISO manifests and restore an interactively selected set",
+      "passes": true
+    },
+    {
+      "id": 26,
+      "name": "26. Rescue-Key Recovery for Encrypted Archives",
+      "description": "A rescue key derived at init recovers an encrypted archive when the passphrase or keyfile is lost",
+      "passes": true
+    },
+    {
+      "id": 27,
+      "name": "27. Automatic Staging-Space Chunking (Local Temp Storage Limits)",
+      "description": "Staging splits work across multiple passes when the local temp area cannot hold one session's data",
+      "passes": true
+    },
+    {
+      "id": 28,
+      "name": "28. Latest-Volume-Only Correctness for Multi-Volume Discs",
+      "description": "Manifest reads, encryption-mode detection, and sync baselines resolve against the current volume's marker instead of a fixed session number",
+      "passes": true
+    },
+    {
+      "id": 29,
+      "name": "29. Streaming Encryption and I/O for Files Above the AEAD Single-Call Limit",
+      "description": "Large files are encrypted and restored in streaming chunks so no file is bounded by an AEAD single-call size limit",
+      "passes": true
+    },
+    {
+      "id": 30,
+      "name": "30. Single-File Splitting Across Physical Volumes (True Media-Size Agnosticism)",
+      "description": "A single file larger than one disc is split into parts across volumes and reassembled on restore, verified against GB-scale fixtures",
+      "passes": true
+    },
+    {
+      "id": 31,
+      "name": "31. Unhandled Burn Failure Modes (Data-Safety Hardening)",
+      "description": "Disc-full detection on init and append, prior-session re-verification, wrong-disc refusal, mid-write disconnect diagnosis, and a --slow post-burn verify level",
+      "passes": true
+    },
+    {
+      "id": 32,
+      "name": "32. Simplified Technical English (STE) Prose Rewrite",
+      "description": "Every docstring and comment in oddarchiver/ is rewritten in ASD-STE100 Simplified Technical English; Python source is complete and Markdown docs are pending",
+      "passes": true
+    },
+    {
+      "id": 33,
+      "name": "33. Full Media Support: CD, DVD, BD, and M-DISC",
+      "description": "CD is refused rather than supported because no tested toolchain keeps a CD-R appendable; DVD and bd-dl/bdxl presets are covered by ISOBackend simulation only, while M-DISC BD-R SL is hardware-verified",
+      "passes": true
     }
   ]
 }

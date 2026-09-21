@@ -4,7 +4,7 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Entry point for `python -m oddarchiver`. Dispatches to cli.main().
+    This is the entry point for `python -m oddarchiver`. It calls cli.main().
 """
 # Imports
 from oddarchiver.cli import main

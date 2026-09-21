@@ -192,6 +192,7 @@ def test_sigint_during_staging_removes_staging_dir(tmp_path):
                 session_n=3,
                 source=source,
                 disc_state={},
+                disc_origin={},
                 backend=backend,
                 cache=cache,
                 crypto=NullCrypto(),

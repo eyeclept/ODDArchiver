@@ -5,9 +5,11 @@ Email:  eyeclept@pm.me
 
 Description:
     Tests for disc.py. ISOBackend, DiscInfo, double-burn guard,
-    prefill, parse_disc_size, and _parse_mediainfo.
+    prefill, parse_disc_size, dvd+rw-mediainfo parsing, CD refusal,
+    disc-full errors, and wrong-disc volume identity.
 """
 # Imports
+import argparse
 import hashlib
 import subprocess
 from pathlib import Path
@@ -15,19 +17,45 @@ from unittest.mock import patch
 
 import pytest
 
+from oddarchiver.cli import dispatch
+
 from oddarchiver.disc import (
+    BDXL_DISC_BYTES,
+    BD_DL_DISC_BYTES,
+    CD_DISC_BYTES,
+    DVD_DL_DISC_BYTES,
+    DVD_SL_DISC_BYTES,
     DiscBackend,
     DiscInfo,
     ISOBackend,
     _parse_mediainfo,
+    _is_disconnect,
     parse_disc_size,
 )
+from oddarchiver.volume import VolumeMarker, write_volume_marker
 
 # Globals
 SMALL_DISC = 10 * 2**20  # 10 MiB. Keeps ISO builds fast in tests.
 
 # Blob name for the test file in session_000 (sha256("0:hello.txt"))
 _HELLO_BLOB = hashlib.sha256(b"0:hello.txt").hexdigest()
+
+# Blank BD-R as reported by dvd+rw-mediainfo: one implicit empty session.
+_MEDIAINFO_BLANK_BD = (
+    " Mounted Media:         41h, BD-R SRM+POW\n"
+    "READ DISC INFORMATION:\n"
+    " Disc status:           blank\n"
+    " Number of Sessions:    1\n"
+    " State of Last Session: empty\n"
+    "READ TRACK INFORMATION[#1]:\n"
+    " Free Blocks:           12088320*2KB\n"
+    "READ CAPACITY:          12088320*2048=24756879360\n"
+)
+
+_MEDIAINFO_CD_REFUSAL_STDERR = ":-( non-DVD media mounted, exiting..."
+
+_FAKE_SR = "/dev/oddarchiver-test-no-drive"
+
 
 
 # Functions
@@ -110,6 +138,43 @@ def test_mediainfo_remaining_bytes(tmp_path):
     assert info.remaining_bytes + info.used_bytes == SMALL_DISC
 
 
+def test_remaining_bytes_decreases_and_clamps_at_zero(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        remaining_bytes falls after init and again after append. When
+        used_bytes exceeds disc_size, remaining_bytes is 0, not negative.
+    """
+    iso = tmp_path / "test.iso"
+    backend = ISOBackend(iso, disc_size=SMALL_DISC)
+    empty = backend.mediainfo()
+    assert empty.remaining_bytes == SMALL_DISC
+    assert empty.used_bytes == 0
+
+    backend.init(_make_staging(tmp_path), label="TEST", expected_session_count=0)
+    after_init = backend.mediainfo()
+    assert after_init.used_bytes > empty.used_bytes
+    assert after_init.remaining_bytes == SMALL_DISC - after_init.used_bytes
+    assert after_init.remaining_bytes < empty.remaining_bytes
+    assert after_init.remaining_bytes >= 0
+
+    staging1 = tmp_path / "staging2"
+    (staging1 / "session_001").mkdir(parents=True)
+    (staging1 / "session_001" / "b.txt").write_bytes(b"second session")
+    backend.append(staging1, label="TEST", expected_session_count=1)
+    after_append = backend.mediainfo()
+    assert after_append.used_bytes > after_init.used_bytes
+    assert after_append.remaining_bytes < after_init.remaining_bytes
+    assert after_append.remaining_bytes == max(0, SMALL_DISC - after_append.used_bytes)
+    assert after_append.remaining_bytes >= 0
+
+    backend.prefill(SMALL_DISC)
+    clamped = backend.mediainfo()
+    assert clamped.used_bytes > SMALL_DISC
+    assert clamped.remaining_bytes == 0
+
+
 def test_prefill_increases_used_bytes(tmp_path):
     """
     Input:  tmp_path
@@ -132,8 +197,9 @@ def test_double_burn_guard_raises(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        init() must raise RuntimeError if the session count at call time
-        differs from expected_session_count (simulated via patching mediainfo).
+        Blank-disc init uses mediainfo().session_count, which is 0 on
+        empty media and nonzero after the first session. init() must
+        raise RuntimeError if that count is not 0.
     """
     iso = tmp_path / "test.iso"
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
@@ -142,6 +208,76 @@ def test_double_burn_guard_raises(tmp_path):
     with patch.object(backend, "mediainfo", return_value=stale_info):
         with pytest.raises(RuntimeError, match="Double-burn guard"):
             backend.init(_make_staging(tmp_path), label="TEST", expected_session_count=0)
+
+
+class _PowLyingISO(ISOBackend):
+    """ISOBackend whose mediainfo().session_count stays 1, like BD-R SRM+POW."""
+
+    def mediainfo(self) -> DiscInfo:
+        """
+        Input:  None
+        Output: DiscInfo with session_count pinned at 1
+        Details:
+            Copies capacity fields from ISOBackend.mediainfo and
+            overwrites session_count. BD-R SRM+POW reports 1 after
+            every append.
+        """
+        info = super().mediainfo()
+        return DiscInfo(
+            session_count=1,
+            remaining_bytes=info.remaining_bytes,
+            used_bytes=info.used_bytes,
+            label=info.label,
+        )
+
+
+def test_double_burn_guard_detects_concurrent_append_when_mmc_stays_one(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        BD-R SRM+POW keeps mediainfo().session_count at 1 after every
+        append. A concurrent second archive session must still trip
+        the guard, and session_002 must not be written.
+    """
+    iso = tmp_path / "test.iso"
+    real = ISOBackend(iso, disc_size=SMALL_DISC)
+    real.init(_make_staging(tmp_path), label="TEST")
+    (real._sessions_root / "session_001").mkdir()
+    (real._sessions_root / "session_001" / "racer.txt").write_bytes(b"racer")
+
+    lying = _PowLyingISO(iso, disc_size=SMALL_DISC)
+    assert lying.mediainfo().session_count == 1
+    staging2 = tmp_path / "staging_ours"
+    (staging2 / "session_002").mkdir(parents=True)
+    (staging2 / "session_002" / "ours.txt").write_bytes(b"ours")
+    with pytest.raises(RuntimeError, match="Double-burn guard"):
+        lying.append(staging2, label="TEST", expected_session_count=1)
+    assert not (real._sessions_root / "session_002").exists()
+
+
+def test_double_burn_guard_allows_append_when_mmc_stays_one(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        After two archive sessions, a BD-R-like backend still reports
+        session_count 1. append with expected archive count 2 must
+        proceed, because the archive count matches.
+    """
+    iso = tmp_path / "test.iso"
+    real = ISOBackend(iso, disc_size=SMALL_DISC)
+    real.init(_make_staging(tmp_path), label="TEST")
+    real.append(_append_staging(tmp_path), label="TEST", expected_session_count=1)
+    assert real.mediainfo().session_count == 2
+
+    lying = _PowLyingISO(iso, disc_size=SMALL_DISC)
+    assert lying.mediainfo().session_count == 1
+    staging3 = tmp_path / "staging3"
+    (staging3 / "session_002").mkdir(parents=True)
+    (staging3 / "session_002" / "c.txt").write_bytes(b"third")
+    lying.append(staging3, label="TEST", expected_session_count=2)
+    assert (lying._sessions_root / "session_002").is_dir()
 
 
 def test_read_path_returns_file_bytes(tmp_path):
@@ -188,9 +324,97 @@ def test_parse_disc_size(size_str, expected):
     Input:  size_str, expected
     Output: None
     Details:
-        parse_disc_size must convert human-readable strings to exact byte counts.
+        parse_disc_size must convert human-readable strings to exact byte
+        counts. These are pre-existing raw-byte and unit-suffix inputs --
+        regression coverage that the new named presets below leave them
+        completely unaffected.
     """
     assert parse_disc_size(size_str) == expected
+
+
+@pytest.mark.parametrize("preset,expected", [
+    ("cd", CD_DISC_BYTES),
+    ("dvd-sl", DVD_SL_DISC_BYTES),
+    ("dvd-dl", DVD_DL_DISC_BYTES),
+    ("bd-r", ISOBackend.DEFAULT_DISC_BYTES),
+    ("bd-dl", BD_DL_DISC_BYTES),
+    ("bdxl", BDXL_DISC_BYTES),
+])
+def test_parse_disc_size_presets(preset, expected):
+    """
+    Input:  preset, expected
+    Output: None
+    Details:
+        Each named media preset must parse to its exact documented byte
+        count.
+    """
+    assert parse_disc_size(preset) == expected
+
+
+@pytest.mark.parametrize("preset,expected", [
+    ("CD", CD_DISC_BYTES),
+    ("Dvd-Sl", DVD_SL_DISC_BYTES),
+    ("DVD-DL", DVD_DL_DISC_BYTES),
+    ("BD-R", ISOBackend.DEFAULT_DISC_BYTES),
+    ("Bd-Dl", BD_DL_DISC_BYTES),
+    ("BdXl", BDXL_DISC_BYTES),
+])
+def test_parse_disc_size_presets_case_insensitive(preset, expected):
+    """
+    Input:  preset, expected
+    Output: None
+    Details:
+        Preset name matching must be case-insensitive.
+    """
+    assert parse_disc_size(preset) == expected
+
+
+@pytest.mark.parametrize("preset,expected", [
+    ("cd", CD_DISC_BYTES),
+    ("dvd-sl", DVD_SL_DISC_BYTES),
+    ("dvd-dl", DVD_DL_DISC_BYTES),
+    ("bd-r", ISOBackend.DEFAULT_DISC_BYTES),
+    ("bd-dl", BD_DL_DISC_BYTES),
+    ("bdxl", BDXL_DISC_BYTES),
+])
+def test_media_preset_empty_isobackend_remaining_bytes(preset, expected, tmp_path):
+    """
+    Input:  preset, expected, tmp_path
+    Output: None
+    Details:
+        Each of the six media presets parses to its documented byte count
+        case-insensitively. An empty ISOBackend built with that size
+        reports remaining_bytes equal to the same count. After init of a
+        tiny staging tree, session_count is 1 and remaining_bytes drops.
+    """
+    assert parse_disc_size(preset) == expected
+    assert parse_disc_size(preset.upper()) == expected
+    backend = ISOBackend(tmp_path / f"{preset}.iso", disc_size=parse_disc_size(preset))
+    info = backend.mediainfo()
+    assert info.remaining_bytes == expected
+    assert info.used_bytes == 0
+    assert info.session_count == 0
+    backend.init(
+        _make_staging(tmp_path), label="TEST", expected_session_count=0,
+    )
+    after = backend.mediainfo()
+    assert after.session_count == 1
+    assert after.used_bytes > 0
+    assert after.remaining_bytes == expected - after.used_bytes
+    assert after.remaining_bytes < expected
+
+
+def test_parse_disc_size_unrecognized_preset_like_string_raises():
+    """
+    Input:  None
+    Output: None
+    Details:
+        A string that is not a raw int, a unit-suffixed size, or a known
+        preset name must still raise the same error parse_disc_size
+        already gives today for an unparseable value.
+    """
+    with pytest.raises(ValueError):
+        parse_disc_size("dvd-xl")
 
 
 def test_parse_mediainfo_parses_fields():
@@ -198,19 +422,28 @@ def test_parse_mediainfo_parses_fields():
     Input:  None
     Output: None
     Details:
-        _parse_mediainfo must extract session count, remaining, used, and label
-        from dvd+rw-mediainfo stdout fixture text.
+        _parse_mediainfo must extract session count, remaining bytes,
+        used bytes, and the volume label from dvd+rw-mediainfo text.
+        Remaining: wins over Free Blocks when both are present.
     """
     fixture = (
-        "Sessions: 2\n"
-        "Remaining: 10000*2KB\n"
-        "READ CAPACITY: 12000*2KB\n"
-        "Volume id: MYDISC\n"
+        " Mounted Media:         41h, BD-R SRM+POW\n"
+        "READ DISC INFORMATION:\n"
+        " Disc status:           appendable\n"
+        " Number of Sessions:    2\n"
+        " State of Last Session: incomplete\n"
+        " Remaining:             8000*2KB\n"
+        "READ TRACK INFORMATION[#1]:\n"
+        " Free Blocks:           0*2KB\n"
+        "READ TRACK INFORMATION[#2]:\n"
+        " Free Blocks:           10000*2KB\n"
+        "READ CAPACITY:          12000*2048=24576000\n"
+        " Volume id:             MYDISC\n"
     )
     info = _parse_mediainfo(fixture)
     assert info.session_count == 2
-    assert info.remaining_bytes == 10000 * 2048
-    assert info.used_bytes == 2000 * 2048
+    assert info.remaining_bytes == 8000 * 2048
+    assert info.used_bytes == (12000 - 8000) * 2048
     assert info.label == "MYDISC"
 
 
@@ -219,72 +452,15 @@ def test_parse_mediainfo_blank_disc_returns_zero_sessions():
     Input:  None
     Output: None
     Details:
-        Blank BD-R discs report "Number of Sessions: 1" with "Disc status: blank".
-        _parse_mediainfo must return session_count=0 so init() proceeds instead
-        of reporting "disc already initialized".
-        Regression for bug: false "disc already initialized" on blank BD-R media.
+        Blank BD-R discs report "Number of Sessions: 1" with
+        "Disc status: blank". _parse_mediainfo must return
+        session_count=0 so init() proceeds instead of reporting
+        the disc already initialized.
     """
-    fixture = (
-        "Disc status:           blank\n"
-        "Number of Sessions:    1\n"
-        "State of Last Session: empty\n"
-        "Next Writable Address: 0\n"
-        "Free Blocks:           12219392*2KB\n"
-    )
-    info = _parse_mediainfo(fixture)
+    info = _parse_mediainfo(_MEDIAINFO_BLANK_BD)
     assert info.session_count == 0
-    assert info.remaining_bytes == 12219392 * 2048
-
-
-def test_parse_mediainfo_empty_last_session_returns_zero_sessions():
-    """
-    Input:  None
-    Output: None
-    Details:
-        Some drives omit "Disc status" but report "State of Last Session: empty"
-        with a single session. _parse_mediainfo must treat this as 0 sessions.
-    """
-    fixture = (
-        "Number of Sessions:    1\n"
-        "State of Last Session: empty\n"
-        "Free Blocks:           5000*2KB\n"
-    )
-    info = _parse_mediainfo(fixture)
-    assert info.session_count == 0
-    assert info.remaining_bytes == 5000 * 2048
-
-
-def test_parse_mediainfo_bdr_srm_pow_real_output():
-    """
-    Input:  None
-    Output: None
-    Details:
-        BD-R SRM+POW drives (e.g. Buffalo) use *2048 in READ CAPACITY and
-        have two Free Blocks: lines. Track#1 (written, 0 free) and Track#2
-        (invisible writable, full remaining space). Parser must take the last
-        Free Blocks entry and parse *2048 as well as *2KB.
-        Regression for bug: remaining_bytes reported as 0 on appendable BD-R.
-    """
-    fixture = (
-        " Mounted Media:         41h, BD-R SRM+POW\n"
-        "READ DISC INFORMATION:\n"
-        " Disc status:           appendable\n"
-        " Number of Sessions:    1\n"
-        " State of Last Session: incomplete\n"
-        "READ TRACK INFORMATION[#1]:\n"
-        " Track State:           partial incremental\n"
-        " Free Blocks:           0*2KB\n"
-        " Track Size:            55872*2KB\n"
-        "READ TRACK INFORMATION[#2]:\n"
-        " Track State:           invisible incremental\n"
-        " Free Blocks:           12032448*2KB\n"
-        " Track Size:            12032448*2KB\n"
-        "READ CAPACITY:          12088320*2048=24756879360\n"
-    )
-    info = _parse_mediainfo(fixture)
-    assert info.session_count == 1
-    assert info.remaining_bytes == 12032448 * 2048
-    assert info.used_bytes == (12088320 - 12032448) * 2048  # ~109 MB written
+    assert info.remaining_bytes == 12088320 * 2048
+    assert info.label == ""
 
 
 def _xorriso_result(returncode, stderr=""):
@@ -568,6 +744,49 @@ def test_run_growisofs_collapses_xorriso_percent_done_lines(monkeypatch, capsys)
     assert "62.44% done" not in out
 
 
+def test_run_growisofs_collapses_genisoimage_percent_done_lines(monkeypatch, capsys):
+    """
+    Input:  monkeypatch, capsys
+    Output: None
+    Details:
+        _run_growisofs forces MKISOFS=genisoimage (disc.py) because
+        genisoimage, not xorriso, handles a 4 GiB+ source file. genisoimage
+        prints its build-phase percentage line bare, with no "UPDATE :" tag,
+        unlike the xorriso line the sibling test above covers. Before this
+        fix, that bare line matched none of the three progress regexes and
+        fell through to the raw-print path, flooding the terminal with one
+        line per ~0.15-0.2% on a large real archive. Regression for exactly
+        that complaint, using the literal lines observed during a real
+        87 GiB, ~148,000-file burn.
+    """
+    from oddarchiver.disc import _run_growisofs
+
+    lines = [
+        "  0.67% done, estimate finish Mon Sep 21 11:15:49 2026\n",
+        "  0.83% done, estimate finish Mon Sep 21 11:05:49 2026\n",
+        "  1.00% done, estimate finish Mon Sep 21 10:59:10 2026\n",
+        "  1.17% done, estimate finish Mon Sep 21 10:54:25 2026\n",
+        "Burn complete.\n",
+    ]
+    monkeypatch.setattr(
+        "oddarchiver.disc.subprocess.Popen",
+        lambda cmd, **kwargs: _FakePopen(lines, returncode=0),
+    )
+
+    returncode, _ = _run_growisofs(["growisofs", "-Z", "/dev/sr0"])
+    out = capsys.readouterr().out
+
+    assert returncode == 0
+    assert out.count("Burn complete.") == 1
+    assert "1/100" in out
+    assert "estimate finish Mon Sep 21 10:54:25 2026" in out
+    # Four progress updates redraw the same line, never four separate
+    # terminal lines, and the raw percentage text never leaks through.
+    assert out.count("\r") >= 4
+    assert "0.67% done" not in out
+    assert "1.17% done" not in out
+
+
 def test_run_growisofs_returns_nonzero_on_failure(monkeypatch, capsys):
     """
     Input:  monkeypatch, capsys
@@ -623,6 +842,9 @@ def test_append_raises_clear_error_for_stale_block_layer(monkeypatch, tmp_path):
             session_count=1, remaining_bytes=10**9, used_bytes=0, label="TEST",
         ),
     )
+    monkeypatch.setattr(
+        "oddarchiver.disc.archive_session_count", lambda backend: 1,
+    )
     monkeypatch.setattr(DiscBackend, "_attempt_usb_reauth", lambda self: False)
     lines = [
         ":-( unable to pread64(2) primary volume descriptor: Input/output error\n",
@@ -648,7 +870,8 @@ def test_append_recovers_via_usb_reauth_and_succeeds(monkeypatch, tmp_path):
     Input:  monkeypatch, tmp_path
     Output: None
     Details:
-        Live-confirmed fix (Assist/HANDOVER_growisofs_append_kernel_limit.md):
+        Live-confirmed fix (see STATE_OF_THE_PROGRAM.md,
+        "Environment-specific hardware limitation"):
         deauthorizing then reauthorizing the drive's USB device node
         forces a full re-enumeration that clears the stale kernel
         capacity cache, with no tray action. When append() hits the
@@ -661,6 +884,9 @@ def test_append_recovers_via_usb_reauth_and_succeeds(monkeypatch, tmp_path):
         lambda self, retries=6, retry_delay=5.0: DiscInfo(
             session_count=1, remaining_bytes=10**9, used_bytes=0, label="TEST",
         ),
+    )
+    monkeypatch.setattr(
+        "oddarchiver.disc.archive_session_count", lambda backend: 1,
     )
     monkeypatch.setattr(DiscBackend, "_attempt_usb_reauth", lambda self: True)
     monkeypatch.setattr(DiscBackend, "_wait_for_device_node", lambda self: True)
@@ -702,6 +928,9 @@ def test_append_raises_clear_error_when_usb_reauth_also_fails(monkeypatch, tmp_p
         lambda self, retries=6, retry_delay=5.0: DiscInfo(
             session_count=1, remaining_bytes=10**9, used_bytes=0, label="TEST",
         ),
+    )
+    monkeypatch.setattr(
+        "oddarchiver.disc.archive_session_count", lambda backend: 1,
     )
     monkeypatch.setattr(DiscBackend, "_attempt_usb_reauth", lambda self: True)
     monkeypatch.setattr(DiscBackend, "_wait_for_device_node", lambda self: True)
@@ -848,3 +1077,747 @@ def test_resolve_usb_device_sysfs_path_returns_none_for_non_usb_device(tmp_path)
     (sda / "device").symlink_to(lun, target_is_directory=True)
 
     assert resolve_usb_device_sysfs_path("/dev/sda", sys_class_block=block_root) is None
+
+
+_DISC_FULL_LINES = [
+    ":-( /dev/sr0: 128 blocks are free, 4096 to be written!\n",
+    ":-( write failed: No space left on device\n",
+]
+
+
+def _stub_disc_mediainfo(monkeypatch, session_count: int) -> None:
+    """Point DiscBackend.mediainfo and archive_session_count at canned values."""
+    monkeypatch.setattr(
+        DiscBackend, "mediainfo",
+        lambda self, retries=6, retry_delay=5.0: DiscInfo(
+            session_count=session_count,
+            remaining_bytes=10**9,
+            used_bytes=0,
+            label="TEST",
+        ),
+    )
+    monkeypatch.setattr(
+        "oddarchiver.disc.archive_session_count",
+        lambda backend: session_count,
+    )
+
+
+def _stub_growisofs(monkeypatch, lines, returncode: int) -> None:
+    """Point growisofs Popen at canned stdout and an exit code."""
+    monkeypatch.setattr(
+        "oddarchiver.disc.subprocess.Popen",
+        lambda cmd, **kwargs: _FakePopen(lines, returncode=returncode),
+    )
+
+
+def test_append_disc_full_reassures_after_reverify(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        growisofs -M printing the disc-full two-line signature must raise
+        a diagnosed RuntimeError, not a bare exit code. The message must
+        say the append ran out of space, that prior sessions were
+        re-verified, and that verify --level fast then a retry is the
+        next step. _reverify_prior_sessions must actually run.
+    """
+    staging = tmp_path / "staging"
+    (staging / "session_001").mkdir(parents=True)
+    _stub_disc_mediainfo(monkeypatch, session_count=1)
+    _stub_growisofs(monkeypatch, _DISC_FULL_LINES, returncode=1)
+    reverify_calls = []
+
+    def fake_reverify(self, attempted):
+        reverify_calls.append(attempted)
+        return True
+
+    monkeypatch.setattr(DiscBackend, "_reverify_prior_sessions", fake_reverify)
+    backend = DiscBackend("/dev/sr0")
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.append(staging, "TEST", 1)
+    message = str(exc_info.value)
+    assert "out of space" in message.lower()
+    assert "append" in message.lower()
+    assert "re-verified readable" in message
+    assert "verify --level fast" in message
+    assert reverify_calls == [1]
+
+
+def test_append_disc_full_reports_unreadable_prior_sessions(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        When re-verify of prior sessions fails, the disc-full append
+        error must say they could not be re-verified instead of claiming
+        they are safe.
+    """
+    staging = tmp_path / "staging"
+    (staging / "session_001").mkdir(parents=True)
+    _stub_disc_mediainfo(monkeypatch, session_count=1)
+    _stub_growisofs(monkeypatch, _DISC_FULL_LINES, returncode=1)
+    monkeypatch.setattr(
+        DiscBackend, "_reverify_prior_sessions", lambda self, attempted: False,
+    )
+    backend = DiscBackend("/dev/sr0")
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.append(staging, "TEST", 1)
+    message = str(exc_info.value)
+    assert "out of space" in message.lower()
+    assert "could NOT be re-verified" in message
+
+
+def test_init_disc_full_capacity_message_skips_reverify(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        growisofs -Z printing the disc-full signature must raise a
+        capacity-oriented RuntimeError. _reverify_prior_sessions must not
+        run: session 0 has nothing prior to check.
+    """
+    staging = tmp_path / "staging"
+    (staging / "session_000").mkdir(parents=True)
+    _stub_disc_mediainfo(monkeypatch, session_count=0)
+    _stub_growisofs(monkeypatch, _DISC_FULL_LINES, returncode=1)
+    reverify_calls = []
+    monkeypatch.setattr(
+        DiscBackend,
+        "_reverify_prior_sessions",
+        lambda self, attempted: reverify_calls.append(attempted) or True,
+    )
+    backend = DiscBackend("/dev/sr0")
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.init(staging, "TEST", 0)
+    message = str(exc_info.value)
+    assert "out of space" in message.lower()
+    assert "init" in message.lower()
+    assert "--disc-size" in message
+    assert reverify_calls == []
+
+
+def test_append_enospc_without_blocks_free_stays_generic(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        A lone "No space left on device" line without the blocks-are-free
+        signature must stay the generic growisofs -M exit-code error.
+    """
+    staging = tmp_path / "staging"
+    (staging / "session_001").mkdir(parents=True)
+    _stub_disc_mediainfo(monkeypatch, session_count=1)
+    _stub_growisofs(
+        monkeypatch,
+        ["write failed: No space left on device\n"],
+        returncode=1,
+    )
+    backend = DiscBackend("/dev/sr0")
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.append(staging, "TEST", 1)
+    message = str(exc_info.value)
+    assert "exit code 1" in message
+    assert "out of space during append" not in message.lower()
+
+
+def _backend_with_marker(
+    tmp_path: Path, archive_id: str = "id-expected", volume_index: int = 0,
+) -> ISOBackend:
+    """Init an ISOBackend whose volume.json carries the given identity."""
+    iso = tmp_path / "test.iso"
+    backend = ISOBackend(iso, disc_size=SMALL_DISC)
+    staging = _make_staging(tmp_path)
+    write_volume_marker(
+        staging,
+        VolumeMarker(
+            archive_id=archive_id,
+            volume_index=volume_index,
+            first_session=0,
+            created_at="2026-09-20T00:00:00Z",
+            previous_volume_label="",
+        ),
+    )
+    backend.init(staging, label="TEST")
+    return backend
+
+
+def _append_staging(tmp_path: Path) -> Path:
+    """Build a session_001 staging tree for an identity-guard append."""
+    staging = tmp_path / "staging2"
+    (staging / "session_001").mkdir(parents=True)
+    (staging / "session_001" / "b.txt").write_bytes(b"second session")
+    return staging
+
+
+def test_append_refuses_wrong_archive_id(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        append() with an expected archive_id that does not match the
+        disc's volume.json must raise a wrong-disc error naming both
+        ids and must not write the new session.
+    """
+    backend = _backend_with_marker(tmp_path, archive_id="id-expected")
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.append(
+            _append_staging(tmp_path), "TEST", 1,
+            expected_archive_id="id-other",
+            expected_volume_index=0,
+        )
+    message = str(exc_info.value)
+    assert "wrong disc" in message.lower()
+    assert "id-expected" in message
+    assert "id-other" in message
+    assert backend.mediainfo().session_count == 1
+
+
+def test_append_accepts_matching_archive_id(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        append() with the disc's own archive_id and volume_index must
+        proceed and increment session count.
+    """
+    backend = _backend_with_marker(tmp_path, archive_id="id-expected")
+    backend.append(
+        _append_staging(tmp_path), "TEST", 1,
+        expected_archive_id="id-expected",
+        expected_volume_index=0,
+    )
+    assert backend.mediainfo().session_count == 2
+
+
+def test_append_refuses_markerless_disc_when_identity_expected(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        A disc with no volume.json, when the caller expected an
+        archive_id, must raise a wrong-disc error naming the expected
+        id. It must not crash and must not write the new session.
+    """
+    iso = tmp_path / "test.iso"
+    backend = ISOBackend(iso, disc_size=SMALL_DISC)
+    backend.init(_make_staging(tmp_path), label="TEST")
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.append(
+            _append_staging(tmp_path), "TEST", 1,
+            expected_archive_id="id-expected",
+        )
+    message = str(exc_info.value)
+    assert "wrong disc" in message.lower()
+    assert "id-expected" in message
+    assert "volume marker" in message.lower()
+    assert backend.mediainfo().session_count == 1
+
+
+def test_append_refuses_wrong_volume_index(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        Same archive_id but a different volume_index must refuse the
+        burn and name both volume indexes.
+    """
+    backend = _backend_with_marker(
+        tmp_path, archive_id="id-same", volume_index=0,
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.append(
+            _append_staging(tmp_path), "TEST", 1,
+            expected_archive_id="id-same",
+            expected_volume_index=1,
+        )
+    message = str(exc_info.value)
+    assert "wrong disc" in message.lower()
+    assert "id-same" in message
+    assert "volume_index 1" in message
+    assert "volume_index 0" in message
+    assert backend.mediainfo().session_count == 1
+
+
+def _mediainfo_completed(text="", returncode=0, stderr=""):
+    """Build a CompletedProcess as `dvd+rw-mediainfo DEVICE` would return."""
+    return subprocess.CompletedProcess(
+        args=["dvd+rw-mediainfo", "/dev/sr0"],
+        returncode=returncode,
+        stdout=text.encode(),
+        stderr=stderr.encode(),
+    )
+
+
+# Verbatim dvd+rw-mediainfo output captured from a real M-DISC BD-R in a
+# Buffalo USB drive, after ODDArchiver burned session 000 through growisofs.
+# growisofs formats BD-R for Pseudo OverWrite (SRM+POW), which is what broke
+# an earlier xorriso-based parser. Media ID MILLEN/MR1 is the M-DISC marker.
+_REAL_POW_BDR_MEDIAINFO = """INQUIRY:                [BUFFALO ][Optical Drive   ][]
+GET [CURRENT] CONFIGURATION:
+ Mounted Media:         41h, BD-R SRM+POW
+ Media ID:              MILLEN/MR1
+ Current Write Speed:   4.0x4495=17984KB/s
+ Write Speed #0:        4.0x4495=17984KB/s
+ Write Speed #1:        2.0x4495=8992KB/s
+ Speed Descriptor#0:    08/12088319 R@6.0x4495=26976KB/s W@4.0x4495=17984KB/s
+ Speed Descriptor#1:    00/12088319 R@6.0x4495=26976KB/s W@2.0x4495=8992KB/s
+BD SPARE AREA INFORMATION:
+ Spare Area:            65536/65536=100.0% free
+POW RESOURCES INFORMATION:
+ Remaining Replacements:16843296
+ Remaining Map Entries: 0
+ Remaining Updates:     0
+READ DISC INFORMATION:
+ Disc status:           appendable
+ Number of Sessions:    1
+ State of Last Session: incomplete
+ "Next" Track:          1
+ Number of Tracks:      2
+READ TRACK INFORMATION[#1]:
+ Track State:           partial incremental
+ Track Start Address:   0*2KB
+ Free Blocks:           0*2KB
+ Track Size:            154048*2KB
+READ TRACK INFORMATION[#2]:
+ Track State:           invisible incremental
+ Track Start Address:   154048*2KB
+ Next Writable Address: 154048*2KB
+ Free Blocks:           11934272*2KB
+ Track Size:            11934272*2KB
+FABRICATED TOC:
+ Track#1  :             14@0
+ Track#AA :             14@12088320
+ Multi-session Info:    #1@0
+READ CAPACITY:          12088320*2048=24756879360
+"""
+
+
+def test_parse_mediainfo_bdr_srm_pow_real_output():
+    """
+    Input:  None
+    Output: None
+    Details:
+        BD-R SRM+POW drives (e.g. Buffalo) use *2048 in READ CAPACITY and
+        have two Free Blocks: lines. Track#1 (written, 0 free) and Track#2
+        (invisible writable, full remaining space). Parser must take the last
+        Free Blocks entry and parse *2048 as well as *2KB.
+        Regression for bug: remaining_bytes reported as 0 on appendable BD-R.
+    """
+    fixture = (
+        " Mounted Media:         41h, BD-R SRM+POW\n"
+        "READ DISC INFORMATION:\n"
+        " Disc status:           appendable\n"
+        " Number of Sessions:    1\n"
+        " State of Last Session: incomplete\n"
+        "READ TRACK INFORMATION[#1]:\n"
+        " Track State:           partial incremental\n"
+        " Free Blocks:           0*2KB\n"
+        " Track Size:            55872*2KB\n"
+        "READ TRACK INFORMATION[#2]:\n"
+        " Track State:           invisible incremental\n"
+        " Free Blocks:           12032448*2KB\n"
+        " Track Size:            12032448*2KB\n"
+        "READ CAPACITY:          12088320*2048=24756879360\n"
+    )
+    info = _parse_mediainfo(fixture)
+    assert info.session_count == 1
+    assert info.remaining_bytes == 12032448 * 2048
+    assert info.used_bytes == (12088320 - 12032448) * 2048  # ~109 MB written
+
+
+def test_parse_mediainfo_empty_last_session_returns_zero_sessions():
+    """
+    Input:  None
+    Output: None
+    Details:
+        Some drives omit "Disc status" but report "State of Last Session: empty"
+        with a single session. _parse_mediainfo must treat this as 0 sessions.
+    """
+    fixture = (
+        "Number of Sessions:    1\n"
+        "State of Last Session: empty\n"
+        "Free Blocks:           5000*2KB\n"
+    )
+    info = _parse_mediainfo(fixture)
+    assert info.session_count == 0
+    assert info.remaining_bytes == 5000 * 2048
+
+def test_mediainfo_retries_on_no_media_then_raises(monkeypatch, capsys):
+    """
+    Input:  monkeypatch, capsys
+    Output: None
+    Details:
+        A transient "no media" from dvd+rw-mediainfo must be retried,
+        because the drive reloads the tray for 5 to 30 seconds after a
+        burn. retries=3 means 4 attempts, then a raise.
+    """
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return _mediainfo_completed(returncode=1, stderr="no media mounted")
+
+    monkeypatch.setattr("oddarchiver.disc.subprocess.run", fake_run)
+    monkeypatch.setattr("oddarchiver.disc.time.sleep", lambda s: None)
+    with pytest.raises(RuntimeError, match="dvd\\+rw-mediainfo failed"):
+        DiscBackend("/dev/sr0").mediainfo(retries=3, retry_delay=0)
+    assert len(calls) == 4
+
+
+def test_mediainfo_refuses_cd_with_unsupported_error(monkeypatch):
+    """
+    Input:  monkeypatch
+    Output: None
+    Details:
+        dvd+rw-mediainfo refuses CD with "non-DVD media mounted". That
+        error is the CD detector, so it must surface as the
+        unsupported-media error rather than a raw tool failure, and it
+        must not be retried as a transient drive problem.
+    """
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return _mediainfo_completed(
+            returncode=1, stderr=_MEDIAINFO_CD_REFUSAL_STDERR)
+
+    monkeypatch.setattr("oddarchiver.disc.subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="CD media is not supported"):
+        DiscBackend("/dev/sr0").mediainfo()
+    assert len(calls) == 1
+
+
+def test_mediainfo_counts_sessions_on_pow_formatted_bdr():
+    """
+    Input:  None
+    Output: None
+    Details:
+        Regression guard for a data-safety bug found on real hardware.
+        growisofs formats BD-R for Pseudo OverWrite. A parser built on
+        xorriso -toc read such a disc as "is unsuitable" with no session
+        count, so a BD-R holding one session reported zero sessions.
+        init() treats zero sessions as a blank disc, so it would have
+        run growisofs -Z and destroyed the archive already on the medium.
+
+        This asserts the real captured output of a written M-DISC BD-R
+        parses as one session, with capacity taken from the writable
+        track rather than the whole disc.
+    """
+    info = _parse_mediainfo(_REAL_POW_BDR_MEDIAINFO)
+    assert info.session_count == 1
+    assert info.remaining_bytes == 11934272 * 2048
+    assert info.used_bytes == (12088320 - 11934272) * 2048
+
+
+def test_mediainfo_pow_bdr_is_never_mistaken_for_blank():
+    """
+    Input:  None
+    Output: None
+    Details:
+        States the safety property directly, independent of exact byte
+        counts: a written disc must never parse as zero sessions,
+        because that is the value init() uses to decide a medium is
+        blank and safe to overwrite.
+    """
+    info = _parse_mediainfo(_REAL_POW_BDR_MEDIAINFO)
+    assert info.session_count > 0, (
+        "a written BD-R parsed as blank; init() would overwrite the archive"
+    )
+
+
+def test_cd_media_is_refused_on_init(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        A CD profile must refuse init with a clear error naming the
+        reason, and must never invoke a burn program. ODDArchiver
+        appends sessions to write-once media, and two real CD-R burns
+        both closed the disc after session 000, leaving 0 writable
+        blocks.
+    """
+    def fake_popen(cmd, **kwargs):
+        raise AssertionError(f"no burn program may run for CD: {cmd}")
+
+    monkeypatch.setattr(
+        "oddarchiver.disc.subprocess.run",
+        lambda cmd, **kwargs: _mediainfo_completed(
+            returncode=1, stderr=_MEDIAINFO_CD_REFUSAL_STDERR),
+    )
+    monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
+    backend = DiscBackend("/dev/sr0")
+    with pytest.raises(RuntimeError, match="CD media is not supported"):
+        backend.init(_make_staging(tmp_path, "session_000"), "TEST", 0)
+
+
+def test_cd_media_is_refused_on_append(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        Append must refuse a CD for the same reason, and must not run
+        a burn program.
+    """
+    def fake_popen(cmd, **kwargs):
+        raise AssertionError(f"no burn program may run for CD: {cmd}")
+
+    monkeypatch.setattr(
+        "oddarchiver.disc.subprocess.run",
+        lambda cmd, **kwargs: _mediainfo_completed(
+            returncode=1, stderr=_MEDIAINFO_CD_REFUSAL_STDERR),
+    )
+    monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
+    backend = DiscBackend("/dev/sr0")
+    with pytest.raises(RuntimeError, match="CD media is not supported"):
+        backend.append(_make_staging(tmp_path, "session_001"), "TEST", 1)
+
+def test_bd_profile_keeps_growisofs_argv(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        A BD-R profile must keep the growisofs -Z argv byte for byte,
+        including -udf and -allow-limited-size. Regression guard for
+        the 4 GiB genisoimage fix.
+    """
+    captured = []
+
+    def fake_popen(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _FakePopen(["ok\n"], 0)
+
+    monkeypatch.setattr(
+        "oddarchiver.disc.subprocess.run",
+        lambda cmd, **kwargs: _mediainfo_completed(_MEDIAINFO_BLANK_BD),
+    )
+    monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
+    staging = _make_staging(tmp_path)
+    backend = DiscBackend(_FAKE_SR)
+    backend.init(staging, "TEST", 0)
+    assert captured[0] == [
+        "growisofs", "-Z", _FAKE_SR,
+        "-udf", "-allow-limited-size", "-R", "-T",
+        "-V", "TEST",
+        "-use-the-force-luke=notray",
+        str(staging),
+    ]
+
+
+def test_bd_append_keeps_growisofs_argv(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        growisofs -M for append must keep -udf and -allow-limited-size.
+        A plain ISO9660 build would reintroduce the 4 GiB genisoimage crash.
+    """
+    captured = []
+
+    def fake_popen(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _FakePopen(["ok\n"], 0)
+
+    _stub_disc_mediainfo(monkeypatch, session_count=1)
+    monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
+    staging = _make_staging(tmp_path, "session_001")
+    backend = DiscBackend(_FAKE_SR)
+    backend.append(staging, "TEST", 1)
+    assert captured[0] == [
+        "growisofs", "-M", _FAKE_SR,
+        "-udf", "-allow-limited-size", "-R", "-T",
+        "-V", "TEST",
+        "-use-the-force-luke=notray",
+        str(staging),
+    ]
+
+
+def _cli_burn_args(tmp_path: Path, command: str) -> argparse.Namespace:
+    """Build a dispatch namespace that selects DiscBackend on a fake device."""
+    source = tmp_path / "src"
+    source.mkdir(exist_ok=True)
+    (source / "a.txt").write_bytes(b"hello")
+    return argparse.Namespace(
+        command=command,
+        source=str(source),
+        dest=None,
+        device=_FAKE_SR,
+        test_iso=None,
+        label="TEST",
+        encrypt="none",
+        key=None,
+        dry_run=False,
+        no_cache=False,
+        disc_size="25gb",
+        prefill=None,
+        session=None,
+        force=False,
+        level="fast",
+        slow=False,
+        mirror=None,
+    )
+
+
+def _stub_cd_refusal(monkeypatch) -> list:
+    """Refuse CD via dvd+rw-mediainfo and fail if a burn program starts."""
+    popen_calls = []
+
+    def fake_popen(cmd, **kwargs):
+        popen_calls.append(list(cmd))
+        raise AssertionError(f"no burn program may run for CD: {cmd}")
+
+    monkeypatch.setattr(
+        "oddarchiver.disc.subprocess.run",
+        lambda cmd, **kwargs: _mediainfo_completed(
+            returncode=1, stderr=_MEDIAINFO_CD_REFUSAL_STDERR),
+    )
+    monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
+    return popen_calls
+
+
+def test_cli_init_refuses_cd(monkeypatch, tmp_path, capsys):
+    """
+    Input:  monkeypatch, tmp_path, capsys
+    Output: None
+    Details:
+        CLI init reaches a burn through DiscBackend.mediainfo. A CD
+        must exit 1 with the unsupported-media error and must not start
+        growisofs.
+    """
+    popen_calls = _stub_cd_refusal(monkeypatch)
+    rc = dispatch(_cli_burn_args(tmp_path, "init"))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "CD media is not supported" in err
+    assert popen_calls == []
+
+
+def test_cli_sync_refuses_cd(monkeypatch, tmp_path, capsys):
+    """
+    Input:  monkeypatch, tmp_path, capsys
+    Output: None
+    Details:
+        CLI sync also reads mediainfo before any append. A CD must exit
+        1 with the unsupported-media error and must not start growisofs.
+    """
+    popen_calls = _stub_cd_refusal(monkeypatch)
+    rc = dispatch(_cli_burn_args(tmp_path, "sync"))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "CD media is not supported" in err
+    assert popen_calls == []
+
+
+# Verbatim growisofs output captured from a real mid-burn USB unplug: a
+# Buffalo drive writing a 7 GiB session to M-DISC BD-R, cable pulled at 13%.
+_REAL_DISCONNECT_OUTPUT = [
+    " 13.34% done, estimate finish Sun Sep 20 19:52:14 2026",
+    ":-( unable to WRITE@LBA=82ac0h: Input/output error",
+    ":-( write failed: Input/output error",
+    "/dev/sr0: flushing cache",
+    ":-( unable to FLUSH CACHE: Input/output error",
+    ":-( unable to SYNCHRONOUS FLUSH CACHE: Input/output error",
+]
+
+
+def test_disconnect_needs_both_io_error_and_missing_device(tmp_path):
+    """
+    Input:  tmp_path - used to build a device path that exists
+    Output: None
+    Details:
+        The I/O-error phrases alone must not be read as a disconnect.
+        Failing media raises the same text while the drive stays on the
+        bus, and that case needs the SCSI-fault path instead. Only a
+        missing device node proves the drive left. Uses the real
+        captured output from a physical unplug.
+    """
+    present = tmp_path / "sr0"
+    present.write_bytes(b"")
+    assert _is_disconnect(_REAL_DISCONNECT_OUTPUT, str(present)) is False
+    assert _is_disconnect(_REAL_DISCONNECT_OUTPUT, str(tmp_path / "gone")) is True
+
+
+def test_disc_full_text_is_not_a_disconnect(tmp_path):
+    """
+    Input:  tmp_path - provides a path that does not exist
+    Output: None
+    Details:
+        A full disc must keep routing to the capacity error even when
+        the device node is absent, so the two diagnoses cannot swap.
+    """
+    full = [
+        "1234 blocks are free, 5678 to be written!",
+        ":-( write failed: No space left on device",
+    ]
+    assert _is_disconnect(full, str(tmp_path / "gone")) is False
+
+
+def test_append_disconnect_raises_diagnosed_error(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        A disconnect during append must not surface as a bare growisofs
+        exit code, which is what shipped before. The message must say
+        the drive disappeared, must NOT claim prior sessions were
+        checked (they cannot be, the drive is gone), must warn that the
+        device path can change on reconnect, and must steer away from
+        init and from growisofs's own -Z suggestion.
+    """
+    missing = str(tmp_path / "sr-gone")
+
+    monkeypatch.setattr(
+        "oddarchiver.disc.subprocess.run",
+        lambda cmd, **kwargs: _mediainfo_completed(_MEDIAINFO_BLANK_BD),
+    )
+    monkeypatch.setattr(
+        "oddarchiver.disc._run_growisofs",
+        lambda cmd, **kwargs: (5, _REAL_DISCONNECT_OUTPUT),
+    )
+
+    backend = DiscBackend(missing)
+    monkeypatch.setattr(backend, "_guard", lambda *a, **k: None)
+    with pytest.raises(RuntimeError) as exc:
+        backend.append(_make_staging(tmp_path, "session_002"), "TEST", 1)
+
+    msg = str(exc.value)
+    assert "disappeared" in msg
+    assert "could NOT be checked" in msg
+    assert "device path did not change" in msg
+    assert "verify --level fast" in msg
+    assert "exit code" not in msg
+
+
+def test_disconnect_never_claims_prior_sessions_verified(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        States the safety property on its own. Other failure paths call
+        _reverify_prior_sessions and report the result. A disconnect
+        cannot, because the device is gone, so the message must never
+        assert prior sessions are readable. Claiming verified data
+        without reading it is the failure this guards.
+    """
+    missing = str(tmp_path / "sr-gone")
+    called = []
+
+    monkeypatch.setattr(
+        "oddarchiver.disc.subprocess.run",
+        lambda cmd, **kwargs: _mediainfo_completed(_MEDIAINFO_BLANK_BD),
+    )
+    monkeypatch.setattr(
+        "oddarchiver.disc._run_growisofs",
+        lambda cmd, **kwargs: (5, _REAL_DISCONNECT_OUTPUT),
+    )
+    backend = DiscBackend(missing)
+    monkeypatch.setattr(backend, "_guard", lambda *a, **k: None)
+    monkeypatch.setattr(
+        backend, "_reverify_prior_sessions",
+        lambda n: called.append(n) or True,
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        backend.append(_make_staging(tmp_path, "session_002"), "TEST", 1)
+
+    assert called == [], "must not read the medium when the drive is gone"
+    assert "re-verified readable" not in str(exc.value)

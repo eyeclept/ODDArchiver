@@ -13,9 +13,11 @@ Description:
 import argparse
 import json
 
+from pathlib import Path
+
 from oddarchiver.cache import DEFAULT_CACHE_DIR
 from oddarchiver.cli import dispatch, _run_dry_run
-from oddarchiver.disc import ISOBackend
+from oddarchiver.disc import DiscInfo, ISOBackend
 
 # Globals
 SMALL_DISC = 50 * 2**20  # 50 MiB
@@ -165,6 +167,131 @@ def test_sync_dry_run_space_overage_no_exit1(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "OVERAGE" in out
+
+
+def test_dry_run_next_session_ignores_mmc_session_count(
+    tmp_path, capsys, monkeypatch,
+):
+    """
+    Input:  tmp_path, capsys, monkeypatch
+    Output: None
+    Details:
+        BD-R SRM+POW reports Number of Sessions 1 after many appends.
+        With archive sessions 000 and 001 on the medium, sync --dry-run
+        must announce session_002, matching the real burn path.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"version 1")
+    iso = tmp_path / "test.iso"
+    _init(source, iso)
+    (source / "a.txt").write_bytes(b"version 2 enough change for a new session")
+    assert dispatch(_make_args(
+        command="sync", dry_run=False, source=str(source), test_iso=str(iso),
+    )) == 0
+
+    class _PowLyingISO(ISOBackend):
+        def mediainfo(self):
+            info = super().mediainfo()
+            return DiscInfo(
+                session_count=1,
+                remaining_bytes=info.remaining_bytes,
+                used_bytes=info.used_bytes,
+                label=info.label,
+            )
+
+    monkeypatch.setattr(
+        "oddarchiver.cli._make_backend",
+        lambda args: _PowLyingISO(
+            Path(args.test_iso), disc_size=SMALL_DISC,
+        ),
+    )
+    (source / "a.txt").write_bytes(b"version 3 dry-run pending change")
+    capsys.readouterr()
+    rc = _run_dry_run(
+        _make_args(command="sync", source=str(source), test_iso=str(iso)),
+        is_init=False,
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Would burn as: session_002" in out
+    assert "Would burn as: session_001" not in out
+
+
+def test_dry_run_disc_state_line_ignores_mmc_session_count(
+    tmp_path, capsys, monkeypatch,
+):
+    """
+    Input:  tmp_path, capsys, monkeypatch
+    Output: None
+    Details:
+        BD-R SRM+POW pins mediainfo session_count at 1. With archive
+        sessions 000 and 001 on the medium, the disc-state line must not
+        print that MMC count as a session number.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"version 1")
+    iso = tmp_path / "test.iso"
+    _init(source, iso)
+    (source / "a.txt").write_bytes(b"version 2 enough change for a new session")
+    assert dispatch(_make_args(
+        command="sync", dry_run=False, source=str(source), test_iso=str(iso),
+    )) == 0
+
+    class _PowLyingISO(ISOBackend):
+        def mediainfo(self):
+            info = super().mediainfo()
+            return DiscInfo(
+                session_count=1,
+                remaining_bytes=info.remaining_bytes,
+                used_bytes=info.used_bytes,
+                label=info.label,
+            )
+
+    monkeypatch.setattr(
+        "oddarchiver.cli._make_backend",
+        lambda args: _PowLyingISO(
+            Path(args.test_iso), disc_size=SMALL_DISC,
+        ),
+    )
+    (source / "a.txt").write_bytes(b"version 3 dry-run pending change")
+    capsys.readouterr()
+    rc = _run_dry_run(
+        _make_args(command="sync", source=str(source), test_iso=str(iso)),
+        is_init=False,
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    state_line = [ln for ln in out.splitlines() if "Disc state:" in ln]
+    assert len(state_line) == 1
+    assert "session 1" not in state_line[0]
+    assert "next session 2" in state_line[0]
+
+
+def test_dry_run_init_disc_state_blank_disc(tmp_path, capsys, monkeypatch):
+    """
+    Input:  tmp_path, capsys, monkeypatch
+    Output: None
+    Details:
+        The is_init path has no marker and no manifests. The disc-state
+        line must still print, with next session 0, and must not raise
+        NameError or UnboundLocalError.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"first version")
+    iso = tmp_path / "test.iso"
+    capsys.readouterr()
+    rc = _run_dry_run(
+        _make_args(command="init", source=str(source), test_iso=str(iso)),
+        is_init=True,
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    state_line = [ln for ln in out.splitlines() if "Disc state:" in ln]
+    assert len(state_line) == 1
+    assert "next session 0" in state_line[0]
 
 
 if __name__ == "__main__":

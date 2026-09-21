@@ -17,6 +17,7 @@ import pytest
 from oddarchiver.manifest import (
     Manifest,
     ManifestEntry,
+    build_disc_origin,
     build_disc_state,
     read_manifest,
     write_manifest,
@@ -168,6 +169,62 @@ def test_build_disc_state_skips_suspect(tmp_path, caplog):
     assert any("SUSPECT" in r.message for r in caplog.records)
 
 
+def test_build_disc_origin_replays_sessions(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        build_disc_origin with three sessions must return the session that
+        last wrote each path. a.txt is rewritten in session 1, so its
+        recorded origin is 1, not 0; b.txt is untouched after session 0 and
+        keeps origin 0; c.txt is first written in session 2.
+    """
+    m0 = _make_manifest(0, entries=[
+        _make_entry("a.txt", "v1"),
+        _make_entry("b.txt", "bv1"),
+    ])
+    m1 = _make_manifest(1, entries=[_make_entry("a.txt", "v2")])
+    m2 = _make_manifest(2, entries=[_make_entry("c.txt", "cv1")])
+
+    origin = build_disc_origin([m0, m1, m2])
+    assert origin["a.txt"] == 1
+    assert origin["b.txt"] == 0
+    assert origin["c.txt"] == 2
+
+
+def test_build_disc_origin_applies_deleted(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        Paths listed in a manifest's deleted list must be absent from the
+        resulting origin map, same as build_disc_state().
+    """
+    m0 = _make_manifest(0, entries=[_make_entry("remove_me.txt", "x")])
+    m1 = _make_manifest(1, deleted=["remove_me.txt"])
+    origin = build_disc_origin([m0, m1])
+    assert "remove_me.txt" not in origin
+
+
+def test_build_disc_origin_skips_suspect(tmp_path, caplog):
+    """
+    Input:  tmp_path, caplog
+    Output: None
+    Details:
+        A manifest with suspect=True must be skipped, so its entries do not
+        overwrite an earlier path's recorded origin. A WARNING is logged.
+    """
+    m0 = _make_manifest(0, entries=[_make_entry("a.txt", "good")])
+    m1 = _make_manifest(1, entries=[_make_entry("a.txt", "bad")])
+    m1.suspect = True
+
+    with caplog.at_level(logging.WARNING):
+        origin = build_disc_origin([m0, m1])
+
+    assert origin["a.txt"] == 0
+    assert any("SUSPECT" in r.message for r in caplog.records)
+
+
 def test_write_manifest_is_atomic(tmp_path, monkeypatch):
     """
     Input:  tmp_path, monkeypatch
@@ -225,3 +282,129 @@ def test_read_manifest_appended_garbage_returns_suspect(tmp_path, caplog):
         m = read_manifest(manifest_path)
 
     assert m.suspect is True
+
+
+def test_read_manifest_missing_streamed_defaults_false(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        A hand-written manifest.json without the streamed key (simulating an
+        already-archived disc) parses with streamed=False on every entry.
+    """
+    from oddarchiver.manifest import _compute_checksum, manifest_checksum_ok
+
+    payload = {
+        "version": 1,
+        "session": 0,
+        "timestamp": _TIMESTAMP,
+        "source": "/src",
+        "label": "TEST",
+        "based_on_session": None,
+        "encryption": {"mode": "none"},
+        "entries": [
+            {
+                "path": "a.txt",
+                "type": "full",
+                "result_checksum": "abc123",
+                "full_size_bytes": 4,
+                "source_checksum": "",
+                "delta_file": "",
+                "delta_size_bytes": 0,
+                "file": "session_000/full/" + ("ab" * 32),
+                "encrypted_dek": "",
+            }
+        ],
+        "deleted": [],
+        "drives": [],
+        "manifest_checksum": "",
+    }
+    payload["manifest_checksum"] = _compute_checksum(
+        {**payload, "manifest_checksum": ""}
+    )
+    dest = tmp_path / "manifest.json"
+    dest.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = read_manifest(dest)
+    assert loaded.suspect is False
+    assert len(loaded.entries) == 1
+    assert loaded.entries[0].streamed is False
+    assert manifest_checksum_ok(loaded) is True
+
+
+
+def test_read_manifest_missing_volume_chunk_fields_defaults_none(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        A hand-written manifest.json without volume_chunk/volume_chunk_count
+        keys (simulating a disc archived before section 30) parses with both
+        fields None on every entry, and manifest_checksum_ok still reports
+        clean against that legacy payload.
+    """
+    from oddarchiver.manifest import _compute_checksum, manifest_checksum_ok
+
+    payload = {
+        "version": 1,
+        "session": 0,
+        "timestamp": _TIMESTAMP,
+        "source": "/src",
+        "label": "TEST",
+        "based_on_session": None,
+        "encryption": {"mode": "none"},
+        "entries": [
+            {
+                "path": "a.txt",
+                "type": "full",
+                "result_checksum": "abc123",
+                "full_size_bytes": 4,
+                "source_checksum": "",
+                "delta_file": "",
+                "delta_size_bytes": 0,
+                "file": "session_000/full/" + ("ab" * 32),
+                "encrypted_dek": "",
+            }
+        ],
+        "deleted": [],
+        "drives": [],
+        "manifest_checksum": "",
+    }
+    payload["manifest_checksum"] = _compute_checksum(
+        {**payload, "manifest_checksum": ""}
+    )
+    dest = tmp_path / "manifest.json"
+    dest.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = read_manifest(dest)
+    assert loaded.suspect is False
+    assert len(loaded.entries) == 1
+    assert loaded.entries[0].volume_chunk is None
+    assert loaded.entries[0].volume_chunk_count is None
+    assert manifest_checksum_ok(loaded) is True
+
+
+def test_volume_chunk_fields_round_trip(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        A ManifestEntry constructed with volume_chunk/volume_chunk_count set
+        must survive write_manifest/read_manifest unchanged.
+    """
+    entry = ManifestEntry(
+        path="big.iso",
+        type="full",
+        result_checksum="dead",
+        full_size_bytes=1234,
+        volume_chunk=2,
+        volume_chunk_count=5,
+    )
+    m = _make_manifest(entries=[entry])
+    write_manifest(tmp_path, m)
+    loaded = read_manifest(tmp_path / "manifest.json")
+
+    assert loaded.suspect is False
+    assert len(loaded.entries) == 1
+    assert loaded.entries[0].volume_chunk == 2
+    assert loaded.entries[0].volume_chunk_count == 5

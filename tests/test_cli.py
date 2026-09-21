@@ -13,10 +13,18 @@ from unittest.mock import patch
 
 import pytest
 
-from oddarchiver.cli import build_parser, dispatch, _make_init_crypto
+from oddarchiver.cli import build_parser, dispatch, _make_backend, _make_init_crypto
+from oddarchiver.disc import (
+    BDXL_DISC_BYTES,
+    BD_DL_DISC_BYTES,
+    CD_DISC_BYTES,
+    DVD_DL_DISC_BYTES,
+    DVD_SL_DISC_BYTES,
+    ISOBackend,
+)
 
 # Globals
-SUBCOMMANDS = ["init", "sync", "restore", "history", "verify", "status"]
+SUBCOMMANDS = ["init", "sync", "restore", "history", "verify", "status", "ls", "browse"]
 
 # Functions
 
@@ -75,6 +83,34 @@ def test_init_flags_in_namespace():
     assert args.prefill == "1gb"
 
 
+@pytest.mark.parametrize("preset,expected", [
+    ("cd", CD_DISC_BYTES),
+    ("dvd-sl", DVD_SL_DISC_BYTES),
+    ("dvd-dl", DVD_DL_DISC_BYTES),
+    ("bd-r", ISOBackend.DEFAULT_DISC_BYTES),
+    ("bd-dl", BD_DL_DISC_BYTES),
+    ("bdxl", BDXL_DISC_BYTES),
+])
+def test_make_backend_honors_disc_size_presets(preset, expected, tmp_path):
+    """
+    Input:  preset, expected, tmp_path
+    Output: None
+    Details:
+        --disc-size with each media preset name must parse and construct
+        an ISOBackend whose disc_size and empty remaining_bytes match
+        the preset.
+    """
+    parser = build_parser()
+    iso = tmp_path / "archive.iso"
+    args = parser.parse_args([
+        "init", "/src", "--test-iso", str(iso), "--disc-size", preset,
+    ])
+    backend = _make_backend(args)
+    assert isinstance(backend, ISOBackend)
+    assert backend.disc_size == expected
+    assert backend.mediainfo().remaining_bytes == expected
+
+
 def test_sync_flags_in_namespace():
     """
     Input:  None
@@ -111,6 +147,22 @@ def test_verify_level_flag():
     parser = build_parser()
     assert parser.parse_args(["verify", "--level", "checksum"]).level == "checksum"
     assert parser.parse_args(["verify"]).level == "fast"
+
+
+
+def test_read_mode_flag_defaults_and_choices():
+    """
+    Input:  None
+    Output: None
+    Details:
+        restore and verify expose --read-mode with default sequential.
+    """
+    parser = build_parser()
+    assert parser.parse_args(["restore", "/dest"]).read_mode == "sequential"
+    assert parser.parse_args(["verify"]).read_mode == "sequential"
+    assert parser.parse_args(
+        ["restore", "/dest", "--read-mode", "full-copy"]
+    ).read_mode == "full-copy"
 
 
 def test_unknown_flag_exits_nonzero():
@@ -167,3 +219,23 @@ def test_passphrase_confirm_mismatch_retries(tmp_path):
     assert mock_gp.call_count == 6
     from oddarchiver.crypto import PassphraseCrypto
     assert isinstance(crypto, PassphraseCrypto)
+
+
+def test_slow_flag_on_init_and_sync_only():
+    """
+    Input:  None
+    Output: None
+    Details:
+        --slow is accepted on init and sync and defaults to False.
+        Commands that do not burn reject the flag.
+    """
+    parser = build_parser()
+    assert parser.parse_args(["init", "/src"]).slow is False
+    assert parser.parse_args(["init", "/src", "--slow"]).slow is True
+    assert parser.parse_args(["sync", "/src"]).slow is False
+    assert parser.parse_args(["sync", "/src", "--slow"]).slow is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(["verify", "--slow"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["restore", "/dest", "--slow"])
+

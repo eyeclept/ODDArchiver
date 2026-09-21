@@ -37,3 +37,4 @@ def _isolated_staging_root(tmp_path, monkeypatch):
         restores both in the correct order on teardown.
     """
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "xdg_runtime"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))

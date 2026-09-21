@@ -1,6 +1,6 @@
 # ODDArchiver
 
-Incremental, delta-compressed backups to write-once optical media (BD-R, M-DISC) or ISO files.
+Incremental, delta-compressed backups to write-once optical media (DVD, BD-R, M-DISC) or ISO files.
 
 ## What it does
 
@@ -59,6 +59,8 @@ oddarchiver sync ~/Documents/ToArchive --device /dev/sr0
 | `history` | List every session: timestamp, files, size, encryption mode |
 | `verify` | Check integrity at `fast`, `checksum`, or `full` depth |
 | `status` | Show disc label, space used and remaining, capacity warnings, SUSPECT sessions |
+| `ls` | List archive contents from disc or ISO manifests |
+| `browse` | Interactively select archive paths and restore the set |
 
 All commands accept either `--device DEV` (physical drive, default `/dev/sr0`) or `--test-iso PATH` (local ISO file).
 
@@ -68,7 +70,7 @@ All commands accept either `--device DEV` (physical drive, default `/dev/sr0`) o
 oddarchiver init <source> [--device DEV] [--label LABEL]
                           [--encrypt {none,passphrase,keyfile}] [--key PATH]
                           [--test-iso PATH] [--disc-size SIZE] [--prefill SIZE]
-                          [--mirror DEV_OR_PATH] [--dry-run]
+                          [--mirror DEV_OR_PATH] [--dry-run] [--slow]
 ```
 
 `--encrypt` and `--key` apply only to `init`. The chosen mode is stored in the disc manifest and used automatically by every later command. Running `init` on a disc that already has session 0 exits 0 with a warning, and no second session is written.
@@ -78,10 +80,10 @@ oddarchiver init <source> [--device DEV] [--label LABEL]
 ```sh
 oddarchiver sync <source> [--device DEV] [--test-iso PATH]
                           [--disc-size SIZE] [--prefill SIZE]
-                          [--no-cache] [--mirror DEV_OR_PATH] [--dry-run]
+                          [--no-cache] [--mirror DEV_OR_PATH] [--dry-run] [--slow]
 ```
 
-Exits 0 with no output when nothing changed. `--no-cache` bypasses the local cache and reads every prior blob straight from disc.
+Exits 0 with no output when nothing changed. `--no-cache` bypasses the local cache and reads every prior blob straight from disc. `--slow` on `init` and `sync` checksums every blob after the burn. Default post-burn verify is `fast` and does not read blob bytes.
 
 ### `restore`
 
@@ -104,8 +106,8 @@ oddarchiver status  [--device DEV] [--test-iso PATH]
 
 | Level | Speed | Checks |
 |---|---|---|
-| `fast` | seconds | Manifest checksums and session ordering. Runs automatically after every burn. |
-| `checksum` | minutes | Reads and decrypts every stored blob, and compares its hash. Recommended monthly. |
+| `fast` | seconds | Manifest checksums and session ordering. Default after every burn. Does not read blob bytes. |
+| `checksum` | minutes | Reads and decrypts every stored blob, and compares its hash. `init --slow` and `sync --slow` use this after the burn. |
 | `full` | minutes to hours | Full restore to a temp directory, then a per-file hash check. Recommended before retiring a disc. |
 
 A failed session never invalidates the others. `verify` reports pass or fail per session and exits 1 if any session failed.
@@ -118,7 +120,28 @@ A failed session never invalidates the others. `verify` reports pass or fail per
 
 `--dry-run` (on `init` and `sync`) runs the full pipeline except the actual burn. It scans, diffs, computes deltas, checks disc space, and prints a report. It does not touch the disc, the ISO, or the cache. Combine `--dry-run` with `--test-iso` to preview a sync against an ISO without changing it.
 
-`--test-iso PATH` builds a real UDF ISO on the local filesystem with `genisoimage`, instead of writing to a drive. It supports the full command set, including `restore` and `verify`, and is the basis for the automated test suite. `--disc-size` sets the simulated capacity (default `25gb`). `--prefill` adds simulated used space, useful for testing capacity warnings without burning real data.
+`--test-iso PATH` builds a real Universal Disk Format (UDF) ISO on the local filesystem with `genisoimage`, instead of writing to a drive. It supports the full command set, including `restore` and `verify`. It is the basis for the automated test suite.
+
+`--disc-size` sets the simulated capacity (default `25gb`). Pass a raw byte count, a unit-suffixed size (`25gb`, `93GiB`), or a named media preset. Preset names match case-insensitively.
+
+| Preset | Nominal | Usable bytes | Write engine |
+|---|---|---|---|
+| `cd` | 700 MB | 737,280,000 | none; simulation only |
+| `dvd-sl` | 4.7 GB | 4,700,372,992 | growisofs plus genisoimage |
+| `dvd-dl` | 8.5 GB | 8,547,991,552 | growisofs plus genisoimage |
+| `bd-r` | 25 GB | 24,696,061,952 | growisofs plus genisoimage |
+| `bd-dl` | 50 GB | 49,392,123,904 | growisofs plus genisoimage |
+| `bdxl` | 100 GB | 99,857,989,632 | growisofs plus genisoimage |
+
+CD media is refused. A CD burn works, but a CD cannot be kept appendable, so an
+archive on one could never take a second session. The `cd` preset remains for
+`ISOBackend` simulation. See [docs/media.md](docs/media.md) for the evidence.
+
+Millennial Disc (M-DISC) uses the matching DVD or BD preset. ODDArchiver has no M-DISC flag. Writing M-DISC needs a drive that supports M-DISC.
+
+See [docs/media.md](docs/media.md) for M-DISC details and which media have real hardware on hand.
+
+`--prefill` adds simulated used space. Use it to test capacity warnings without burning real data.
 
 ## Encryption
 
@@ -207,4 +230,6 @@ It is the wrong tool for large or fast-changing data. That includes database ind
 ## More
 
 - [SETUP.md](SETUP.md): install, system dependencies, configuration file, environment variables
+- [docs/media.md](docs/media.md): media presets, write engines, M-DISC, hardware vs ISO tests
+- [docs/verify.md](docs/verify.md): verify levels and post-burn `--slow`
 - [STATE_OF_THE_PROGRAM.md](STATE_OF_THE_PROGRAM.md): what is done, what is left, known issues

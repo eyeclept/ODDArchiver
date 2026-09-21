@@ -175,15 +175,18 @@ def test_stale_staging_dir_removed_and_rebuilt(tmp_path):
     cache = MagicMock()
     cache.get_with_fallback.return_value = b""
 
-    staging = build_staging(
+    chunks = build_staging(
         session_n=0,
         source=source,
         disc_state={},
+        disc_origin={},
         backend=backend,
         cache=cache,
         crypto=NullCrypto(),
         _staging_root=staging_root,
     )
+    assert len(chunks) == 1, "single-medium changeset must not split"
+    staging, _, _ = chunks[0]
     try:
         assert not sentinel.exists(), "stale sentinel must be removed"
         assert (staging / "session_000" / "manifest.json").exists()

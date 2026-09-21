@@ -5,7 +5,11 @@ Email:  eyeclept@pm.me
 
 Description:
     Local cache for encrypted blobs that mirror disc content.
-    Cache is a performance optimization only. Correctness never depends on it.
+    The cache is a performance optimization only. Correctness never
+    depends on it. Cold-cache misses (TODO 23f) group by origin
+    session. The code extracts each session's missing blobs in one
+    read_paths() call. It uses an already-loaded Manifest list when
+    the caller has one.
 """
 # Imports
 from __future__ import annotations
@@ -20,6 +24,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from oddarchiver.crypto import CryptoBackend
     from oddarchiver.disc import BurnBackend
+    from oddarchiver.manifest import Manifest
 
 # Globals
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "oddarchiver"
@@ -54,12 +59,16 @@ def _load_manifest(cache_dir: Path) -> dict:
     Input:  cache_dir - cache root
     Output: dict of cache manifest entries, empty if missing or corrupt
     Details:
-        Returns an empty dict when the file is missing or JSON is invalid.
+        Returns an empty dict when the file is missing or the JSON is
+        invalid.
     """
     mp = _manifest_path(cache_dir)
     try:
         return json.loads(mp.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        _log.warning("cache manifest %s is not valid JSON; treating as empty", mp)
         return {}
 
 
@@ -69,7 +78,8 @@ def _save_manifest(cache_dir: Path, manifest: dict) -> None:
             manifest  - dict to persist
     Output: None
     Details:
-        Writes via a .tmp file then os.replace so the replace is atomic.
+        Writes through a .tmp file and then calls os.replace, so the
+        replace is atomic.
     """
     mp = _manifest_path(cache_dir)
     mp.parent.mkdir(parents=True, exist_ok=True)
@@ -78,26 +88,38 @@ def _save_manifest(cache_dir: Path, manifest: dict) -> None:
     os.replace(tmp, mp)
 
 
-def _read_blob_from_disc(
-    path: str,
+def _blob_rel_for_path(manifest: "Manifest", path: str) -> str | None:
+    """
+    Input:  manifest - already-loaded session Manifest
+            path     - relative source path to find
+    Output: disc-relative blob path (entry.file or entry.delta_file), or None
+    Details:
+        The code scans manifest.entries one time. A missing path gives
+        None, not an error. The caller decides whether to raise.
+    """
+    for entry in manifest.entries:
+        if entry.path != path:
+            continue
+        blob_rel = entry.file if entry.type == "full" else entry.delta_file
+        return blob_rel or None
+    return None
+
+
+def _load_session_manifest_from_disc(
     session: int,
     backend: "BurnBackend",
     crypto: "CryptoBackend | None",
-) -> bytes:
+) -> "Manifest":
     """
-    Input:  path    - relative file path to resolve
-            session - session the entry belongs to
-            backend - BurnBackend to read the manifest and blob from
+    Input:  session - session index whose manifest to load
+            backend - BurnBackend to read from
             crypto  - CryptoBackend for an encrypted manifest (None = plaintext)
-    Output: raw blob bytes exactly as stored on disc for that entry
+    Output: Manifest for that session
     Details:
-        Reads session's manifest (manifest.enc preferred, manifest.json
-        fallback) into a temp file so read_manifest() can operate on a real
-        path, same convention as verify._read_all_manifests and
-        restore._read_manifests. Finds the entry for path and reads its
-        actual blob: entry.file for a "full" entry, entry.delta_file for a
-        "delta" entry. The blob is named by content hash, never by path.
-        Raises RuntimeError if the manifest or the entry cannot be found.
+        Tries manifest.enc, then manifest.json, through read_path.
+        This matches the single-file fallback that existing callers
+        (and tests) already mock. Raises RuntimeError when neither
+        file is present.
     """
     from oddarchiver.manifest import read_manifest
 
@@ -111,27 +133,67 @@ def _read_blob_from_disc(
             data = backend.read_path(disc_path)
             suffix = Path(disc_path).suffix
             break
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            _log.warning("cache fallback: %s not present", disc_path)
+            continue
+        except (OSError, ValueError) as exc:
+            _log.warning("cache fallback: %s: %s", disc_path, exc)
             continue
     if data is None:
         raise RuntimeError(
-            f"Cannot read session {session} manifest to resolve cache miss for {path!r}"
+            f"Cannot read session {session} manifest to resolve cache miss"
         )
 
     with tempfile.TemporaryDirectory(prefix="oddarchiver_cache_fallback_") as tmp:
         tmp_file = Path(tmp) / f"manifest_{session:03d}{suffix}"
         tmp_file.write_bytes(data)
-        manifest = read_manifest(tmp_file, crypto=crypto)
+        return read_manifest(tmp_file, crypto=crypto)
 
-    for entry in manifest.entries:
-        if entry.path != path:
-            continue
-        blob_rel = entry.file if entry.type == "full" else entry.delta_file
-        if not blob_rel:
-            break
+
+def _read_blob_from_disc(
+    path: str,
+    session: int,
+    backend: "BurnBackend",
+    crypto: "CryptoBackend | None",
+    manifest: "Manifest | None" = None,
+) -> bytes:
+    """
+    Input:  path     - relative file path to resolve
+            session  - session that the entry belongs to
+            backend  - BurnBackend to read the blob (and maybe the manifest) from
+            crypto   - CryptoBackend for an encrypted manifest (None = plaintext)
+            manifest - optional already-loaded Manifest for this session;
+                       skips a disc re-extract when provided
+    Output: raw blob bytes exactly as stored on disc for that entry
+    Details:
+        Finds the entry for path and reads its actual blob. It reads
+        entry.file for a "full" entry and entry.delta_file for a
+        "delta" entry. The blob name is a content hash, never a path.
+        Raises RuntimeError when the manifest or the entry cannot be
+        found.
+    """
+    if manifest is None:
+        try:
+            manifest = _load_session_manifest_from_disc(session, backend, crypto)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Cannot read session {session} manifest to resolve cache miss "
+                f"for {path!r}"
+            ) from exc
+
+    blob_rel = _blob_rel_for_path(manifest, path)
+    if not blob_rel:
+        raise RuntimeError(f"No entry for {path!r} in session {session} manifest")
+    try:
         return backend.read_path(blob_rel)
-
-    raise RuntimeError(f"No entry for {path!r} in session {session} manifest")
+    except (OSError, ValueError):
+        _log.exception(
+            "Failed to read blob %r for %r (session %d)",
+            blob_rel, path, session,
+        )
+        raise RuntimeError(
+            f"No entry for {path!r} in session {session} manifest"
+        ) from None
 
 
 class CacheManager:
@@ -139,8 +201,10 @@ class CacheManager:
     Input:  cache_dir - root directory for the cache (default ~/.cache/oddarchiver)
     Output: N/A (class)
     Details:
-        Blobs are keyed by (session, path). get() treats a missing or partial
-        blob as a miss. get_with_fallback() reads from the backend on a miss.
+        Blobs are keyed by (session, path). get() treats a missing or
+        partial blob as a miss. get_with_fallback() reads from the
+        backend on a miss. prefetch_origin_blobs() batch-fills misses,
+        grouped by origin session.
     """
 
     def __init__(self, cache_dir: Path = DEFAULT_CACHE_DIR) -> None:
@@ -152,7 +216,8 @@ class CacheManager:
                 session - session number the blob belongs to
         Output: encrypted blob bytes, or None on miss
         Details:
-            Logs WARNING on miss. Treats a partially written blob as a miss.
+            Logs WARNING on a miss. Treats a partially written blob as
+            a miss.
         """
         bp = _blob_path(self.cache_dir, path, session)
         manifest = _load_manifest(self.cache_dir)
@@ -168,7 +233,7 @@ class CacheManager:
             _log.warning("cache miss: %s session %d (blob file missing)", path, session)
             return None
 
-        # Treat a partial write as a miss by checking expected size.
+        # Treat a partial write as a miss. Check the expected size.
         expected = manifest[key]["size"]
         if len(data) != expected:
             _log.warning(
@@ -205,30 +270,112 @@ class CacheManager:
         session: int,
         backend: "BurnBackend",
         crypto: "CryptoBackend | None" = None,
+        manifests: "list[Manifest] | None" = None,
     ) -> bytes:
         """
-        Input:  path    - relative file path
-                session - session number
-                backend - BurnBackend for disc read on cache miss
-                crypto  - CryptoBackend to decrypt an encrypted manifest
-                          (None for a plaintext manifest)
+        Input:  path      - relative file path
+                session   - session number
+                backend   - BurnBackend for disc read on cache miss
+                crypto    - CryptoBackend to decrypt an encrypted manifest
+                            (None for a plaintext manifest)
+                manifests - optional already-loaded Manifest list (23b/23f);
+                            used to resolve the blob path without re-extracting
         Output: encrypted blob bytes, exactly as stored on disc for that entry
         Details:
-            Returns the cached blob if present. On a miss, reads session's
-            manifest to find the real entry for path, then reads that entry's
-            actual blob (entry.file for "full", entry.delta_file for "delta")
-            from the backend. Blobs are named by content hash under full/ or
-            deltas/, never by the plaintext path, so the path cannot be
-            guessed. Raises RuntimeError if the manifest or the entry for
-            path cannot be found.
+            Returns the cached blob when present. On a miss, the code
+            resolves the real entry for path. It uses the in-memory
+            manifest when one is provided. Otherwise it reads that
+            session's manifest one time. Then it reads that entry's
+            actual blob (entry.file for "full", entry.delta_file for
+            "delta") from the backend. Blobs are named by content hash
+            under full/ or deltas/, never by the plaintext path. A
+            caller cannot guess the path. Raises RuntimeError when the
+            manifest or the entry for path cannot be found.
         """
         cached = self.get(path, session)
         if cached is not None:
             return cached
 
-        blob = _read_blob_from_disc(path, session, backend, crypto)
+        manifest = None
+        if manifests:
+            for item in manifests:
+                if item.session == session:
+                    manifest = item
+                    break
+        blob = _read_blob_from_disc(path, session, backend, crypto, manifest=manifest)
         self.put(path, session, blob)
         return blob
+
+    def prefetch_origin_blobs(
+        self,
+        needed: list[tuple[str, int]],
+        backend: "BurnBackend",
+        manifests: "list[Manifest] | None" = None,
+        crypto: "CryptoBackend | None" = None,
+    ) -> None:
+        """
+        Input:  needed    - (path, origin_session) pairs to ensure are cached
+                backend   - BurnBackend for batched blob reads
+                manifests - optional already-loaded Manifest list; origin
+                            sessions present here are not re-extracted
+                crypto    - CryptoBackend for a session whose manifest is
+                            not in manifests and must be loaded from disc
+        Output: None (cache populated for every resolvable miss)
+        Details:
+            Groups cache misses by origin session, in ascending order.
+            It pulls each origin session's missing blobs in one
+            backend.read_paths() call. An origin session already in
+            manifests is not re-read from disc. The code loads any
+            other origin session one time and reuses it for every miss
+            that points at it. A path with no matching entry stays
+            uncached. A later get_with_fallback then raises the same
+            RuntimeError it always has.
+        """
+        by_session: dict[int, list[str]] = {}
+        for path, session in needed:
+            if self.get(path, session) is not None:
+                continue
+            by_session.setdefault(session, []).append(path)
+        if not by_session:
+            return
+
+        loaded: dict[int, Manifest] = {}
+        if manifests:
+            for item in manifests:
+                loaded[item.session] = item
+
+        for session in sorted(by_session):
+            paths = by_session[session]
+            manifest = loaded.get(session)
+            if manifest is None:
+                try:
+                    manifest = _load_session_manifest_from_disc(
+                        session, backend, crypto,
+                    )
+                except RuntimeError:
+                    _log.exception(
+                        "prefetch: cannot load origin session %d manifest",
+                        session,
+                    )
+                    continue
+                loaded[session] = manifest
+            path_to_blob: dict[str, str] = {}
+            for path in paths:
+                blob_rel = _blob_rel_for_path(manifest, path)
+                if blob_rel:
+                    path_to_blob[path] = blob_rel
+            if not path_to_blob:
+                continue
+            raw = backend.read_paths(list(path_to_blob.values()))
+            for path, blob_rel in path_to_blob.items():
+                data = raw.get(blob_rel)
+                if data is None:
+                    _log.warning(
+                        "prefetch: blob %r for %r (session %d) missing on disc",
+                        blob_rel, path, session,
+                    )
+                    continue
+                self.put(path, session, data)
 
 
 if __name__ == "__main__":

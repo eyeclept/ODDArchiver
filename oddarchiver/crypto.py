@@ -6,25 +6,47 @@ Email:  eyeclept@pm.me
 Description:
     Encryption layer. Three modes share one interface: NullCrypto (mode 0),
     PassphraseCrypto (Argon2id + ChaCha20-Poly1305), and KeyfileCrypto
-    (ChaCha20-Poly1305 DEK wrapping). All operations work on bytes in memory.
+    (ChaCha20-Poly1305 DEK wrapping). Small blobs use encrypt()/decrypt()
+    on bytes. Files above STREAM_CHUNK_SIZE use encrypt_file()/decrypt_file()
+    so plaintext and ciphertext are never fully materialized. Rescue-key
+    wrapping uses scrypt + ChaCha20-Poly1305 so a lost passphrase or
+    keyfile can be recovered without a second AEAD scheme.
 """
 # Imports
 from __future__ import annotations
 
 import abc
+import base64
+import logging
 import os
 import secrets
+import shutil
+from pathlib import Path
 
 from argon2.low_level import Type, hash_secret_raw
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 # Globals
 PASSPHRASE_ENV = "ODDARCHIVER_PASSPHRASE"
+STREAM_CHUNK_SIZE = 256 * 2**20  # 256 MiB; AEAD chunk size and large-file threshold
+
+logger = logging.getLogger(__name__)
 
 _SALT_LEN = 16
 _NONCE_LEN = 12
 _KEY_LEN = 32
 _DEK_CIPHERTEXT_LEN = _KEY_LEN + 16  # ChaCha20-Poly1305 tag is 16 bytes
+_TAG_LEN = 16  # ChaCha20-Poly1305 authentication tag
+
+# scrypt cost for rescue-key wrapping. Runs once per init/restore, not per blob.
+# n=2**14 (16 MiB memory with r=8) is enough: the rescue code is 256 bits of
+# independent entropy, so KDF cost is not what stops a brute-force search.
+_SCRYPT_N = 2**14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_RESCUE_GROUP = 4
+_RESCUE_AAD = b"oddarchiver-rescue-v1"
 
 
 # Functions
@@ -51,6 +73,40 @@ class CryptoBackend(abc.ABC):
             Raises ValueError on authentication failure or malformed input.
         """
 
+    @abc.abstractmethod
+    def encrypt_file(
+        self, src: Path, dest: Path, offset: int = 0, length: int | None = None
+    ) -> None:
+        """
+        Input:  src    - plaintext file
+                dest   - ciphertext destination path
+                offset - byte offset into src to start encrypting from
+                         (default 0)
+                length - number of bytes to encrypt starting at offset, or
+                         None to encrypt through end-of-file (default None)
+        Output: None (writes dest)
+        Details:
+            Streaming counterpart of encrypt(). A dedicated wire format,
+            not the same as encrypt(bytes). Never materializes the whole
+            file in memory. When offset/length select a byte range, dest
+            is a complete, independently self-decryptable streamed blob
+            for just that range. decrypt_file() needs no knowledge of
+            the range or the source file's total size. Omitting
+            offset/length (or passing length=None) is identical to
+            encrypting the whole file.
+        """
+
+    @abc.abstractmethod
+    def decrypt_file(self, src: Path, dest: Path) -> None:
+        """
+        Input:  src  - ciphertext file produced by encrypt_file()
+                dest - plaintext destination path
+        Output: None (writes dest)
+        Details:
+            Streaming counterpart of decrypt(). Raises ValueError on
+            authentication failure or malformed input.
+        """
+
 
 class NullCrypto(CryptoBackend):
     """
@@ -65,6 +121,40 @@ class NullCrypto(CryptoBackend):
 
     def decrypt(self, ciphertext: bytes) -> bytes:
         return ciphertext
+
+    def encrypt_file(
+        self, src: Path, dest: Path, offset: int = 0, length: int | None = None
+    ) -> None:
+        """
+        Input:  src, dest, offset, length - see CryptoBackend.encrypt_file
+        Output: None
+        Details:
+            Identity crypto: the "streamed format" for a range is just that
+            raw byte range. Whole-file copy path is unchanged when
+            offset/length are omitted.
+        """
+        if offset == 0 and length is None:
+            shutil.copy2(src, dest)
+            return
+        with src.open("rb") as inf, dest.open("wb") as outf:
+            if offset:
+                inf.seek(offset)
+            remaining = length
+            while remaining is None or remaining > 0:
+                read_size = (
+                    STREAM_CHUNK_SIZE
+                    if remaining is None
+                    else min(STREAM_CHUNK_SIZE, remaining)
+                )
+                chunk = inf.read(read_size)
+                if not chunk:
+                    break
+                outf.write(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+
+    def decrypt_file(self, src: Path, dest: Path) -> None:
+        shutil.copy2(src, dest)
 
 
 class PassphraseCrypto(CryptoBackend):
@@ -124,6 +214,38 @@ class PassphraseCrypto(CryptoBackend):
         except Exception as exc:
             raise ValueError("Decryption failed: authentication error.") from exc
 
+    def encrypt_file(
+        self, src: Path, dest: Path, offset: int = 0, length: int | None = None
+    ) -> None:
+        """
+        Input:  src, dest, offset, length - see CryptoBackend.encrypt_file
+        Output: None
+        Details:
+            Wire format: salt(16) + repeated[nonce(12) + ciphertext_chunk].
+            One Argon2id derivation for the whole file (or for the selected
+            range); fresh nonce per chunk. A range produces its own salt, so
+            the resulting blob is fully self-decryptable.
+        """
+        salt = secrets.token_bytes(_SALT_LEN)
+        key = self._derive_key(salt)
+        _encrypt_chunks(key, src, dest, header=salt, offset=offset, length=length)
+
+    def decrypt_file(self, src: Path, dest: Path) -> None:
+        """
+        Input:  src  - ciphertext file from encrypt_file()
+                dest - plaintext destination
+        Output: None
+        Details:
+            Reads salt, derives the key once, then decrypts each chunk
+            and writes plaintext immediately.
+        """
+        with src.open("rb") as inf, dest.open("wb") as outf:
+            salt = inf.read(_SALT_LEN)
+            if len(salt) != _SALT_LEN:
+                raise ValueError("Ciphertext too short.")
+            key = self._derive_key(salt)
+            _decrypt_chunks(key, inf, outf)
+
 
 class KeyfileCrypto(CryptoBackend):
     """
@@ -145,6 +267,24 @@ class KeyfileCrypto(CryptoBackend):
             raise ValueError(
                 f"Keyfile must contain exactly {_KEY_LEN} bytes; got {len(self._kek)}."
             )
+
+    @classmethod
+    def from_kek(cls, kek: bytes) -> "KeyfileCrypto":
+        """
+        Input:  kek - 32 raw key-encryption-key bytes
+        Output: KeyfileCrypto keyed by kek
+        Details:
+            Used by the rescue-key unwrap path. Does not read a keyfile.
+            The public constructor still takes a file path.
+        """
+        if len(kek) != _KEY_LEN:
+            raise ValueError(
+                f"Keyfile must contain exactly {_KEY_LEN} bytes; got {len(kek)}."
+            )
+        inst = object.__new__(cls)
+        inst.keyfile_path = ""
+        inst._kek = bytes(kek)
+        return inst
 
     def encrypt(self, plaintext: bytes) -> bytes:
         dek = secrets.token_bytes(_KEY_LEN)
@@ -168,6 +308,134 @@ class KeyfileCrypto(CryptoBackend):
         except Exception as exc:
             raise ValueError("Decryption failed: authentication error.") from exc
 
+    def encrypt_file(
+        self, src: Path, dest: Path, offset: int = 0, length: int | None = None
+    ) -> None:
+        """
+        Input:  src, dest, offset, length - see CryptoBackend.encrypt_file
+        Output: None
+        Details:
+            Wire format: kek_nonce(12) + enc_dek(48) +
+            repeated[nonce(12) + ciphertext_chunk]. One fresh DEK per call,
+            so a range gets its own wrapped DEK and is fully
+            self-decryptable independent of any other range from the
+            same source file.
+        """
+        dek = secrets.token_bytes(_KEY_LEN)
+        kek_nonce = secrets.token_bytes(_NONCE_LEN)
+        enc_dek = ChaCha20Poly1305(self._kek).encrypt(kek_nonce, dek, None)
+        _encrypt_chunks(
+            dek, src, dest, header=kek_nonce + enc_dek, offset=offset, length=length
+        )
+
+    def decrypt_file(self, src: Path, dest: Path) -> None:
+        """
+        Input:  src  - ciphertext file from encrypt_file()
+                dest - plaintext destination
+        Output: None
+        Details:
+            Unwraps the DEK from the 12+48 byte header, then decrypts
+            each chunk with that DEK.
+        """
+        header_len = _NONCE_LEN + _DEK_CIPHERTEXT_LEN
+        with src.open("rb") as inf, dest.open("wb") as outf:
+            header = inf.read(header_len)
+            if len(header) != header_len:
+                raise ValueError("Ciphertext too short.")
+            kek_nonce = header[:_NONCE_LEN]
+            enc_dek = header[_NONCE_LEN:]
+            try:
+                dek = ChaCha20Poly1305(self._kek).decrypt(kek_nonce, enc_dek, None)
+            except Exception as exc:
+                logger.exception("DEK unwrap failed")
+                raise ValueError("Decryption failed: authentication error.") from exc
+            _decrypt_chunks(dek, inf, outf)
+
+
+def _encrypt_chunks(
+    key: bytes,
+    src: Path,
+    dest: Path,
+    header: bytes,
+    offset: int = 0,
+    length: int | None = None,
+) -> None:
+    """
+    Input:  key    - 32-byte ChaCha20-Poly1305 key
+            src    - plaintext file
+            dest   - ciphertext destination
+            header - bytes written before the first chunk
+            offset - byte offset into src to start reading from (default 0)
+            length - number of bytes to encrypt starting at offset, or None
+                     to encrypt through end-of-file (default None)
+    Output: None
+    Details:
+        Writes header, then nonce+ciphertext for each STREAM_CHUNK_SIZE
+        plaintext sub-chunk drawn from src[offset:offset+length]. A
+        zero-byte range (source or explicit length=0) writes header plus
+        one empty plaintext chunk so the file is well-formed and
+        round-trips. A range that is an exact multiple of
+        STREAM_CHUNK_SIZE produces no trailing empty chunk. offset=0,
+        length=None reproduces the original whole-file behavior exactly.
+    """
+    aead = ChaCha20Poly1305(key)
+    with src.open("rb") as inf, dest.open("wb") as outf:
+        if offset:
+            inf.seek(offset)
+        outf.write(header)
+        first = True
+        remaining = length
+        while True:
+            if remaining is not None and remaining <= 0:
+                chunk = b""
+            else:
+                read_size = (
+                    STREAM_CHUNK_SIZE
+                    if remaining is None
+                    else min(STREAM_CHUNK_SIZE, remaining)
+                )
+                chunk = inf.read(read_size)
+            if not chunk:
+                if first:
+                    nonce = secrets.token_bytes(_NONCE_LEN)
+                    outf.write(nonce + aead.encrypt(nonce, b"", None))
+                break
+            first = False
+            nonce = secrets.token_bytes(_NONCE_LEN)
+            outf.write(nonce + aead.encrypt(nonce, chunk, None))
+            if remaining is not None:
+                remaining -= len(chunk)
+
+
+def _decrypt_chunks(key: bytes, inf, outf) -> None:
+    """
+    Input:  key  - 32-byte ChaCha20-Poly1305 key
+            inf  - binary file positioned after the streaming header
+            outf - binary file for plaintext
+    Output: None
+    Details:
+        Loop: read 12-byte nonce (empty means EOF); read up to
+        STREAM_CHUNK_SIZE+tag ciphertext; decrypt; write plaintext.
+        Auth failure becomes ValueError, matching decrypt().
+    """
+    aead = ChaCha20Poly1305(key)
+    ct_max = STREAM_CHUNK_SIZE + _TAG_LEN
+    while True:
+        nonce = inf.read(_NONCE_LEN)
+        if not nonce:
+            return
+        if len(nonce) != _NONCE_LEN:
+            raise ValueError("Ciphertext too short.")
+        ciphertext = inf.read(ct_max)
+        if not ciphertext:
+            raise ValueError("Ciphertext too short.")
+        try:
+            plaintext = aead.decrypt(nonce, ciphertext, None)
+        except Exception as exc:
+            logger.exception("Chunk decrypt failed")
+            raise ValueError("Decryption failed: authentication error.") from exc
+        outf.write(plaintext)
+
 
 def generate_keyfile(path: str) -> None:
     """
@@ -178,6 +446,110 @@ def generate_keyfile(path: str) -> None:
     """
     with open(path, "wb") as fh:
         fh.write(secrets.token_bytes(_KEY_LEN))
+
+
+def generate_rescue_code() -> tuple[str, bytes]:
+    """
+    Input:  None
+    Output: (printable code, raw 32-byte secret)
+    Details:
+        RFC 4648 base32, no padding, uppercase, grouped in 4-character
+        chunks with hyphens. 32 bytes become 52 characters, 13 groups.
+    """
+    raw = secrets.token_bytes(_KEY_LEN)
+    encoded = base64.b32encode(raw).decode("ascii").rstrip("=")
+    grouped = "-".join(
+        encoded[i:i + _RESCUE_GROUP]
+        for i in range(0, len(encoded), _RESCUE_GROUP)
+    )
+    return grouped, raw
+
+
+def parse_rescue_code(code: str) -> bytes:
+    """
+    Input:  code - printable rescue code (hyphens and case optional)
+    Output: 32 raw bytes
+    Details:
+        Invalid encoding raises ValueError with the same authentication
+        error text as a wrong passphrase, so a typo is not a distinct path.
+    """
+    compact = "".join(ch for ch in code.upper() if ch.isalnum())
+    pad_len = (8 - len(compact) % 8) % 8
+    try:
+        raw = base64.b32decode(compact + ("=" * pad_len), casefold=True)
+    except Exception as exc:
+        logger.exception("Rescue code decode failed")
+        raise ValueError("Decryption failed: authentication error.") from exc
+    if len(raw) != _KEY_LEN:
+        raise ValueError("Decryption failed: authentication error.")
+    return raw
+
+
+def wrap_rescue_secret(rescue_raw: bytes, secret: bytes) -> dict:
+    """
+    Input:  rescue_raw - 32-byte rescue code
+            secret     - passphrase bytes or keyfile KEK to escrow
+    Output: dict with base64 wrapped blob, salt, and scrypt cost parameters
+    Details:
+        Derives a ChaCha20-Poly1305 key via scrypt (n=2**14, r=8, p=1)
+        from the rescue code. The wrapped blob is nonce || ciphertext.
+    """
+    salt = secrets.token_bytes(_SALT_LEN)
+    kdf = Scrypt(salt=salt, length=_KEY_LEN, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P)
+    key = kdf.derive(rescue_raw)
+    nonce = secrets.token_bytes(_NONCE_LEN)
+    wrapped = ChaCha20Poly1305(key).encrypt(nonce, secret, _RESCUE_AAD)
+    return {
+        "wrapped": base64.b64encode(nonce + wrapped).decode("ascii"),
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "n": _SCRYPT_N,
+        "r": _SCRYPT_R,
+        "p": _SCRYPT_P,
+    }
+
+
+def unwrap_rescue_secret(rescue_code: str, rescue_block: dict) -> bytes:
+    """
+    Input:  rescue_code  - printable rescue code
+            rescue_block - dict stored in enc_mode.json under "rescue"
+    Output: original passphrase bytes or keyfile KEK
+    Details:
+        Wrong code or a malformed blob raises ValueError with the same
+        authentication error text as PassphraseCrypto.decrypt.
+    """
+    rescue_raw = parse_rescue_code(rescue_code)
+    try:
+        wrapped_b64 = rescue_block["wrapped"]
+        salt_b64 = rescue_block["salt"]
+        n = int(rescue_block["n"])
+        r = int(rescue_block["r"])
+        p = int(rescue_block["p"])
+        blob = base64.b64decode(wrapped_b64)
+        salt = base64.b64decode(salt_b64)
+    except Exception as exc:
+        logger.exception("Malformed rescue block")
+        raise ValueError("Decryption failed: authentication error.") from exc
+    if (
+        n < 2
+        or (n & (n - 1)) != 0
+        or n > 2**20
+        or r < 1
+        or r > 16
+        or p < 1
+        or p > 16
+        or len(blob) < _NONCE_LEN
+        or len(salt) != _SALT_LEN
+    ):
+        raise ValueError("Decryption failed: authentication error.")
+    kdf = Scrypt(salt=salt, length=_KEY_LEN, n=n, r=r, p=p)
+    key = kdf.derive(rescue_raw)
+    nonce = blob[:_NONCE_LEN]
+    body = blob[_NONCE_LEN:]
+    try:
+        return ChaCha20Poly1305(key).decrypt(nonce, body, _RESCUE_AAD)
+    except Exception as exc:
+        logger.exception("Rescue-key unwrap failed")
+        raise ValueError("Decryption failed: authentication error.") from exc
 
 
 def make_crypto(mode: str, **kwargs: object) -> CryptoBackend:

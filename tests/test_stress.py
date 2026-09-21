@@ -225,15 +225,18 @@ def test_5_1_interrupted_sync_recovery(tmp_path):
     cache = MagicMock()
     cache.get_with_fallback.return_value = b""
 
-    staging = build_staging(
+    chunks = build_staging(
         session_n=1,
         source=source,
         disc_state={},
+        disc_origin={},
         backend=backend,
         cache=cache,
         crypto=NullCrypto(),
         _staging_root=staging_root,
     )
+    assert len(chunks) == 1, "single-medium changeset must not split"
+    staging, _, _ = chunks[0]
     try:
         assert not sentinel.exists(), "stale sentinel must be removed by build_staging"
         assert (staging / "session_001" / "manifest.json").exists()
@@ -284,6 +287,7 @@ def test_5_2_staging_dir_cleanup_on_sigint(tmp_path):
                 session_n=0,
                 source=source,
                 disc_state={},
+                disc_origin={},
                 backend=backend,
                 cache=cache,
                 crypto=NullCrypto(),
@@ -316,15 +320,18 @@ def test_6_1_wrong_passphrase_restore_raises(tmp_path):
     wrong_crypto = PassphraseCrypto("wrong")
 
     cache = CacheManager(tmp_path / "cache")
-    staging = build_staging(
+    chunks = build_staging(
         session_n=0,
         source=source,
         disc_state={},
+        disc_origin={},
         backend=backend,
         cache=cache,
         crypto=correct_crypto,
         _staging_root=tmp_path / "staging",
     )
+    assert len(chunks) == 1, "single-medium changeset must not split"
+    staging, _, _ = chunks[0]
     try:
         from oddarchiver.cli import _patch_manifest, _encryption_block
         _patch_manifest(staging, 0, "STRESS", _encryption_block(correct_crypto))
@@ -357,15 +364,18 @@ def test_6_2_encrypted_storage_differs_from_plaintext(tmp_path):
     crypto = PassphraseCrypto("mypassphrase")
 
     cache = CacheManager(tmp_path / "cache")
-    staging = build_staging(
+    chunks = build_staging(
         session_n=0,
         source=source,
         disc_state={},
+        disc_origin={},
         backend=backend,
         cache=cache,
         crypto=crypto,
         _staging_root=tmp_path / "staging",
     )
+    assert len(chunks) == 1, "single-medium changeset must not split"
+    staging, _, _ = chunks[0]
     try:
         from oddarchiver.cli import _patch_manifest, _encryption_block
         from oddarchiver.manifest import read_manifest

@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from oddarchiver.cli import dispatch
-from oddarchiver.disc import ISOBackend
+from oddarchiver.disc import ISOBackend, parse_disc_size
 from oddarchiver.manifest import read_manifest
 
 # Globals
@@ -49,6 +49,7 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "session": None,
         "force": False,
         "level": "fast",
+        "slow": False,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -221,3 +222,161 @@ def test_status_shows_suspect_on_bad_checksum(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "SUSPECT" in out
+
+
+class _CorruptAfterBurnISO(ISOBackend):
+    """ISOBackend that overwrites stored full blobs after each burn."""
+
+    def init(self, staging, label, expected_session_count=0):
+        super().init(staging, label, expected_session_count)
+        self._corrupt_full_blobs()
+
+    def append(self, staging, label, expected_session_count):
+        super().append(staging, label, expected_session_count)
+        self._corrupt_full_blobs()
+
+    def _corrupt_full_blobs(self) -> None:
+        """
+        Input:  None
+        Output: None
+        Details:
+            Overwrites every session_*/full/* blob with garbage so a later
+            checksum verify can see media-level corruption.
+        """
+        for blob in self._sessions_root.glob("session_*/full/*"):
+            if blob.is_file():
+                blob.write_bytes(b"CORRUPTED GARBAGE")
+
+
+def _spy_verify_levels(monkeypatch) -> list[str]:
+    """Record verify(level=) values without skipping the real call."""
+    import oddarchiver.verify as verify_mod
+
+    levels: list[str] = []
+    real = verify_mod.verify
+
+    def spy(*args, **kwargs):
+        levels.append(kwargs["level"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(verify_mod, "verify", spy)
+    return levels
+
+
+def test_init_post_burn_verify_defaults_to_fast(tmp_path, monkeypatch):
+    """
+    Input:  tmp_path, monkeypatch
+    Output: None
+    Details:
+        init without --slow must call verify at fast level. Verify must
+        run; it cannot be skipped.
+    """
+    levels = _spy_verify_levels(monkeypatch)
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"hello")
+    iso = tmp_path / "test.iso"
+    rc = dispatch(_make_args(command="init", source=str(source), test_iso=str(iso)))
+    assert rc == 0
+    assert levels == ["fast"]
+
+
+def test_init_slow_post_burn_verify_uses_checksum(tmp_path, monkeypatch):
+    """
+    Input:  tmp_path, monkeypatch
+    Output: None
+    Details:
+        init --slow must call verify at checksum level.
+    """
+    levels = _spy_verify_levels(monkeypatch)
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"hello")
+    iso = tmp_path / "test.iso"
+    rc = dispatch(_make_args(
+        command="init", source=str(source), test_iso=str(iso), slow=True,
+    ))
+    assert rc == 0
+    assert levels == ["checksum"]
+
+
+def test_sync_slow_post_burn_verify_uses_checksum(tmp_path, monkeypatch):
+    """
+    Input:  tmp_path, monkeypatch
+    Output: None
+    Details:
+        sync --slow must call verify at checksum level after the append.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"version 1")
+    iso = tmp_path / "test.iso"
+    assert dispatch(_make_args(
+        command="init", source=str(source), test_iso=str(iso),
+    )) == 0
+    (source / "a.txt").write_bytes(b"version 2 - different content")
+    levels = _spy_verify_levels(monkeypatch)
+    rc = dispatch(_make_args(
+        command="sync", source=str(source), test_iso=str(iso), slow=True,
+    ))
+    assert rc == 0
+    assert levels == ["checksum"]
+
+
+def test_post_burn_verify_cannot_be_skipped_via_config(tmp_path, monkeypatch):
+    """
+    Input:  tmp_path, monkeypatch
+    Output: None
+    Details:
+        config.toml post_burn_verify = false must not skip post-burn
+        verify. The burn path always calls verify at fast unless --slow.
+    """
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("post_burn_verify = false\n", encoding="utf-8")
+    monkeypatch.setattr("oddarchiver.config.DEFAULT_CONFIG_PATH", cfg)
+    levels = _spy_verify_levels(monkeypatch)
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"hello")
+    iso = tmp_path / "test.iso"
+    rc = dispatch(_make_args(command="init", source=str(source), test_iso=str(iso)))
+    assert rc == 0
+    assert levels == ["fast"]
+
+
+def test_slow_catches_corrupted_blob_default_does_not(tmp_path, monkeypatch, capsys):
+    """
+    Input:  tmp_path, monkeypatch, capsys
+    Output: None
+    Details:
+        After the burn, stored blob bytes are overwritten with garbage.
+        Default post-burn verify still exits 0. --slow exits nonzero.
+    """
+    def fake_make(args):
+        return _CorruptAfterBurnISO(
+            Path(args.test_iso),
+            disc_size=parse_disc_size(getattr(args, "disc_size", "50mb")),
+        )
+
+    monkeypatch.setattr("oddarchiver.cli._make_backend", fake_make)
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"hello")
+
+    fast_iso = tmp_path / "fast.iso"
+    rc_fast = dispatch(_make_args(
+        command="init", source=str(source), test_iso=str(fast_iso),
+    ))
+    assert rc_fast == 0
+    fast_err = capsys.readouterr().err
+    assert "post-burn verify failed" not in fast_err
+
+    slow_iso = tmp_path / "slow.iso"
+    rc_slow = dispatch(_make_args(
+        command="init", source=str(source), test_iso=str(slow_iso), slow=True,
+    ))
+    captured = capsys.readouterr()
+    assert rc_slow == 1
+    assert "post-burn verify failed" in captured.err
+
