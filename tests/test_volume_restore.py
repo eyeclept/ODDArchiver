@@ -3,29 +3,33 @@ Author: Richard Baldwin
 Date:   2026
 Email:  eyeclept@pm.me
 
-Description:
-    Tests for multi-volume restore: 3-volume ISOBackend fixture, restore-state
-    skip of already-applied volumes, missing-middle-volume reporting, and
-    the unmarked legacy path leaving restore-state untouched.
+    Tests for marked single-disc and legacy restore. Multi-disc selection
+    lives in test_restore_plan.py.
 """
 # Imports
 import argparse
 import hashlib
-import json
+import logging
 import shutil
-import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
+from oddarchiver.cache import CacheManager
+from oddarchiver.catalog import remember_encryption_mode
 from oddarchiver.cli import _run_restore
 from oddarchiver.crypto import NullCrypto
 from oddarchiver.disc import ISOBackend
 from oddarchiver.ledger import ledger_dir
-from oddarchiver.manifest import Manifest, ManifestEntry, write_manifest
+from oddarchiver.manifest import Manifest, ManifestEntry, read_manifest, write_manifest
 from oddarchiver.restore import restore
-from oddarchiver.restore_state import load_restore_state, state_path
+from oddarchiver.restore_state import load_restore_state
 from oddarchiver.session import build_staging
-from oddarchiver.volume import VolumeMarker, write_volume_marker
+from oddarchiver.volume import (
+    VolumeMarker, build_volume_baseline, write_volume_marker,
+)
+from tests.helpers import _write_prior_baseline
 
 # Globals
 _DISC = 100_000
@@ -34,6 +38,16 @@ _ARCHIVE_ID = "test-archive-3vol"
 _LABELS = ("VOL0", "VOL1", "VOL2")
 _CREATED_AT = "2026-09-16T00:00:00Z"
 _crypto = NullCrypto()
+
+logger = logging.getLogger(__name__)
+
+@pytest.fixture(autouse=True)
+def _isolated_cli_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr("oddarchiver.cli.CacheManager", lambda *a, **k: CacheManager(cache))
+
 
 
 # Functions
@@ -63,21 +77,12 @@ def _tree_files(root: Path) -> dict[str, bytes]:
 
 
 def _blob_id(session_n: int, rel_path: str) -> str:
-    """Matching session.py _blob_id: sha256(session_n:rel_path)."""
+    """Input: session and path. Output: a legacy blob name for this fixture."""
     return hashlib.sha256(f"{session_n}:{rel_path}".encode()).hexdigest()
 
 
 def _build_three_volumes(tmp_path: Path) -> tuple[Path, list[Path]]:
-    """
-    Input:  tmp_path - pytest temp directory
-    Output: (source, iso_paths) for a 3-volume marked archive
-    Details:
-        Three 60 KB files on a 100000-byte ISOBackend force build_staging
-        to return 3 chunks. Each chunk is burned to its own ISO with a
-        VolumeMarker: volume 0 first_session=0, later volumes increment
-        volume_index / first_session and point previous_volume_label at
-        the prior volume's UDF label.
-    """
+    """Build three independent marked ISO discs and their v2 baselines."""
     source = tmp_path / "src"
     source.mkdir()
     (source / "a.bin").write_bytes(b"A" * _FILE_BYTES)
@@ -99,104 +104,67 @@ def _build_three_volumes(tmp_path: Path) -> tuple[Path, list[Path]]:
     )
     try:
         assert len(chunks) == 3, f"expected 3 chunks, got {len(chunks)}"
+        prior = None
         iso_paths: list[Path] = []
         for i, (staging, session_n, is_new) in enumerate(chunks):
             assert session_n == i
             assert is_new == (i > 0)
             prev_label = "" if i == 0 else _LABELS[i - 1]
-            write_volume_marker(
-                staging,
-                VolumeMarker(
-                    archive_id=_ARCHIVE_ID,
-                    volume_index=i,
-                    first_session=session_n,
-                    created_at=_CREATED_AT,
-                    previous_volume_label=prev_label,
-                ),
+            marker = VolumeMarker(
+                archive_id=_ARCHIVE_ID,
+                volume_index=i,
+                first_session=session_n,
+                created_at=_CREATED_AT,
+                previous_volume_label=prev_label,
             )
+            _write_prior_baseline(staging, prior, _crypto, marker, session_n)
+            write_volume_marker(staging, marker)
             iso = tmp_path / f"vol{i}.iso"
             backend = ISOBackend(iso, disc_size=_DISC)
             backend.init(staging, label=_LABELS[i], expected_session_count=0)
             iso_paths.append(iso)
+            manifest = read_manifest(staging / f"session_{session_n:03d}" / "manifest.json")
+            prior = build_volume_baseline(prior, [manifest], marker, _LABELS[i])
         return source, iso_paths
     finally:
         for staging, _session_n, _is_new in chunks:
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def test_three_volume_restore_matches_source(tmp_path):
-    """
-    Input:  tmp_path
-    Output: None
-    Details:
-        Restore oldest-first, one invocation per ISO. Dest tree must
-        match the source byte-for-byte (restore-state file excluded).
-    """
+def test_marked_restore_uses_inserted_disc_only(tmp_path):
     source, isos = _build_three_volumes(tmp_path)
     dest = tmp_path / "dest"
-    for iso in isos:
-        result = restore(dest, ISOBackend(iso, disc_size=_DISC), _crypto)
-        assert result.failures == 0
-        assert result.needed is None
-    assert _tree_files(dest) == _tree_files(source)
-    state = load_restore_state(dest, _ARCHIVE_ID)
-    assert state is not None
-    assert state.archive_id == _ARCHIVE_ID
-    assert state.applied_volumes == [0, 1, 2]
+    result = restore(dest, ISOBackend(isos[2], disc_size=_DISC), _crypto)
+    assert result.failures == 0
+    assert result.restored == 1
+    assert result.unresolved == []
+    assert _tree_files(dest) == {"sub/c.bin": (source / "sub" / "c.bin").read_bytes()}
 
 
-def test_rerun_skips_already_applied_volume(tmp_path):
-    """
-    Input:  tmp_path
-    Output: None
-    Details:
-        After restoring volume 0, a second restore of the same ISO must
-        leave restore-state applied_volumes at [0] and not rewrite dest.
-    """
+def test_rerun_skips_identical_file_without_applied_volume_list(tmp_path):
     _source, isos = _build_three_volumes(tmp_path)
     dest = tmp_path / "dest_partial"
     backend = ISOBackend(isos[0], disc_size=_DISC)
     first = restore(dest, backend, _crypto)
     assert first.failures == 0
-    assert first.restored >= 1
-    state_file = state_path(dest, _ARCHIVE_ID)
-    state_first = json.loads(state_file.read_text(encoding="utf-8"))
-    assert state_first["applied_volumes"] == [0]
     dest_file = dest / "a.bin"
     mtime_before = dest_file.stat().st_mtime_ns
-    time.sleep(0.01)
     second = restore(dest, backend, _crypto)
     assert second.restored == 0
     assert second.failures == 0
-    state_second = json.loads(state_file.read_text(encoding="utf-8"))
-    assert state_second["applied_volumes"] == [0]
     assert dest_file.stat().st_mtime_ns == mtime_before
-
-
-def test_restore_skips_missing_middle_volume(tmp_path):
-    """
-    Input:  tmp_path
-    Output: None
-    Details:
-        Restore volumes 0 and 2 only. Files fully on 0 and 2 appear in
-        dest. The volume-1 file is absent. restore() reports needing
-        volume 1 by its label, and that is not a failure.
-    """
-    source, isos = _build_three_volumes(tmp_path)
-    dest = tmp_path / "dest_gap"
-    r0 = restore(dest, ISOBackend(isos[0], disc_size=_DISC), _crypto)
-    r2 = restore(dest, ISOBackend(isos[2], disc_size=_DISC), _crypto)
-    assert r0.failures == 0
-    assert r2.failures == 0
-    assert r2.needed is not None
-    assert r2.needed.volume_index == 1
-    assert r2.needed.label == "VOL1"
-    assert (dest / "a.bin").read_bytes() == (source / "a.bin").read_bytes()
-    assert (dest / "sub" / "c.bin").read_bytes() == (source / "sub" / "c.bin").read_bytes()
-    assert not (dest / "b.bin").exists()
     state = load_restore_state(dest, _ARCHIVE_ID)
     assert state is not None
-    assert state.applied_volumes == [0, 2]
+    assert state.files["a.bin"].last_session == 0
+
+
+def test_single_disc_restore_does_not_request_missing_middle(tmp_path):
+    source, isos = _build_three_volumes(tmp_path)
+    dest = tmp_path / "dest_gap"
+    result = restore(dest, ISOBackend(isos[2], disc_size=_DISC), _crypto)
+    assert result.failures == 0
+    assert result.unresolved == []
+    assert _tree_files(dest) == {"sub/c.bin": (source / "sub" / "c.bin").read_bytes()}
 
 
 def test_legacy_unmarked_does_not_write_state(tmp_path):
@@ -254,9 +222,8 @@ def test_delta_without_prior_volume_is_unresolved(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        A marked volume whose only entry is a delta, restored with empty
-        dest, must not fail or write the file. It reports needing the
-        previous volume by label.
+        A delta with no local full base is unresolved without prompting
+        for another disc. The planner handles cross-disc reconstruction.
     """
     staging = tmp_path / "staging_delta"
     delta_dir = staging / "session_001" / "deltas"
@@ -304,22 +271,33 @@ def test_delta_without_prior_volume_is_unresolved(tmp_path):
     result = restore(dest, backend, _crypto)
     assert result.failures == 0
     assert result.restored == 0
-    assert result.needed is not None
-    assert result.needed.volume_index == 0
-    assert result.needed.label == "VOL0"
+    assert result.unresolved == [("changed.txt", "disc 0")]
     assert not (dest / "changed.txt").exists()
 
 
-def test_cli_prints_needed_volume_message(tmp_path, capsys):
+def _assert_single_disc_cli_files(dest: Path, source: Path) -> None:
+    """Input: destination and source paths. Output: verified single-disc contents."""
+    assert (dest / "sub" / "c.bin").read_bytes() == (source / "sub" / "c.bin").read_bytes()
+    assert (dest / "sub" / "c.bin").read_bytes() == b"C" * _FILE_BYTES
+    assert not (dest / "a.bin").exists()
+    assert not (dest / "b.bin").exists()
+    restored = {
+        str(path.relative_to(dest)): path.read_bytes()
+        for path in dest.rglob("*") if path.is_file()
+    }
+    assert restored == {"sub/c.bin": b"C" * _FILE_BYTES}
+
+
+def test_cli_single_disc_notice_without_needed_volume(tmp_path, capsys):
     """
     Input:  tmp_path, capsys
     Output: None
     Details:
-        _run_restore on volume 2 with an empty dest must exit 0 and print
-        the insert-volume-1 message. Missing earlier volumes are not
-        failures.
+        A marked single-disc restore identifies its limited scope.
+        The file on the inserted disc matches the source bytes.
     """
-    _source, isos = _build_three_volumes(tmp_path)
+    source, isos = _build_three_volumes(tmp_path)
+    remember_encryption_mode(_ARCHIVE_ID, "none")
     dest = tmp_path / "dest_cli"
     args = argparse.Namespace(
         dest=str(dest),
@@ -335,10 +313,7 @@ def test_cli_prints_needed_volume_message(tmp_path, capsys):
     )
     rc = _run_restore(args)
     assert rc == 0
-    out = capsys.readouterr().out
-    assert "Restore needs volume 1" in out
-    assert "VOL1" in out
-    assert "oddarchiver restore" in out
-    assert (dest / "sub" / "c.bin").exists()
-    assert not (dest / "a.bin").exists()
-    assert not (dest / "b.bin").exists()
+    out = capsys.readouterr()
+    assert "Restore needs volume" not in out.out + out.err
+    assert "Other discs can hold newer versions" in out.err
+    _assert_single_disc_cli_files(dest, source)

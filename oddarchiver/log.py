@@ -8,12 +8,14 @@ Description:
     The format is: TIMESTAMP LEVEL [module] message. Timestamps use UTC.
     The module adds SUSPECT as a custom level (35) between WARNING and ERROR.
     setup_logging() sets up a file handler for all levels and a stderr handler for ERROR and above.
+    The stderr handler prints one line per record; exception tracebacks go only to the log file.
     check_capacity() logs the disk fill percentage at the matching level.
 """
 # Imports
 import logging
 import sys
 import time
+import os
 from pathlib import Path
 
 # Globals
@@ -23,7 +25,8 @@ logging.addLevelName(SUSPECT_LEVEL, "SUSPECT")
 _LOG_FMT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 _DATE_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
-_log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+_log = logger
 
 # Functions
 
@@ -38,6 +41,27 @@ class _UTCFormatter(logging.Formatter):
     converter = time.gmtime
 
 
+class _ConsoleFormatter(_UTCFormatter):
+    """
+    Input:  N/A - subclass of _UTCFormatter
+    Output: N/A
+    Details:
+        Formats a record without its exception traceback or stack. The file
+        handler keeps the full traceback; the terminal shows only the message.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        """
+        Input:  record - the log record
+        Output: the formatted message line without exc_info or stack_info
+        """
+        plain = logging.makeLogRecord(record.__dict__)
+        plain.exc_info = None
+        plain.exc_text = None
+        plain.stack_info = None
+        return super().format(plain)
+
+
 def _fmt_bytes(n: int) -> str:
     """
     Input:  n - the byte count
@@ -50,6 +74,40 @@ def _fmt_bytes(n: int) -> str:
     return f"{n:.1f} TiB"
 
 
+def _create_log_parents(log_file: Path) -> None:
+    """
+    Input:  log_file - the path whose missing parents must be created
+    Output: None
+    """
+    missing = []
+    parent = log_file.parent
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+
+
+def _open_private_log(log_file: Path) -> int:
+    """
+    Input:  log_file - the path to the private log file
+    Output: An open file descriptor for the log file
+    """
+    fd = os.open(
+        log_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        if os.fstat(fd).st_uid != os.getuid():
+            raise PermissionError(f"Log file is not owned by this user: {log_file}")
+        os.fchmod(fd, 0o600)
+    except (OSError, PermissionError):
+        _log.exception("Cannot secure log file %s", log_file)
+        os.close(fd)
+        raise
+    return fd
+
+
 def setup_logging(log_file: Path, level: int = logging.INFO) -> None:
     """
     Input:  log_file - the path to the append-only log file. The function creates
@@ -59,14 +117,15 @@ def setup_logging(log_file: Path, level: int = logging.INFO) -> None:
     Details:
         The function adds two handlers to the root logger:
           - A FileHandler at `log_file` for all messages at `level` and above.
-          - A StreamHandler(stderr) for ERROR level and above only.
+          - A StreamHandler(stderr) for ERROR level and above only. It prints the
+            message line without exception tracebacks; the file keeps them.
         You can call this function more than once. It skips duplicate handlers
         for the same path.
         The function keeps existing handlers. This does not disrupt library callers.
     """
     log_file = Path(log_file)
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-
+    _create_log_parents(log_file)
+    fd = _open_private_log(log_file)
     formatter = _UTCFormatter(fmt=_LOG_FMT, datefmt=_DATE_FMT)
 
     root = logging.getLogger()
@@ -79,10 +138,13 @@ def setup_logging(log_file: Path, level: int = logging.INFO) -> None:
         if isinstance(h, logging.FileHandler)
     }
     if str(log_file.resolve()) not in existing_paths:
-        fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        fh = logging.FileHandler(log_file, mode="a", encoding="utf-8", delay=True)
+        fh.stream = os.fdopen(fd, "a", encoding="utf-8")
         fh.setLevel(level)
         fh.setFormatter(formatter)
         root.addHandler(fh)
+    else:
+        os.close(fd)
 
     # Do not add a second stderr handler.
     has_stderr = any(
@@ -94,7 +156,7 @@ def setup_logging(log_file: Path, level: int = logging.INFO) -> None:
     if not has_stderr:
         sh = logging.StreamHandler(sys.stderr)
         sh.setLevel(logging.ERROR)
-        sh.setFormatter(formatter)
+        sh.setFormatter(_ConsoleFormatter(fmt=_LOG_FMT, datefmt=_DATE_FMT))
         root.addHandler(sh)
 
     root.setLevel(level)

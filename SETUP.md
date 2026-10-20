@@ -6,9 +6,9 @@
 - `xdelta3`: binary delta computation
 - `genisoimage`: builds ISO images for `--test-iso` mode and the test suite
 - `dvd+rw-tools` (`growisofs`, `dvd+rw-mediainfo`): writes and reads a physical BD-R drive
-- `xorriso`: reads files back off a physical BD-R drive directly over SG_IO.
-  It never depends on the OS mounting the disc. OS mounting was unreliable
-  for several minutes after a real, multi-GB burn. See the
+- `xorriso`: reads files directly from a physical BD-R drive over SG_IO.
+  It does not depend on the OS mounting the disc. After a real, multi-GB
+  burn, OS mounting was unreliable for several minutes. See the
   "Environment-specific hardware limitation" section of
   `STATE_OF_THE_PROGRAM.md`
 - `udftools`: optional. Only needed to mount an individual session by hand
@@ -41,33 +41,32 @@ oddarchiver --help
 
 ## Enable unattended recovery for a stuck USB optical drive (optional, recommended for cron)
 
-On some USB-bridged BD-R drives, the `sync` append step can fail right
-after a burn with `unable to pread64(2) primary volume descriptor`. The
-cause is a stale kernel block-device capacity cache, not disc corruption
-or a code defect. Live testing confirmed this failure. The
+On some USB-bridged BD-R drives, the `sync` append step can fail immediately
+after a burn with `unable to pread64(2) primary volume descriptor`.
+A stale kernel block-device capacity cache causes this failure, not disc
+corruption or a code defect. Live testing confirmed this failure. The
 "Environment-specific hardware limitation" section of
 `STATE_OF_THE_PROGRAM.md` documents it.
 
-`append()` recovers from this automatically. It deauthorizes and then
+`append()` automatically recovers from this failure. It deauthorizes and
 reauthorizes the USB device of the drive. This forces the kernel to fully
 re-enumerate the device.
 
-That toggle needs no tray action and no interactive session. But that
-toggle needs root, so it needs a one-time, narrowly scoped `sudo` grant.
+The toggle needs no tray action or interactive session. It needs root, so
+give it a one-time, narrowly scoped `sudo` grant.
 
 Without this step, `sync` still works interactively. The error message
-tells you to physically eject and reinsert the disc. But `sync` cannot
-self-heal inside an unattended cron job.
+tells you to physically eject and reinsert the disc. However, `sync`
+cannot recover inside an unattended cron job.
 
-Install the helper script itself as a **root-owned** file at a fixed
-system path. This is a separate, manual, `sudo`-run step.
-`pip install -e .` deliberately does not do it for you.
+Install the helper script as a **root-owned** file at a fixed system path.
+Run this separate step manually with `sudo`. `pip install -e .` does not
+install the helper for you.
 
-`pip install -e .` runs as your own unprivileged user, so anything it
-puts on your `PATH` is writable by that same user. A `sudo` grant trusts
-an exact path string, not who currently controls the file living there.
-So the actual privileged script must live somewhere your own account
-cannot modify:
+`pip install -e .` runs as your own unprivileged user. That user can modify
+anything the command puts on your `PATH`. A `sudo` grant trusts an exact
+path string, not who currently controls the file at that path. Put the
+privileged script where your own account cannot modify it:
 
 ```sh
 cd ODDArchiver   # this repo's root
@@ -75,27 +74,26 @@ sudo install -o root -g root -m 0755 \
     oddarchiver/usb_reauth.py /usr/local/sbin/oddarchiver-usb-reauth
 ```
 
-Then add exactly this line via `sudo visudo` (or a new file under
-`/etc/sudoers.d/`), replacing `<you>` with your own username:
+Then use `sudo visudo` to add exactly this line. Alternatively, add a new
+file under `/etc/sudoers.d/`. Replace `<you>` with your own username:
 
 ```
 <you> ALL=(root) NOPASSWD: /usr/local/sbin/oddarchiver-usb-reauth
 ```
 
-The exact path above has no wildcards and no argument pattern. The
-helper only ever accepts one bare device name (e.g. `sr0`). It validates
-it against `^sr[0-9]+$` and re-derives the real USB sysfs path of the
-drive itself. It trusts nothing passed to it.
+The exact path above has no wildcards or argument pattern. The helper
+accepts only one bare device name (e.g. `sr0`). It validates the name
+against `^sr[0-9]+$` and independently finds the real USB sysfs path of
+the drive. It trusts nothing passed to it.
 
-The job of the sudoers rule is only to let this one specific,
-already-validating, root-owned script run without a password. It is not
-the security boundary for what gets touched. The script is deliberately
-self-contained (no `oddarchiver` package import), so root never
-dynamically loads code from your own writable site-packages. See the
-module docstring of `oddarchiver/usb_reauth.py` for the full security
-model.
+The sudoers rule lets only this specific, root-owned script run without a
+password. The script validates its inputs. The rule does not define the
+security boundary for what the script can access. The script imports no
+`oddarchiver` package code. Thus, root never dynamically loads code from
+your writable site-packages. See the module docstring of
+`oddarchiver/usb_reauth.py` for the full security model.
 
-Re-run the `sudo install` command above any time
+Run the `sudo install` command above again whenever
 `oddarchiver/usb_reauth.py` changes upstream.
 
 ## Set up encryption
@@ -104,7 +102,7 @@ Encryption is optional. Pick one mode before your first `init`. See the README f
 
 ### Passphrase mode
 
-Set the passphrase in the environment so it is not prompted on every run:
+Set the passphrase in the environment to avoid a prompt on every run:
 
 ```sh
 export ODDARCHIVER_PASSPHRASE="correct horse battery staple"
@@ -121,18 +119,25 @@ Generate a 32-byte keyfile:
 python3 -c "from oddarchiver.crypto import generate_keyfile; generate_keyfile('/path/to/keyfile.bin')"
 ```
 
-Store the keyfile somewhere secure, such as an encrypted volume or a hardware token, not next to the archive itself. Pass `--key PATH` on `init` and on every command afterward:
+`generate_keyfile` creates the keyfile with mode 0600. It refuses to overwrite an existing file.
+Before you use an existing keyfile, run `chmod 600 /path/to/keyfile.bin`.
+ODDArchiver refuses keyfiles that group members or other users can read.
+ODDArchiver also refuses keyfiles that you do not own.
+
+Store the keyfile on an encrypted volume or a hardware token. Do not store it next to the archive.
+Pass `--key PATH` on `init` and on every later command:
 
 ```sh
 oddarchiver init ~/ToArchive --test-iso archive.iso --encrypt keyfile --key /path/to/keyfile.bin
 oddarchiver sync ~/ToArchive --test-iso archive.iso --key /path/to/keyfile.bin
 ```
 
-Losing the keyfile makes the archive permanently unreadable. Keep backup copies of it.
+Keep a backup of the keyfile. If you lose it, use the offline rescue key to restore the archive.
+If you lose both keys, you cannot read the archive.
 
 ## Configuration file
 
-ODDArchiver reads an optional file at `~/.config/oddarchiver/config.toml`. Every setting has a built-in default, so the file is never required.
+ODDArchiver reads an optional file at `~/.config/oddarchiver/config.toml`. Every setting has a built-in default. The file is not required.
 
 Precedence, lowest to highest: built-in default, then `config.toml`, then a CLI flag. A CLI flag always wins.
 
@@ -171,18 +176,19 @@ Precedence, lowest to highest: built-in default, then `config.toml`, then a CLI 
 | `~/logs/` | Log file directory | `log_file` in `config.toml` |
 | `~/.config/oddarchiver/` | Configuration file | not overridable |
 
-\* Not currently wired through the CLI. Setting it in `config.toml` has no
-effect yet.
+\* The CLI does not currently use this setting. Setting it in `config.toml`
+has no effect yet.
 
-`$XDG_RUNTIME_DIR` is usually a RAM-backed tmpfs sized well below real
+`$XDG_RUNTIME_DIR` is usually a RAM-backed tmpfs much smaller than real
 disk space (6.2 GiB on a 61 GiB workstation is typical). A session 0
-`init` stages every source file as a full blob before burning. So the
-whole source tree has to fit there, regardless of the capacity of the
-target disc or `/home`.
+`init` stages every source file as a full blob before burning. Therefore,
+the whole source tree must fit there, regardless of the target disc or
+`/home` capacity.
 
-`init`/`sync` check for this before staging any file and fail fast with
-a clear message instead of crashing partway through. See "Staging space
-check failed" in the Troubleshooting section of the README.
+`init`/`sync` check the available space before staging any file. If the
+space is insufficient, they stop with a clear message instead of crashing
+partway through. See "Staging space check failed" in the Troubleshooting
+section of the README.
 
 Clear the cache at any time:
 
@@ -190,7 +196,7 @@ Clear the cache at any time:
 rm -rf ~/.cache/oddarchiver
 ```
 
-It rebuilds automatically from disc reads on the next `sync`.
+The cache automatically rebuilds from disc reads on the next `sync`.
 
 ## Cron deployment
 
@@ -198,7 +204,8 @@ It rebuilds automatically from disc reads on the next `sync`.
 0 2 * * 0 oddarchiver sync ~/Documents/ToArchive --device /dev/sr0
 ```
 
-A no-change run prints nothing to stdout, so cron does not send mail unless the job fails. Errors go to stderr and to the log file. The process exits 1 on any error, so cron can alert on a non-zero exit code.
+A no-change run prints nothing to stdout, so cron sends no mail unless the job fails.
+Errors go to stderr and the log file. The process exits 1 on any error, so cron can alert on a non-zero exit code.
 
 ## Development setup
 

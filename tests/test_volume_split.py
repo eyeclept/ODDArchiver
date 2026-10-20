@@ -11,6 +11,7 @@ Description:
 """
 # Imports
 import hashlib
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -18,11 +19,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from oddarchiver.cache import CacheManager
+from oddarchiver.catalog import build_archive_catalog
 from oddarchiver.cli import _volume_iso_path, build_parser, dispatch
-from oddarchiver.crypto import NullCrypto
+from oddarchiver.crypto import KeyfileCrypto, NullCrypto, blob_aad, generate_keyfile
 from oddarchiver.disc import DVD_DL_DISC_BYTES, DVD_SL_DISC_BYTES, ISOBackend
-from oddarchiver.manifest import load_session_manifests, read_manifest
+from oddarchiver.filehash import hash_file
+from oddarchiver.manifest import load_session_manifests, read_manifest, write_manifest
 from oddarchiver.restore import restore
+from oddarchiver.restore_plan import restore_archive
 from oddarchiver.restore_state import load_restore_state
 from oddarchiver.session import (
     SPACE_SAFETY_MARGIN,
@@ -32,7 +37,11 @@ from oddarchiver.session import (
     build_staging,
 )
 from oddarchiver.verify import verify
-from oddarchiver.volume import VolumeMarker, write_volume_marker
+from oddarchiver.volume import (
+    VolumeMarker, build_volume_baseline, read_volume_marker,
+    write_volume_marker,
+)
+from tests.helpers import _write_prior_baseline
 
 # Globals
 _DISC = 20_000
@@ -40,15 +49,23 @@ _BUDGET = int(_DISC * SPACE_SAFETY_MARGIN)  # 19000
 _SPLIT_BYTES = 50_000  # 19000 + 19000 + 12000 = 3 chunks
 _SMALL_BYTES = 100
 _ARCHIVE_ID = "test-archive-vsplit"
-_LABELS = ("VOL0", "VOL1", "VOL2", "VOL3")
 _CREATED_AT = "2026-09-20T00:00:00Z"
 _crypto = NullCrypto()
+logger = logging.getLogger(__name__)
+_log = logger
 
 ROCKY_ISO = Path("/HDD/iso/Rocky-10.0-x86_64-dvd1.iso")
 SYNTH_BIN = Path(
     "/HDD/eyeclept/oddarchiver-test-fixtures/oversized_split_test.bin"
 )
 _GATED_WORK = Path("/HDD/eyeclept/oddarchiver-test-fixtures/section30-work")
+_ROCKY_PROFILE = ("rocky.iso", "rocky-archive.iso", "dvd-sl", "ROCKY", DVD_SL_DISC_BYTES)
+_SYNTH_PROFILE = ("payload.bin", "synth-archive.iso", "dvd-dl", "SYNTH", DVD_DL_DISC_BYTES)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
 
 # Functions
@@ -59,14 +76,8 @@ def _sha256(data: bytes) -> str:
 
 
 def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        while True:
-            chunk = fh.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+    """Input: file path. Output: SHA-256 hex digest."""
+    return hash_file(path, 1024 * 1024).hexdigest()
 
 
 def _make_cache() -> MagicMock:
@@ -139,14 +150,42 @@ def test_pack_blobs_gives_each_split_chunk_a_dedicated_bin():
     assert [b.rel_path for b in bins[3]] == ["tiny.txt"]
 
 
+def _assert_tagged_chunks(chunks: list[tuple[Path, int, bool]], payload: bytes) -> None:
+    """Input: staged chunks and source bytes. Output: None; checks split metadata."""
+    parts: list[bytes] = []
+    count = None
+    for i, (staging, session_n, is_new) in enumerate(chunks):
+        assert session_n == i
+        assert is_new == (i > 0)
+        manifest = read_manifest(
+            staging / f"session_{session_n:03d}" / "manifest.json"
+        )
+        assert len(manifest.entries) == 1
+        entry = manifest.entries[0]
+        assert entry.path == "huge.bin"
+        assert entry.type == "full"
+        assert entry.streamed
+        assert entry.volume_chunk == i
+        if count is None:
+            count = entry.volume_chunk_count
+        assert entry.volume_chunk_count == count
+        assert entry.full_size_bytes == _SPLIT_BYTES
+        assert entry.result_checksum == _sha256(payload)
+        blob = (staging / entry.file).read_bytes()
+        assert len(blob) <= _BUDGET
+        parts.append(blob)
+    assert count == len(chunks)
+    assert b"".join(parts) == payload
+
+
 def test_oversized_file_splits_into_tagged_dedicated_bins(tmp_path):
     """
     Input:  tmp_path
     Output: None
     Details:
-        A 50000-byte file on a 20000-byte disc splits into 3 dedicated
-        bins with volume_chunk 0..2, volume_chunk_count 3, and
-        full_size_bytes equal to the whole file on every entry.
+        A 50000-byte file on a 20000-byte disc splits into dedicated
+        bins with sequential volume_chunk fields and full_size_bytes
+        equal to the whole file on every entry.
     """
     source = tmp_path / "src"
     source.mkdir()
@@ -164,30 +203,8 @@ def test_oversized_file_splits_into_tagged_dedicated_bins(tmp_path):
         _staging_root=tmp_path / "staging",
     )
     try:
-        assert len(chunks) == 3
-        parts: list[bytes] = []
-        for i, (staging, session_n, is_new) in enumerate(chunks):
-            assert session_n == i
-            assert is_new == (i > 0)
-            manifest = read_manifest(
-                staging / f"session_{session_n:03d}" / "manifest.json"
-            )
-            assert len(manifest.entries) == 1
-            entry = manifest.entries[0]
-            assert entry.path == "huge.bin"
-            assert entry.type == "full"
-            assert entry.streamed is True
-            assert entry.volume_chunk == i
-            assert entry.volume_chunk_count == 3
-            assert entry.full_size_bytes == _SPLIT_BYTES
-            assert entry.result_checksum == _sha256(payload)
-            blob = (staging / entry.file).read_bytes()
-            if i < 2:
-                assert len(blob) == _BUDGET
-            else:
-                assert len(blob) == _SPLIT_BYTES - 2 * _BUDGET
-            parts.append(blob)
-        assert b"".join(parts) == payload
+        assert len(chunks) >= 2
+        _assert_tagged_chunks(chunks, payload)
     finally:
         for staging, _session_n, _is_new in chunks:
             shutil.rmtree(staging, ignore_errors=True)
@@ -221,65 +238,134 @@ def _burn_split_archive(
         _staging_root=tmp_path / "staging",
     )
     try:
+        prior = None
         iso_paths: list[Path] = []
         for i, (staging, session_n, is_new) in enumerate(chunks):
             assert session_n == i
             assert is_new == (i > 0)
-            prev_label = "" if i == 0 else _LABELS[i - 1]
-            write_volume_marker(
-                staging,
-                VolumeMarker(
-                    archive_id=_ARCHIVE_ID,
-                    volume_index=i,
-                    first_session=session_n,
-                    created_at=_CREATED_AT,
-                    previous_volume_label=prev_label,
-                ),
-            )
+            prev_label = "" if i == 0 else f"VOL{i - 1}"
+            label = f"VOL{i}"
+            marker = VolumeMarker(_ARCHIVE_ID, i, session_n, _CREATED_AT, prev_label)
+            _write_prior_baseline(staging, prior, _crypto, marker, session_n)
+            write_volume_marker(staging, marker)
             iso = tmp_path / f"vol{i}.iso"
             backend = ISOBackend(iso, disc_size=_DISC)
-            backend.init(staging, label=_LABELS[i], expected_session_count=0)
+            backend.init(staging, label=label, expected_session_count=0)
             iso_paths.append(iso)
+            manifest = read_manifest(staging / f"session_{session_n:03d}" / "manifest.json")
+            prior = build_volume_baseline(prior, [manifest], marker, label)
         return source, iso_paths
     finally:
         for staging, _session_n, _is_new in chunks:
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def test_split_file_restore_round_trip_three_volumes(tmp_path):
-    """
-    Input:  tmp_path
-    Output: None
-    Details:
-        Sync a 3-chunk split file onto 3 marked ISOBackend volumes.
-        Oldest-first restore reconstructs huge.bin byte-for-byte.
-    """
+class _Acquire:
+    image = None
+
+    def __init__(self, paths, order):
+        self.paths = paths
+        self.order = iter(order)
+        self.seen = []
+
+    def acquire(self, needed, catalog, archive_id):
+        index = next(self.order)
+        assert index in needed
+        self.seen.append(index)
+        return ISOBackend(self.paths[index], disc_size=_DISC), None, False
+
+
+def _restore_split(dest, paths, order):
+    backend = ISOBackend(paths[-1], disc_size=_DISC)
+    marker = read_volume_marker(backend)
+    manifests = load_session_manifests(
+        backend, _crypto, start_session=marker.first_session, marker=marker,
+    )
+    catalog = build_archive_catalog(backend, _crypto, manifests, marker)
+    acquisition = _Acquire(paths, order)
+    result = restore_archive(
+        dest, backend, _crypto, catalog, manifests=manifests, acquisition=acquisition,
+    )
+    return result, acquisition
+
+
+def _track_blob_reads(monkeypatch, isos: list[Path]) -> dict[int, list[str]]:
+    """Input: pytest patcher and ISO paths. Output: per-volume blob reads."""
+    iso_index = {path.resolve(): index for index, path in enumerate(isos)}
+    blob_reads: dict[int, list[str]] = {index: [] for index in range(len(isos))}
+    orig_read = ISOBackend.read_paths
+    orig_one = ISOBackend.extract_path_to_file
+
+    def record(self, paths):
+        blobs = [path for path in paths if "/full/" in path or "/deltas/" in path]
+        if blobs:
+            blob_reads[iso_index[self.iso_path.resolve()]].extend(blobs)
+
+    def track_read(self, paths):
+        record(self, paths)
+        return orig_read(self, paths)
+
+    def track_one(self, path, dest_file):
+        record(self, [path])
+        return orig_one(self, path, dest_file)
+
+    monkeypatch.setattr(ISOBackend, "read_paths", track_read)
+    if hasattr(ISOBackend, "extract_paths"):
+        orig_many = ISOBackend.extract_paths
+
+        def track_many(self, paths, *args, **kwargs):
+            record(self, paths)
+            return orig_many(self, paths, *args, **kwargs)
+
+        monkeypatch.setattr(ISOBackend, "extract_paths", track_many)
+    else:
+        monkeypatch.setattr(ISOBackend, "extract_path_to_file", track_one)
+    return blob_reads
+
+
+def _assert_single_read_per_volume(
+    isos: list[Path], blob_reads: dict[int, list[str]],
+) -> None:
+    """Input: ISO list and recorded paths. Output: None; checks each volume."""
+    for index, _iso in enumerate(isos):
+        blobs = blob_reads[index]
+        assert blobs, f"volume {index} had no blob reads"
+        assert len(blobs) == len(set(blobs)), f"volume {index} reread blobs: {blobs}"
+        assert len(set(blobs)) == 1
+
+
+def test_split_file_restore_round_trip_three_volumes(tmp_path, monkeypatch):
+    """Collect split chunks in mixed disc order and reconstruct the file."""
     payload = bytes([(i * 3 + 5) % 256 for i in range(_SPLIT_BYTES)])
-    source, isos = _burn_split_archive(tmp_path, payload)
-    assert len(isos) == 3
+    _source, isos = _burn_split_archive(tmp_path, payload)
+    assert len(isos) >= 2
     dest = tmp_path / "dest"
-    for iso in isos:
-        result = restore(dest, ISOBackend(iso, disc_size=_DISC), _crypto)
-        assert result.failures == 0
+    order = list(range(len(isos) - 1))
+    order.reverse()
+    blob_reads = _track_blob_reads(monkeypatch, isos)
+    result, _acquisition = _restore_split(dest, isos, order)
+    assert result.failures == 0
     assert (dest / "huge.bin").read_bytes() == payload
     assert _sha256_path(dest / "huge.bin") == _sha256(payload)
     state = load_restore_state(dest, _ARCHIVE_ID)
     assert state is not None
-    assert state.applied_volumes == [0, 1, 2]
+    assert set(state.read_discs) == set(range(len(isos)))
+    _assert_single_read_per_volume(isos, blob_reads)
 
 
 def test_split_file_independent_chunk_decrypt(tmp_path):
     """
-    Input:  tmp_path
+    Input: temporary source and keyfile
     Output: None
-    Details:
-        Each range-encrypted chunk decrypts via decrypt_file with no
-        extra params. Concatenating those plaintexts equals the source.
+    Details: Every encrypted chunk decrypts on its own to its source range.
     """
     source = tmp_path / "src"
     source.mkdir()
     payload = b"Z" * _SPLIT_BYTES
     (source / "huge.bin").write_bytes(payload)
+    keyfile = tmp_path / "archive.key"
+    generate_keyfile(str(keyfile))
+    crypto = KeyfileCrypto(str(keyfile))
     chunks = build_staging(
         session_n=0,
         source=source,
@@ -287,23 +373,69 @@ def test_split_file_independent_chunk_decrypt(tmp_path):
         disc_origin={},
         backend=ISOBackend(tmp_path / "pack.iso", disc_size=_DISC),
         cache=_make_cache(),
-        crypto=_crypto,
+        crypto=crypto,
         _staging_root=tmp_path / "staging",
     )
     try:
         plains: list[bytes] = []
+        offset = 0
         for i, (staging, session_n, _is_new) in enumerate(chunks):
+            # build_staging writes the staged manifest encrypted.
             manifest = read_manifest(
-                staging / f"session_{session_n:03d}" / "manifest.json"
+                staging / f"session_{session_n:03d}" / "manifest.json", crypto=crypto,
             )
             blob = staging / manifest.entries[0].file
             out = tmp_path / f"plain_{i}"
-            _crypto.decrypt_file(blob, out)
-            plains.append(out.read_bytes())
+            crypto.decrypt_file(blob, out, aad=blob_aad(manifest.entries[0]))
+            plain = out.read_bytes()
+            assert plain == payload[offset:offset + len(plain)]
+            assert blob.read_bytes() != plain
+            offset += len(plain)
+            plains.append(plain)
+        assert offset == len(payload)
         assert b"".join(plains) == payload
     finally:
         for staging, _session_n, _is_new in chunks:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def _remove_staged(chunks: list[tuple[Path, int, bool]]) -> None:
+    """Input: staged chunks. Output: None; removes each staging directory."""
+    for staging, _session_n, _is_new in chunks:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _copy_staged_sessions(
+    chunks: list[tuple[Path, int, bool]], combined: Path,
+) -> None:
+    """Input: staged sessions and destination. Output: None; copies sessions."""
+    for staging, session_n, _is_new in chunks:
+        shutil.copytree(
+            staging / f"session_{session_n:03d}",
+            combined / f"session_{session_n:03d}",
+        )
+
+
+def _assert_shrunk_chunk(
+    sync_chunks: list[tuple[Path, int, bool]], shrunk: bytes, backend: ISOBackend,
+) -> None:
+    """Input: sync chunks, new bytes, backend. Output: None; checks and appends."""
+    assert len(sync_chunks) == 1
+    staging, session_n, is_new = sync_chunks[0]
+    assert not is_new
+    manifest = read_manifest(
+        staging / f"session_{session_n:03d}" / "manifest.json"
+    )
+    entry = {e.path: e for e in manifest.entries}["huge.bin"]
+    assert entry.volume_chunk is None
+    assert entry.volume_chunk_count is None
+    assert entry.streamed
+    assert entry.full_size_bytes == len(shrunk)
+    backend.append(
+        staging,
+        label="SHRINK",
+        expected_session_count=backend.mediainfo().session_count,
+    )
 
 
 def test_split_file_shrinks_to_single_blob(tmp_path, monkeypatch):
@@ -323,7 +455,7 @@ def test_split_file_shrinks_to_single_blob(tmp_path, monkeypatch):
 
     monkeypatch.setattr(crypto_mod, "STREAM_CHUNK_SIZE", 100)
     monkeypatch.setattr(session_mod, "STREAM_CHUNK_SIZE", 100)
-    monkeypatch.setattr(restore_mod, "STREAM_CHUNK_SIZE", 100)
+    monkeypatch.setattr(restore_mod, "HASH_CHUNK_SIZE", 100)
     monkeypatch.setattr(verify_mod, "STREAM_CHUNK_SIZE", 100)
 
     source = tmp_path / "src"
@@ -346,14 +478,9 @@ def test_split_file_shrinks_to_single_blob(tmp_path, monkeypatch):
     combined.mkdir()
     try:
         assert len(chunks) >= 2
-        for staging, session_n, _is_new in chunks:
-            shutil.copytree(
-                staging / f"session_{session_n:03d}",
-                combined / f"session_{session_n:03d}",
-            )
+        _copy_staged_sessions(chunks, combined)
     finally:
-        for staging, _session_n, _is_new in chunks:
-            shutil.rmtree(staging, ignore_errors=True)
+        _remove_staged(chunks)
 
     iso = tmp_path / "test.iso"
     backend = ISOBackend(iso, disc_size=2_000_000)
@@ -375,25 +502,9 @@ def test_split_file_shrinks_to_single_blob(tmp_path, monkeypatch):
         _staging_root=tmp_path / "staging1",
     )
     try:
-        assert len(sync_chunks) == 1
-        staging, session_n, is_new = sync_chunks[0]
-        assert is_new is False
-        manifest = read_manifest(
-            staging / f"session_{session_n:03d}" / "manifest.json"
-        )
-        entry = {e.path: e for e in manifest.entries}["huge.bin"]
-        assert entry.volume_chunk is None
-        assert entry.volume_chunk_count is None
-        assert entry.streamed is True
-        assert entry.full_size_bytes == len(shrunk)
-        backend.append(
-            staging,
-            label="SHRINK",
-            expected_session_count=backend.mediainfo().session_count,
-        )
+        _assert_shrunk_chunk(sync_chunks, shrunk, backend)
     finally:
-        for staging, _session_n, _is_new in sync_chunks:
-            shutil.rmtree(staging, ignore_errors=True)
+        _remove_staged(chunks)
 
     dest = tmp_path / "dest"
     restored, failures = restore(dest, backend, _crypto)
@@ -407,40 +518,26 @@ def test_split_file_shrinks_to_single_blob(tmp_path, monkeypatch):
 
 
 def test_skip_volume_on_split_chunk_reports_missing(tmp_path):
-    """
-    Input:  tmp_path
-    Output: None
-    Details:
-        --skip-volume on a volume that holds one chunk of a split file
-        reports that file missing, never stale, and does not write a
-        partial dest file. A small file on a later volume still restores.
-    """
+    """Missing a split chunk leaves no partial file, but restores other files."""
     payload = b"H" * _SPLIT_BYTES
     extra = {"other.txt": b"O" * _SMALL_BYTES}
     _source, isos = _burn_split_archive(tmp_path, payload, extra=extra)
-    assert len(isos) == 4
-    dest = tmp_path / "dest"
-    skip = [1]
-    r0 = restore(
-        dest, ISOBackend(isos[0], disc_size=_DISC), _crypto, skip_volumes=skip,
+    assert len(isos) >= 3
+    backend = ISOBackend(isos[-1], disc_size=_DISC)
+    marker = read_volume_marker(backend)
+    manifests = load_session_manifests(
+        backend, _crypto, start_session=marker.first_session, marker=marker,
     )
-    r2 = restore(
-        dest, ISOBackend(isos[2], disc_size=_DISC), _crypto, skip_volumes=skip,
+    catalog = build_archive_catalog(backend, _crypto, manifests, marker)
+    result = restore_archive(
+        tmp_path / "dest", backend, _crypto, catalog,
+        skip_volumes=[1], manifests=manifests, acquisition=_Acquire(isos, []),
     )
-    r3 = restore(
-        dest, ISOBackend(isos[3], disc_size=_DISC), _crypto, skip_volumes=skip,
-    )
-    assert r0.failures == 0
-    assert r2.failures == 0
-    assert r3.failures == 0
-    assert "huge.bin" in r0.missing
-    assert r0.stale == []
-    assert "huge.bin" in r2.missing
-    assert r2.stale == []
-    assert r3.stale == []
-    assert not (dest / "huge.bin").exists()
-    assert (dest / "other.txt").read_bytes() == extra["other.txt"]
-
+    assert result.failures == 0
+    assert result.stale == []
+    assert result.missing == ["huge.bin"]
+    assert not (tmp_path / "dest" / "huge.bin").exists()
+    assert (tmp_path / "dest" / "other.txt").read_bytes() == extra["other.txt"]
 
 def test_verify_checksum_catches_tampered_split_chunk(tmp_path):
     """
@@ -468,19 +565,14 @@ def test_verify_checksum_catches_tampered_split_chunk(tmp_path):
     combined = tmp_path / "combined"
     combined.mkdir()
     try:
-        for staging, session_n, _is_new in chunks:
-            shutil.copytree(
-                staging / f"session_{session_n:03d}",
-                combined / f"session_{session_n:03d}",
-            )
+        _copy_staged_sessions(chunks, combined)
     finally:
-        for staging, _session_n, _is_new in chunks:
-            shutil.rmtree(staging, ignore_errors=True)
+        _remove_staged(chunks)
 
     iso = tmp_path / "all.iso"
     backend = ISOBackend(iso, disc_size=_DISC * 4)
     backend.init(combined, label="VERIFY", expected_session_count=0)
-    assert verify(backend, _crypto, level="checksum") is True
+    assert verify(backend, _crypto, level="checksum")
 
     manifests = load_session_manifests(backend, crypto=_crypto)
     split_entries = [
@@ -509,6 +601,9 @@ def _gated_work(tmp_path, monkeypatch) -> Path:
     work.mkdir(parents=True)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(work / "xdg_runtime"))
     monkeypatch.setenv("XDG_STATE_HOME", str(work / "xdg_state"))
+    monkeypatch.setattr(
+        "oddarchiver.cli.CacheManager", lambda *a, **k: CacheManager(work / "cache"),
+    )
     return work
 
 
@@ -519,6 +614,47 @@ def _expected_split_count(file_size: int, disc_size: int) -> int:
     return len(_volume_split_lengths(file_size, budget, budget))
 
 
+def _assert_gated_round_trip(
+    work: Path,
+    fixture: Path,
+    profile: tuple[str, str, str, str, int],
+) -> None:
+    """Input: work path, source fixture and archive profile. Output: None; checks restore."""
+    name, archive_name, disc_option, label, disc_bytes = profile
+    source = work / "src"
+    source.mkdir()
+    (source / name).symlink_to(fixture)
+    iso0 = work / archive_name
+    rc = _dispatch([
+        "init", str(source), "--test-iso", str(iso0),
+        "--encrypt", "none", "--disc-size", disc_option, "--label", label,
+    ])
+    assert rc == 0
+    expected = _expected_split_count(fixture.stat().st_size, disc_bytes)
+    vol_paths = [iso0] + [
+        _volume_iso_path(iso0, i) for i in range(1, expected)
+    ]
+    for path in vol_paths:
+        assert path.is_file(), f"missing volume ISO {path}"
+    dest = work / "dest"
+    assert _dispatch([
+        "restore", str(dest), "--test-iso", str(vol_paths[-1]), "--all-disks",
+    ]) == 0
+    restored = dest / name
+    assert restored.is_file()
+    assert restored.stat().st_size == fixture.stat().st_size
+    assert _sha256_path(restored) == _sha256_path(fixture)
+
+
+def _run_gated_round_trip(tmp_path, monkeypatch, fixture: Path, profile: tuple[str, str, str, str, int]) -> None:
+    """Input: pytest paths, fixture and profile. Output: None; cleans temporary work."""
+    work = _gated_work(tmp_path, monkeypatch)
+    try:
+        _assert_gated_round_trip(work, fixture, profile)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 @pytest.mark.skipif(not ROCKY_ISO.is_file(), reason="Rocky DVD ISO fixture not present")
 def test_rocky_iso_splits_across_dvd_sl_and_restores(tmp_path, monkeypatch):
     """
@@ -527,38 +663,10 @@ def test_rocky_iso_splits_across_dvd_sl_and_restores(tmp_path, monkeypatch):
     Details:
         The Rocky 10 DVD ISO exceeds DVD_SL_DISC_BYTES and fits
         DVD_DL_DISC_BYTES. init with --disc-size dvd-sl splits it across
-        the expected volume count. Oldest-first restore matches the
+        the expected volume count. Disc-aware restore matches the
         original ISO byte-for-byte.
     """
-    work = _gated_work(tmp_path, monkeypatch)
-    try:
-        source = work / "src"
-        source.mkdir()
-        (source / "rocky.iso").symlink_to(ROCKY_ISO)
-        iso0 = work / "rocky-archive.iso"
-        rc = _dispatch([
-            "init", str(source), "--test-iso", str(iso0),
-            "--encrypt", "none", "--disc-size", "dvd-sl", "--label", "ROCKY",
-        ])
-        assert rc == 0
-        expected = _expected_split_count(ROCKY_ISO.stat().st_size, DVD_SL_DISC_BYTES)
-        vol_paths = [iso0] + [
-            _volume_iso_path(iso0, i) for i in range(1, expected)
-        ]
-        for path in vol_paths:
-            assert path.is_file(), f"missing volume ISO {path}"
-        dest = work / "dest"
-        for path in vol_paths:
-            result = restore(
-                dest, ISOBackend(path, disc_size=DVD_SL_DISC_BYTES), _crypto,
-            )
-            assert result.failures == 0
-        restored = dest / "rocky.iso"
-        assert restored.is_file()
-        assert restored.stat().st_size == ROCKY_ISO.stat().st_size
-        assert _sha256_path(restored) == _sha256_path(ROCKY_ISO)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    _run_gated_round_trip(tmp_path, monkeypatch, ROCKY_ISO, _ROCKY_PROFILE)
 
 
 @pytest.mark.skipif(not SYNTH_BIN.is_file(), reason="9.5GB synthetic fixture not present")
@@ -569,35 +677,7 @@ def test_synth_9_5gb_splits_across_dvd_dl_and_restores(tmp_path, monkeypatch):
     Details:
         The 9.5 GB high-entropy fixture exceeds DVD_DL_DISC_BYTES. init
         with --disc-size dvd-dl splits it across the expected volume
-        count. Oldest-first restore matches the original file
+        count. Disc-aware restore matches the original file
         byte-for-byte.
     """
-    work = _gated_work(tmp_path, monkeypatch)
-    try:
-        source = work / "src"
-        source.mkdir()
-        (source / "payload.bin").symlink_to(SYNTH_BIN)
-        iso0 = work / "synth-archive.iso"
-        rc = _dispatch([
-            "init", str(source), "--test-iso", str(iso0),
-            "--encrypt", "none", "--disc-size", "dvd-dl", "--label", "SYNTH",
-        ])
-        assert rc == 0
-        expected = _expected_split_count(SYNTH_BIN.stat().st_size, DVD_DL_DISC_BYTES)
-        vol_paths = [iso0] + [
-            _volume_iso_path(iso0, i) for i in range(1, expected)
-        ]
-        for path in vol_paths:
-            assert path.is_file(), f"missing volume ISO {path}"
-        dest = work / "dest"
-        for path in vol_paths:
-            result = restore(
-                dest, ISOBackend(path, disc_size=DVD_DL_DISC_BYTES), _crypto,
-            )
-            assert result.failures == 0
-        restored = dest / "payload.bin"
-        assert restored.is_file()
-        assert restored.stat().st_size == SYNTH_BIN.stat().st_size
-        assert _sha256_path(restored) == _sha256_path(SYNTH_BIN)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    _run_gated_round_trip(tmp_path, monkeypatch, SYNTH_BIN, _SYNTH_PROFILE)

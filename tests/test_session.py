@@ -10,17 +10,22 @@ Description:
 # Imports
 import hashlib
 import json
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 import oddarchiver.session as session_mod
-from oddarchiver.crypto import NullCrypto
+from oddarchiver.crypto import (
+    KeyfileCrypto, NullCrypto, PassphraseCrypto, generate_keyfile,
+)
 from oddarchiver.disc import DiscInfo
 from oddarchiver.manifest import read_manifest
+from tests.helpers import _assert_build_staging_interrupted
 
 # Globals
+logger = logging.getLogger(__name__)
 _LARGE_REMAINING = 25 * 2**30   # 25 GB - passes space check for tiny staging dirs
 
 
@@ -44,6 +49,80 @@ def _make_cache(old_bytes: bytes = b"") -> MagicMock:
     cache = MagicMock()
     cache.get_with_fallback.return_value = old_bytes
     return cache
+
+
+@pytest.mark.parametrize("mode", ["keyfile", "passphrase"])
+def test_encrypted_staging_never_writes_plaintext_manifest(tmp_path, monkeypatch, mode):
+    """
+    Input: tmp_path, monkeypatch, encryption mode
+    Output: None
+    Details: Staging and manifest patching never write a plaintext manifest.
+    """
+    from oddarchiver.cli import _patch_manifest
+
+    if mode == "keyfile":
+        key = tmp_path / "key.bin"
+        generate_keyfile(str(key))
+        crypto = KeyfileCrypto(str(key))
+    else:
+        crypto = PassphraseCrypto(passphrase="test passphrase")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "secret.txt").write_bytes(b"private content")
+    original_write_bytes = Path.write_bytes
+    plaintext_writes = []
+
+    def track_write(path, data):
+        if path.name in ("manifest.json", "manifest.json.tmp"):
+            plaintext_writes.append(path)
+        return original_write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", track_write)
+    chunks = session_mod.build_staging(
+        session_n=0, source=source, disc_state={}, disc_origin={},
+        backend=_make_backend(), cache=_make_cache(), crypto=crypto,
+        _staging_root=tmp_path / "staging",
+    )
+    staging, session_n, _ = chunks[0]
+    session_dir = staging / "session_000"
+    assert not plaintext_writes
+    assert not (session_dir / "manifest.json").exists()
+    assert (session_dir / "manifest.enc").exists()
+    manifest = _patch_manifest(
+        staging, session_n, "TEST", {"mode": mode}, crypto=crypto,
+    )
+    assert manifest.entries[0].path == "secret.txt"
+    assert not plaintext_writes
+    assert not (session_dir / "manifest.json").exists()
+    assert (session_dir / "manifest.enc").exists()
+
+
+def test_plaintext_staging_keeps_manifest_json(tmp_path):
+    """
+    Input: tmp_path
+    Output: None
+    Details: The none mode writes and patches a plaintext manifest.
+    """
+    from oddarchiver.cli import _patch_manifest
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "public.txt").write_bytes(b"public content")
+    chunks = session_mod.build_staging(
+        session_n=0, source=source, disc_state={}, disc_origin={},
+        backend=_make_backend(), cache=_make_cache(), crypto=NullCrypto(),
+        _staging_root=tmp_path / "staging",
+    )
+    staging, session_n, _ = chunks[0]
+    session_dir = staging / "session_000"
+    assert (session_dir / "manifest.json").exists()
+    assert not (session_dir / "manifest.enc").exists()
+    manifest = _patch_manifest(
+        staging, session_n, "TEST", {"mode": "none"}, crypto=NullCrypto(),
+    )
+    assert manifest.entries[0].path == "public.txt"
+    assert (session_dir / "manifest.json").exists()
+    assert not (session_dir / "manifest.enc").exists()
 
 
 def test_new_files_staged_in_full_dir(tmp_path):
@@ -76,7 +155,7 @@ def test_new_files_staged_in_full_dir(tmp_path):
         for entry in manifest.entries:
             assert (staging / entry.file).exists(), f"blob missing: {entry.file}"
         assert chunks[0][1] == 0
-        assert chunks[0][2] is False
+        assert not chunks[0][2]
     finally:
         import shutil
         shutil.rmtree(staging, ignore_errors=True)
@@ -245,6 +324,27 @@ def test_deleted_list_in_manifest(tmp_path):
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def _staged_paths(chunks: list[tuple[Path, int, bool]]) -> list[str]:
+    """
+    Input:  chunks - staged sessions
+    Output: Paths of all manifest entries in chunk order
+    """
+    staged_paths: list[str] = []
+    for staging, session_n, _is_new in chunks:
+        manifest = read_manifest(staging / f"session_{session_n:03d}" / "manifest.json")
+        staged_paths.extend(entry.path for entry in manifest.entries)
+    return staged_paths
+
+
+def _assert_new_volume_chunks(chunks: list[tuple[Path, int, bool]]) -> None:
+    """
+    Input:  chunks - staged sessions
+    Output: None
+    """
+    assert not chunks[0][2]
+    assert all(is_new for _, _, is_new in chunks[1:])
+
+
 def test_space_check_splits_when_over_remaining(tmp_path):
     """
     Input:  tmp_path
@@ -276,13 +376,9 @@ def test_space_check_splits_when_over_remaining(tmp_path):
     )
     try:
         assert len(chunks) >= 2
-        assert chunks[0][2] is False
-        assert all(is_new for _, _, is_new in chunks[1:])
+        _assert_new_volume_chunks(chunks)
         assert [n for _, n, _ in chunks] == list(range(chunks[0][1], chunks[0][1] + len(chunks)))
-        staged_paths: list[str] = []
-        for staging, session_n, _is_new in chunks:
-            manifest = read_manifest(staging / f"session_{session_n:03d}" / "manifest.json")
-            staged_paths.extend(entry.path for entry in manifest.entries)
+        staged_paths = _staged_paths(chunks)
         assert staged_paths.count("big.bin") == 1
         assert "big.bin" in staged_paths
     finally:
@@ -331,12 +427,8 @@ def test_append_merge_overhead_forces_split_even_when_raw_bytes_fit(tmp_path):
     )
     try:
         assert len(chunks) >= 2, "expected a split onto a new volume"
-        assert chunks[0][2] is False
-        assert all(is_new for _, _, is_new in chunks[1:])
-        staged_paths: list[str] = []
-        for staging, session_n, _is_new in chunks:
-            manifest = read_manifest(staging / f"session_{session_n:03d}" / "manifest.json")
-            staged_paths.extend(entry.path for entry in manifest.entries)
+        _assert_new_volume_chunks(chunks)
+        staged_paths = _staged_paths(chunks)
         assert staged_paths.count("new_big_file.bin") == 1
         # The new file must not land on chunk 0 (the nearly-full current medium).
         chunk0_staging, chunk0_session, _ = chunks[0]
@@ -399,29 +491,21 @@ def test_sigint_during_staging_cleans_up_temp_dir(tmp_path, monkeypatch):
     (tmp_path / "file.txt").write_bytes(b"content")
 
     # Simulate SIGINT arriving during the sha256 scan
-    real_sha256 = session_mod._sha256_file
+    real_hash = session_mod.hash_file
 
-    def sha256_then_signal(path: Path) -> str:
+    def hash_then_signal(path, chunk_size, digest=None):
         session_mod._sigint_received = True
-        return real_sha256(path)
+        return real_hash(path, chunk_size, digest)
 
-    monkeypatch.setattr(session_mod, "_sha256_file", sha256_then_signal)
+    monkeypatch.setattr(session_mod, "hash_file", hash_then_signal)
 
     staging_root = tmp_path / "staging"
     staging_root.mkdir()
     expected_staging = staging_root / "oddarchiver_staging_001"
 
-    with pytest.raises(KeyboardInterrupt):
-        session_mod.build_staging(
-            session_n=1,
-            source=tmp_path,
-            disc_state={},
-            disc_origin={},
-            backend=_make_backend(),
-            cache=_make_cache(),
-            crypto=NullCrypto(),
-            _staging_root=staging_root,
-        )
+    _assert_build_staging_interrupted(
+        tmp_path, _make_backend(), _make_cache(), staging_root, session_n=1,
+    )
 
     assert not expected_staging.exists(), "staging dir must be removed after SIGINT"
 

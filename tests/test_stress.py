@@ -11,6 +11,7 @@ Description:
 # Imports
 import argparse
 import hashlib
+import logging
 import os
 import shutil
 import subprocess
@@ -23,12 +24,14 @@ from oddarchiver.cli import dispatch, _run_history, _run_status
 from oddarchiver.crypto import NullCrypto, PassphraseCrypto
 from oddarchiver.delta import compute_delta, delta_or_full
 from oddarchiver.disc import ISOBackend
-from oddarchiver.manifest import read_manifest
+from oddarchiver.manifest import load_session_manifests, read_manifest
 from oddarchiver.restore import restore
 from oddarchiver.session import build_staging
 from oddarchiver.verify import verify
+from tests.helpers import _assert_staging_sigint
 
 # Globals
+logger = logging.getLogger(__name__)
 SMALL_DISC = 200 * 2**20   # 200 MiB. Enough for large-file and delta-explosion tests.
 
 
@@ -273,41 +276,55 @@ def test_5_2_staging_dir_cleanup_on_sigint(tmp_path):
     staging_root = tmp_path / "staging"
     staging_root.mkdir()
 
-    real_sha256 = session_mod._sha256_file
+    real_hash = session_mod.hash_file
 
-    def sha256_then_sigint(path: Path) -> str:
+    def hash_then_sigint(path, chunk_size, digest=None):
         session_mod._sigint_received = True
-        return real_sha256(path)
+        return real_hash(path, chunk_size, digest)
 
-    original_sha = session_mod._sha256_file
-    session_mod._sha256_file = sha256_then_sigint
-    try:
-        with pytest.raises(KeyboardInterrupt):
-            build_staging(
-                session_n=0,
-                source=source,
-                disc_state={},
-                disc_origin={},
-                backend=backend,
-                cache=cache,
-                crypto=NullCrypto(),
-                _staging_root=staging_root,
-            )
-    finally:
-        session_mod._sha256_file = original_sha
+    _assert_staging_sigint(
+        0, source, backend, cache, staging_root, hash_then_sigint, real_hash,
+    )
 
     leftover = list(staging_root.glob("oddarchiver_staging_*"))
     assert leftover == [], f"staging dirs not cleaned up: {leftover}"
 
 
-def test_6_1_wrong_passphrase_restore_raises(tmp_path):
+def _assert_wrong_passphrase_rejected(
+    backend: ISOBackend, wrong_crypto: PassphraseCrypto, caplog, tmp_path: Path,
+) -> None:
     """
-    Input:  tmp_path
+    Input:  backend - encrypted archive; wrong_crypto - incorrect decryptor;
+            caplog - captured warnings; tmp_path - destination parent
+    Output: None
+    """
+    with caplog.at_level(logging.WARNING, logger="oddarchiver.manifest"):
+        manifests = load_session_manifests(backend, wrong_crypto)
+    assert [m.suspect for m in manifests] == [True]
+    assert any(
+        "decryption failed" in rec.getMessage()
+        and "authentication error" in rec.getMessage()
+        for rec in caplog.records
+    ), "wrong passphrase must fail at manifest decryption"
+
+    dest = tmp_path / "dest"
+    restored_count, failure_count = restore(dest, backend, wrong_crypto)
+    assert failure_count > 0, "wrong passphrase must produce failures, not silent success"
+    assert restored_count == 0, "no file should be restored with wrong passphrase"
+    assert not (dest / "secret.txt").exists(), "no file must be written with wrong passphrase"
+
+
+def test_6_1_wrong_passphrase_restore_raises(tmp_path, caplog):
+    """
+    Input:  tmp_path, caplog
     Output: None
     Details:
-        Init with PassphraseCrypto("correct"), then restore with
-        PassphraseCrypto("wrong"). Assert failures greater than 0.
-        No file is written. The call does not have to raise.
+        Init with PassphraseCrypto("correct") and an encrypted manifest,
+        as production writes it. Restore with PassphraseCrypto("wrong").
+        The manifest decrypt fails with an authentication error, the
+        manifest is SUSPECT, failures are greater than 0, and no file is
+        written. The call does not have to raise. The correct passphrase
+        then restores the file, so the wrong passphrase is the only cause.
     """
     source = tmp_path / "src"
     source.mkdir()
@@ -334,16 +351,23 @@ def test_6_1_wrong_passphrase_restore_raises(tmp_path):
     staging, _, _ = chunks[0]
     try:
         from oddarchiver.cli import _patch_manifest, _encryption_block
-        _patch_manifest(staging, 0, "STRESS", _encryption_block(correct_crypto))
+        _patch_manifest(
+            staging, 0, "STRESS", _encryption_block(correct_crypto),
+            crypto=correct_crypto,
+        )
         backend.init(staging, "STRESS", expected_session_count=0)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
-    dest = tmp_path / "dest"
-    restored_count, failure_count = restore(dest, backend, wrong_crypto)
-    assert failure_count > 0, "wrong passphrase must produce failures, not silent success"
-    assert restored_count == 0, "no file should be restored with wrong passphrase"
-    assert not (dest / "secret.txt").exists(), "no file must be written with wrong passphrase"
+    session_dir = backend._sessions_root / "session_000"
+    assert (session_dir / "manifest.enc").is_file()
+    assert not (session_dir / "manifest.json").exists()
+    _assert_wrong_passphrase_rejected(backend, wrong_crypto, caplog, tmp_path)
+
+    good_dest = tmp_path / "good"
+    restored_count, failure_count = restore(good_dest, backend, correct_crypto)
+    assert (restored_count, failure_count) == (1, 0)
+    assert (good_dest / "secret.txt").read_bytes() == b"confidential data"
 
 
 def test_6_2_encrypted_storage_differs_from_plaintext(tmp_path):
@@ -379,9 +403,9 @@ def test_6_2_encrypted_storage_differs_from_plaintext(tmp_path):
     try:
         from oddarchiver.cli import _patch_manifest, _encryption_block
         from oddarchiver.manifest import read_manifest
-        manifest = read_manifest(staging / "session_000" / "manifest.json")
+        manifest = read_manifest(staging / "session_000" / "manifest.json", crypto=crypto)
         entry = manifest.entries[0]
-        _patch_manifest(staging, 0, "STRESS", _encryption_block(crypto))
+        _patch_manifest(staging, 0, "STRESS", _encryption_block(crypto), crypto=crypto)
         backend.init(staging, "STRESS", expected_session_count=0)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -389,6 +413,24 @@ def test_6_2_encrypted_storage_differs_from_plaintext(tmp_path):
     blob = backend.read_path(entry.file)
     assert blob != plaintext, "encrypted blob must not equal plaintext"
     assert plaintext not in blob, "plaintext must not appear verbatim in ciphertext"
+
+
+def _assert_history_status_counts(
+    manifest_count: int, history_out: str, status_out: str,
+) -> None:
+    """
+    Input:  manifest_count - sessions on disc; history_out, status_out - CLI output
+    Output: None
+    """
+    rows = [
+        line for line in history_out.splitlines()
+        if line and not line.startswith("Session") and not line.startswith("-")
+        and line.strip()
+    ]
+    assert len(rows) == manifest_count, (
+        f"history rows ({len(rows)}) must equal manifest count ({manifest_count})"
+    )
+    assert str(manifest_count) in status_out, "status must report correct session count"
 
 
 def test_7_1_history_status_session_count_consistent(tmp_path, capsys):
@@ -422,15 +464,7 @@ def test_7_1_history_status_session_count_consistent(tmp_path, capsys):
     _run_status(_make_args(command="status", test_iso=str(iso)))
     status_out = capsys.readouterr().out
 
-    rows = [
-        line for line in history_out.splitlines()
-        if line and not line.startswith("Session") and not line.startswith("-")
-        and line.strip()
-    ]
-    assert len(rows) == manifest_count, (
-        f"history rows ({len(rows)}) must equal manifest count ({manifest_count})"
-    )
-    assert str(manifest_count) in status_out, "status must report correct session count"
+    _assert_history_status_counts(manifest_count, history_out, status_out)
 
 
 def test_8_1_empty_directory_sync_exits_0(tmp_path):

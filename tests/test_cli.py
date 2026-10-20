@@ -55,7 +55,7 @@ def test_dry_run_and_test_iso_are_not_mutually_exclusive():
     """
     parser = build_parser()
     args = parser.parse_args(["sync", "/src", "--test-iso", "fake.iso", "--dry-run"])
-    assert args.dry_run is True
+    assert args.dry_run is True  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
     assert args.test_iso == "fake.iso"
 
 
@@ -121,7 +121,7 @@ def test_sync_flags_in_namespace():
     parser = build_parser()
     args = parser.parse_args(["sync", "/src", "--no-cache"])
     assert args.command == "sync"
-    assert args.no_cache is True
+    assert args.no_cache is True  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
 
 
 def test_restore_flags_in_namespace():
@@ -134,7 +134,7 @@ def test_restore_flags_in_namespace():
     parser = build_parser()
     args = parser.parse_args(["restore", "/dest", "--session", "3", "--force"])
     assert args.session == 3
-    assert args.force is True
+    assert args.force is True  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
 
 
 def test_verify_level_flag():
@@ -155,11 +155,12 @@ def test_read_mode_flag_defaults_and_choices():
     Input:  None
     Output: None
     Details:
-        restore and verify expose --read-mode with default sequential.
+        restore and verify leave --read-mode unset unless specified.
+        The command chooses the mode when it runs.
     """
     parser = build_parser()
-    assert parser.parse_args(["restore", "/dest"]).read_mode == "sequential"
-    assert parser.parse_args(["verify"]).read_mode == "sequential"
+    assert parser.parse_args(["restore", "/dest"]).read_mode is None
+    assert parser.parse_args(["verify"]).read_mode is None
     assert parser.parse_args(
         ["restore", "/dest", "--read-mode", "full-copy"]
     ).read_mode == "full-copy"
@@ -230,10 +231,10 @@ def test_slow_flag_on_init_and_sync_only():
         Commands that do not burn reject the flag.
     """
     parser = build_parser()
-    assert parser.parse_args(["init", "/src"]).slow is False
-    assert parser.parse_args(["init", "/src", "--slow"]).slow is True
-    assert parser.parse_args(["sync", "/src"]).slow is False
-    assert parser.parse_args(["sync", "/src", "--slow"]).slow is True
+    assert parser.parse_args(["init", "/src"]).slow is False  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+    assert parser.parse_args(["init", "/src", "--slow"]).slow is True  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+    assert parser.parse_args(["sync", "/src"]).slow is False  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+    assert parser.parse_args(["sync", "/src", "--slow"]).slow is True  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
     with pytest.raises(SystemExit):
         parser.parse_args(["verify", "--slow"])
     with pytest.raises(SystemExit):

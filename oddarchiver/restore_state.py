@@ -18,13 +18,15 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from oddarchiver.ledger import ledger_dir
 
 # Globals
-_log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+_log = logger
 
 STATE_FILENAME = ".oddarchiver_restore_state.json"
 
@@ -70,6 +72,12 @@ class RestoreState:
     volumes: dict[int, VolumeRecord] = field(default_factory=dict)
     files: dict[str, FileReplay] = field(default_factory=dict)
     deleted: dict[str, int] = field(default_factory=dict)
+    read_discs: list[int] = field(default_factory=list)
+    missing_discs: list[int] = field(default_factory=list)
+    plan_session: int | None = None
+    plan_paths: list[str] | None = None
+    done_files: dict[str, int] = field(default_factory=dict)
+    collected_entries: dict[str, dict] = field(default_factory=dict)
 
 
 # Functions
@@ -135,20 +143,26 @@ def write_restore_state(dest: Path, state: RestoreState) -> None:
                     the other half of the key
     Output: None
     Details:
-        Writes atomically. It first writes a .tmp file, then calls
-        os.replace. This matches manifest.write_manifest. The file
-        lives under ledger_dir(), not dest. See state_path().
+        Writes a private temporary file in the state directory.
+        Replaces the state file after the write completes.
     """
     path = state_path(dest, state.archive_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
     payload = json.dumps(_state_to_dict(state), indent=2).encode("utf-8")
+    tmp = None
     try:
-        tmp.write_bytes(payload)
+        fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        tmp = Path(name)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
         os.replace(tmp, path)
+        os.chmod(path, 0o600)
     except OSError:
         _log.exception("Failed to write restore-state file %s", path)
         raise
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def new_restore_state(
@@ -169,21 +183,11 @@ def new_restore_state(
     )
 
 
-def _parse_state(raw: dict) -> RestoreState:
+def _parse_volume_records(raw: dict) -> dict[int, VolumeRecord]:
     """
     Input:  raw - decoded JSON object
-    Output: RestoreState
-    Details:
-        Raises KeyError/TypeError/ValueError for a malformed field.
+    Output: volume records indexed by volume number
     """
-    session_raw = raw.get("session", None)
-    session: int | None
-    if session_raw is None:
-        session = None
-    else:
-        session = int(session_raw)
-
-    applied = [int(v) for v in raw.get("applied_volumes", [])]
     volumes: dict[int, VolumeRecord] = {}
     for item in raw.get("volumes", []):
         rec = VolumeRecord(
@@ -194,7 +198,14 @@ def _parse_state(raw: dict) -> RestoreState:
             previous_volume_label=str(item.get("previous_volume_label", "")),
         )
         volumes[rec.volume_index] = rec
+    return volumes
 
+
+def _parse_file_replays(raw: dict) -> dict[str, FileReplay]:
+    """
+    Input:  raw - decoded JSON object
+    Output: file replay records indexed by path
+    """
     files: dict[str, FileReplay] = {}
     for path, item in raw.get("files", {}).items():
         files[str(path)] = FileReplay(
@@ -210,6 +221,26 @@ def _parse_state(raw: dict) -> RestoreState:
                 if item.get("volume_chunk_count") is not None else None
             ),
         )
+    return files
+
+
+def _parse_state(raw: dict) -> RestoreState:
+    """
+    Input:  raw - decoded JSON object
+    Output: RestoreState
+    Details:
+        Raises KeyError/TypeError/ValueError for a malformed field.
+    """
+    session_raw = raw.get("session")
+    session: int | None
+    if session_raw is None:
+        session = None
+    else:
+        session = int(session_raw)
+
+    applied = [int(v) for v in raw.get("applied_volumes", [])]
+    volumes = _parse_volume_records(raw)
+    files = _parse_file_replays(raw)
 
     deleted = {str(p): int(s) for p, s in raw.get("deleted", {}).items()}
 
@@ -221,6 +252,12 @@ def _parse_state(raw: dict) -> RestoreState:
         volumes=volumes,
         files=files,
         deleted=deleted,
+        read_discs=sorted({int(v) for v in raw.get("read_discs", [])}),
+        missing_discs=sorted({int(v) for v in raw.get("missing_discs", [])}),
+        plan_session=(int(raw["plan_session"]) if raw.get("plan_session") is not None else None),
+        plan_paths=(list(map(str, raw["plan_paths"])) if raw.get("plan_paths") is not None else None),
+        done_files={str(p): int(s) for p, s in raw.get("done_files", {}).items()},
+        collected_entries={str(k): dict(v) for k, v in raw.get("collected_entries", {}).items()},
     )
 
 
@@ -258,6 +295,12 @@ def _state_to_dict(state: RestoreState) -> dict:
         "volumes": volumes,
         "files": files,
         "deleted": deleted,
+        "read_discs": state.read_discs,
+        "missing_discs": state.missing_discs,
+        "plan_session": state.plan_session,
+        "plan_paths": state.plan_paths,
+        "done_files": state.done_files,
+        "collected_entries": state.collected_entries,
     }
 
 

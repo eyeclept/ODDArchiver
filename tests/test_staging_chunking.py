@@ -11,7 +11,7 @@ Description:
     one volume, with no user interaction and no SystemExit.
 """
 # Imports
-import argparse
+import logging
 import json
 from pathlib import Path
 
@@ -22,37 +22,14 @@ from oddarchiver.cli import _run_init, _run_sync, dispatch
 from oddarchiver.crypto import NullCrypto
 from oddarchiver.disc import ISOBackend
 from oddarchiver.restore import restore
+from tests.helpers import _make_args
 
 # Globals
+logger = logging.getLogger(__name__)
 SMALL_DISC = 50 * 2**20  # 50 MiB -- plenty of disc room; only staging is tiny.
 
 
 # Functions
-
-
-def _make_args(**kwargs) -> argparse.Namespace:
-    """Return an argparse.Namespace with defaults for init/sync commands."""
-    defaults = {
-        "command": "init",
-        "source": None,
-        "dest": None,
-        "device": "/dev/sr0",
-        "test_iso": None,
-        "label": "TEST",
-        "encrypt": "none",
-        "key": None,
-        "dry_run": False,
-        "no_cache": False,
-        "disc_size": "50mb",
-        "prefill": None,
-        "session": None,
-        "force": False,
-        "level": "fast",
-        "mirror": None,
-        "recover_scan": False,
-    }
-    defaults.update(kwargs)
-    return argparse.Namespace(**defaults)
 
 
 def _shrink_staging_budget(monkeypatch, tmp_path, free_bytes: int) -> None:
@@ -228,6 +205,24 @@ def test_changeset_fitting_one_pass_is_unchanged_from_today(tmp_path, capsys):
     assert "automatic passes" not in out
 
 
+def _assert_deletion_recorded_once(iso: Path, session_count: int) -> None:
+    """
+    Input:  iso - archive path; session_count - number of recorded sessions
+    Output: None
+    """
+    deleted_counts = [
+        len(_manifest_deleted(iso, s)) for s in range(1, session_count)
+    ]
+    assert sum(deleted_counts) == 1, (
+        f"del.bin must be recorded as deleted exactly once, saw {deleted_counts}"
+    )
+    sessions_with_deletion = [
+        s for s in range(1, session_count)
+        if "del.bin" in _manifest_deleted(iso, s)
+    ]
+    assert sessions_with_deletion == [1]
+
+
 def test_chunked_sync_deletion_applies_exactly_once(tmp_path, monkeypatch):
     """
     Input:  tmp_path, monkeypatch
@@ -258,17 +253,7 @@ def test_chunked_sync_deletion_applies_exactly_once(tmp_path, monkeypatch):
     session_count = backend.mediainfo().session_count
     assert session_count >= 3  # session 0 plus 2+ automatic passes
 
-    deleted_counts = [
-        len(_manifest_deleted(iso, s)) for s in range(1, session_count)
-    ]
-    assert sum(deleted_counts) == 1, (
-        f"del.bin must be recorded as deleted exactly once, saw {deleted_counts}"
-    )
-    sessions_with_deletion = [
-        s for s in range(1, session_count)
-        if "del.bin" in _manifest_deleted(iso, s)
-    ]
-    assert sessions_with_deletion == [1]
+    _assert_deletion_recorded_once(iso, session_count)
 
     dest = tmp_path / "dest"
     result = restore(dest, backend, NullCrypto())

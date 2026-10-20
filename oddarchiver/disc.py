@@ -36,12 +36,15 @@ DVD_DL_DISC_BYTES = 8_547_991_552  # ~8.5 GB dual-layer DVD usable capacity
 # Same GiB-floor headroom as bd-r (23 GiB) and bdxl (93 GiB): floor(50_050_629_632 / 2**30).
 BD_DL_DISC_BYTES = 46 * 2**30      # 50 GB dual-layer BD-R usable headroom (~46 GiB)
 BDXL_DISC_BYTES = 93 * 2**30       # 100 GB BDXL usable headroom (~93 GiB)
+_SMALL_CONTROL_MAX_BYTES = 1024 * 1024
+_LARGE_CONTROL_MAX_BYTES = 64 * 1024 * 1024
 # Fixed, root-owned path, never the PATH of the invoking user. See
 # the module docstring of usb_reauth.py and SETUP.md for why this must
 # be a manual `sudo install` target, not something
 # `pip install -e .` creates.
 _USB_REAUTH_HELPER = "/usr/local/sbin/oddarchiver-usb-reauth"
-_log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+_log = logger
 # Text growisofs prints when the drive stops answering mid-write. Captured
 # from a real mid-burn USB unplug on a Buffalo drive writing BD-R:
 #   :-( unable to WRITE@LBA=82ac0h: Input/output error
@@ -65,6 +68,13 @@ _HW_FAULT_SIGNATURES = (
     "scsi bus reset",
     "bus device reset",
 )
+# A published ISO session directory. Only names that match this pattern
+# count as sessions. Publish temp names start with "." and never match.
+_SESSION_DIR_RE = re.compile(r"session_(\d{3})")
+# _copy_staging builds each root item under ".<name>.partial-<random>"
+# and moves a replaced tree aside as ".<name>.prior-<random>". The
+# random part comes from tempfile and has no dot.
+_PUBLISH_TEMP_RE = re.compile(r"\.(.+)\.(partial|prior)-[A-Za-z0-9_]+")
 
 
 
@@ -160,6 +170,28 @@ class BurnBackend(abc.ABC):
             not raise. A drive/medium failure raises RuntimeError.
         """
 
+    def list_session_numbers(self) -> list[int] | None:
+        """
+        Input:  None
+        Output: session numbers of the session_NNN root directories, or
+                None when the backend cannot list them
+        Details:
+            load_session_manifests uses the list to request only real
+            control files. None makes the caller probe all 1000 sessions.
+        """
+        return None
+
+    def invalidate_session_list(self) -> None:
+        """
+        Input:  None
+        Output: None
+        Details:
+            Clears any cached session listing. A burn or a disc change
+            makes the cached list stale. The base backend keeps no
+            cache, so this is a no-op here.
+        """
+        return None
+
     @abc.abstractmethod
     def read_path(self, path: str) -> bytes:
         """
@@ -182,6 +214,152 @@ class BurnBackend(abc.ABC):
             A drive/medium failure raises RuntimeError.
         """
 
+    def extract_paths(
+        self,
+        paths: Sequence[str],
+        dest_root: Path,
+        max_bytes: int | None = None,
+    ) -> int:
+        """
+        Input:  paths     - relative paths within the disc/ISO filesystem
+                dest_root - local directory that receives the files
+                max_bytes - optional cap on total bytes written
+        Output: total bytes written
+        Details:
+            Generic fallback writes each path with extract_path_to_file,
+            so a batch of blobs never sits in a dict of bytes. DiscBackend
+            and ISOBackend override this with their own batch shape.
+        """
+        written = 0
+        dest_root = Path(dest_root)
+        for path in dict.fromkeys(paths):
+            dest = dest_root / path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            fd, name = tempfile.mkstemp(
+                prefix=dest.name + ".", suffix=".tmp", dir=str(dest.parent),
+            )
+            os.close(fd)
+            tmp = Path(name)
+            try:
+                self.extract_path_to_file(path, tmp)
+            except FileNotFoundError:
+                _log.warning("Path not found on the medium: %s", path)
+                tmp.unlink(missing_ok=True)
+                continue
+            try:
+                size = tmp.stat().st_size
+                if max_bytes is not None and written + size > max_bytes:
+                    raise RuntimeError(
+                        "Not enough local space to extract archive blobs."
+                    )
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, dest)
+                written += size
+            except (OSError, RuntimeError):
+                _log.exception("Failed to extract %s to %s", path, dest)
+                tmp.unlink(missing_ok=True)
+                raise
+        return written
+
+
+
+def _retry_mediainfo_error(
+    stderr: str, attempt: int, retries: int, retry_delay: float, device: str,
+) -> bool:
+    """
+    Input:  stderr, attempt, retries, retry_delay, device
+    Output: bool - True if mediainfo should retry
+    Details:
+        Raises on CD media. Waits before retrying on "no media".
+    """
+    if "non-dvd media" in stderr.lower():
+        _log.warning("mediainfo: CD media detected on %s", device)
+        _raise_cd_unsupported()
+    if "no media" in stderr.lower() and attempt < retries:
+        print(
+            f"  Drive not ready (attempt {attempt + 1}/{retries + 1}); "
+            f"waiting {retry_delay:.0f}s for disc...",
+            flush=True,
+        )
+        time.sleep(retry_delay)
+        return True
+    return False
+
+
+def _control_file_cap(path: str) -> int | None:
+    """
+    Input:  path - relative path on the disc filesystem
+    Output: maximum control-file size, or None for blobs
+    """
+    return (
+        _SMALL_CONTROL_MAX_BYTES if path == "volume.json"
+        or path.endswith("/enc_mode.json")
+        else _LARGE_CONTROL_MAX_BYTES if path in (
+            "volume_baseline.json", "volume_baseline.enc",
+        ) or path.endswith(("/manifest.json", "/manifest.enc"))
+        else None
+    )
+
+
+def _retry_xorriso_read(
+    device: str, stderr: str, attempt: int, retries: int, retry_delay: float,
+) -> bool:
+    """
+    Input:  device, stderr, attempt, retries, retry_delay
+    Output: True if the read should be retried
+    """
+    if "no media" in stderr.lower() and attempt < retries:
+        print(
+            f"  Drive not ready (attempt {attempt + 1}/{retries + 1}); "
+            f"waiting {retry_delay:.0f}s for disc...",
+            flush=True,
+        )
+        time.sleep(retry_delay)
+        return True
+    if (
+        ("busy device" in stderr.lower() or "resource busy" in stderr.lower())
+        and attempt < retries
+    ):
+        print(
+            f"  Drive busy (attempt {attempt + 1}/{retries + 1}); "
+            "releasing an automount and retrying...",
+            flush=True,
+        )
+        subprocess.run(
+            ["udisksctl", "unmount", "-b", device],
+            capture_output=True,
+        )
+        return True
+    return False
+
+
+def _publish_extracted_paths(
+    unique_paths: list[str], scratch: Path, dest_root: Path, max_bytes: int | None,
+) -> int:
+    """
+    Input:  unique_paths - requested paths in extraction order
+            scratch - temporary extraction root
+            dest_root - final output root
+            max_bytes - optional total-byte cap
+    Output: total bytes published
+    """
+    written = 0
+    for path in unique_paths:
+        src = scratch / path
+        if not src.is_file():
+            continue
+        size = src.stat().st_size
+        if max_bytes is not None and written + size > max_bytes:
+            raise RuntimeError(
+                "Not enough local space to extract archive blobs."
+            )
+        dest = dest_root / path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(src, dest)
+        os.chmod(dest, 0o600)
+        written += size
+    return written
+
 
 class DiscBackend(BurnBackend):
     """
@@ -201,6 +379,7 @@ class DiscBackend(BurnBackend):
 
     def __init__(self, device: str) -> None:
         self.device = device
+        self._session_numbers_cache: list[int] | None = None
 
     def init(
         self,
@@ -227,6 +406,7 @@ class DiscBackend(BurnBackend):
             expected_archive_id=expected_archive_id,
             expected_volume_index=expected_volume_index,
         )
+        self.invalidate_session_list()
         cmd = [
             "growisofs", "-Z", self.device,
             "-udf", "-allow-limited-size", "-R", "-T",
@@ -283,6 +463,7 @@ class DiscBackend(BurnBackend):
             expected_archive_id=expected_archive_id,
             expected_volume_index=expected_volume_index,
         )
+        self.invalidate_session_list()
         cmd = [
             "growisofs", "-M", self.device,
             "-udf", "-allow-limited-size", "-R", "-T",
@@ -291,6 +472,23 @@ class DiscBackend(BurnBackend):
             str(staging),
         ]
         returncode, output_lines = _run_growisofs(cmd)
+        returncode, output_lines, stale_cache = self._retry_stale_append(
+            cmd, returncode, output_lines,
+        )
+        self._raise_append_failure(
+            returncode, output_lines, stale_cache, staging, expected_session_count,
+        )
+
+    def _retry_stale_append(
+        self, cmd: list[str], returncode: int, output_lines: list[str],
+    ) -> tuple[int, list[str], bool]:
+        """
+        Input:  cmd, returncode, output_lines - growisofs -M command and result
+        Output: tuple - (returncode, output_lines, stale_cache) after any retry
+        Details:
+            On the stale-cache signature, re-enumerates USB once, waits
+            for the device node, and retries growisofs once.
+        """
         stale_cache = returncode != 0 and any(
             "pread64" in ln and "primary volume descriptor" in ln
             for ln in output_lines
@@ -310,42 +508,83 @@ class DiscBackend(BurnBackend):
                 if self._wait_for_device_node():
                     print("  Device is back; retrying append...", flush=True)
                     returncode, output_lines = _run_growisofs(cmd)
+                    stale_cache = returncode != 0 and any(
+                        "pread64" in ln and "primary volume descriptor" in ln
+                        for ln in output_lines
+                    )
                 else:
                     _log.warning(
                         "%s did not reappear within the wait budget after "
                         "USB re-enumeration; not retrying growisofs",
                         self.device,
                     )
-        if returncode != 0:
-            if stale_cache:
-                raise RuntimeError(
-                    f"growisofs -M could not read the existing session(s) back "
-                    f"from {self.device} before appending, and automatic "
-                    "recovery did not clear it. This is a stale kernel "
-                    "block-device cache, not disc corruption: nothing signals "
-                    "a media-change event to the kernel after an in-place "
-                    "burn, so growisofs's own read of the prior session fails "
-                    "even though the drive and disc are fine. Do NOT follow "
-                    "growisofs's own '-Z' suggestion in the output above -- "
-                    "that option re-initializes the disc and would overwrite "
-                    "the existing archive. Either the oddarchiver-usb-reauth "
-                    "sudoers entry is not set up (see SETUP.md) or it failed "
-                    "-- check the warning logged above it. Physically eject "
-                    "and reinsert the disc (or reboot), then retry this sync."
-                )
-            if _is_disconnect(output_lines, self.device):
-                _log.warning(
-                    "%s: %s vanished mid-write; treating as disconnect",
-                    "init" if False else "append", self.device,
-                )
-                _raise_disconnected(self.device, _session_n_from_staging(staging))
-            self._raise_if_interrupted(
-                returncode, output_lines, staging, expected_session_count,
+        return returncode, output_lines, stale_cache
+
+    def _raise_append_failure(
+        self, returncode: int, output_lines: list[str], stale_cache: bool,
+        staging: Path, expected_session_count: int,
+    ) -> None:
+        """
+        Input:  returncode, output_lines, stale_cache, staging,
+                expected_session_count
+        Output: None
+        Details:
+            Raises the diagnosed error for a failed growisofs -M run.
+            Returns without raising when returncode is 0.
+        """
+        if returncode == 0:
+            return
+        if stale_cache:
+            raise RuntimeError(
+                f"growisofs -M could not read the existing session(s) back "
+                f"from {self.device} before appending, and automatic "
+                "recovery did not clear it. This is a stale kernel "
+                "block-device cache, not disc corruption: nothing signals "
+                "a media-change event to the kernel after an in-place "
+                "burn, so growisofs's own read of the prior session fails "
+                "even though the drive and disc are fine. Do NOT follow "
+                "growisofs's own '-Z' suggestion in the output above -- "
+                "that option re-initializes the disc and would overwrite "
+                "the existing archive. Either the oddarchiver-usb-reauth "
+                "sudoers entry is not set up (see SETUP.md) or it failed "
+                "-- check the warning logged above it. Physically eject "
+                "and reinsert the disc (or reboot), then retry this sync."
             )
-            self._raise_if_disc_full(
-                output_lines, staging, expected_session_count, is_init=False,
+        if _is_disconnect(output_lines, self.device):
+            _log.warning(
+                "%s: %s vanished mid-write; treating as disconnect",
+                "init" if False else "append", self.device,
             )
-            raise RuntimeError(f"growisofs -M failed with exit code {returncode}")
+            _raise_disconnected(self.device, _session_n_from_staging(staging))
+        self._raise_if_interrupted(
+            returncode, output_lines, staging, expected_session_count,
+        )
+        self._raise_if_disc_full(
+            output_lines, staging, expected_session_count, is_init=False,
+        )
+        raise RuntimeError(f"growisofs -M failed with exit code {returncode}")
+
+    def _prior_session_clause(self, attempted: int) -> tuple[bool, str]:
+        """
+        Input:  attempted - session number that just failed to burn
+        Output: tuple - (prior_ok, prior_clause) for the error message
+        Details:
+            Re-verifies prior sessions once and words the result.
+        """
+        prior_ok = self._reverify_prior_sessions(attempted)
+        if attempted <= 0:
+            prior_clause = "no prior sessions to re-verify"
+        elif prior_ok:
+            prior_clause = (
+                f"sessions 000-{attempted - 1:03d} re-verified readable"
+            )
+        else:
+            prior_clause = (
+                f"sessions 000-{attempted - 1:03d} could NOT be re-verified "
+                "- do not retry blindly; run 'oddarchiver verify --level fast' "
+                "first"
+            )
+        return prior_ok, prior_clause
 
     def _raise_if_interrupted(
         self,
@@ -373,19 +612,7 @@ class DiscBackend(BurnBackend):
         attempted = _session_n_from_staging(staging)
         if attempted is None:
             attempted = expected_session_count
-        prior_ok = self._reverify_prior_sessions(attempted)
-        if attempted <= 0:
-            prior_clause = "no prior sessions to re-verify"
-        elif prior_ok:
-            prior_clause = (
-                f"sessions 000-{attempted - 1:03d} re-verified readable"
-            )
-        else:
-            prior_clause = (
-                f"sessions 000-{attempted - 1:03d} could NOT be re-verified "
-                "- do not retry blindly; run 'oddarchiver verify --level fast' "
-                "first"
-            )
+        prior_ok, prior_clause = self._prior_session_clause(attempted)
         joiner = "; " if prior_ok or attempted <= 0 else " and "
         raise BurnInterrupted(
             f"burn for session {attempted:03d} failed (exit {returncode})"
@@ -428,19 +655,7 @@ class DiscBackend(BurnBackend):
         attempted = _session_n_from_staging(staging)
         if attempted is None:
             attempted = expected_session_count
-        prior_ok = self._reverify_prior_sessions(attempted)
-        if attempted <= 0:
-            prior_clause = "no prior sessions to re-verify"
-        elif prior_ok:
-            prior_clause = (
-                f"sessions 000-{attempted - 1:03d} re-verified readable"
-            )
-        else:
-            prior_clause = (
-                f"sessions 000-{attempted - 1:03d} could NOT be re-verified "
-                "- do not retry blindly; run 'oddarchiver verify --level fast' "
-                "first"
-            )
+        prior_ok, prior_clause = self._prior_session_clause(attempted)
         if prior_ok or attempted <= 0:
             retry = (
                 "Run 'oddarchiver verify --level fast', then retry the "
@@ -456,6 +671,34 @@ class DiscBackend(BurnBackend):
             f"{retry}"
         )
 
+    def _reverify_session(self, s: int) -> bool:
+        """
+        Input:  s - prior session number
+        Output: bool - True if manifest.enc or manifest.json reads back
+        Details:
+            Tries manifest.enc first; a successful read skips manifest.json.
+        """
+        for disc_path in (
+            f"session_{s:03d}/manifest.enc",
+            f"session_{s:03d}/manifest.json",
+        ):
+            try:
+                self.read_path(disc_path)
+                return True
+            except FileNotFoundError:
+                _log.warning(
+                    "re-verify: %s not present for session %03d",
+                    disc_path, s,
+                )
+                continue
+            except Exception:
+                _log.exception(
+                    "re-verify: failed reading %s for session %03d",
+                    disc_path, s,
+                )
+                return False
+        return False
+
     def _reverify_prior_sessions(self, attempted_session: int) -> bool:
         """
         Input:  attempted_session - session number that just failed to burn
@@ -468,28 +711,7 @@ class DiscBackend(BurnBackend):
         if attempted_session <= 0:
             return True
         for s in range(attempted_session):
-            found = False
-            for disc_path in (
-                f"session_{s:03d}/manifest.enc",
-                f"session_{s:03d}/manifest.json",
-            ):
-                try:
-                    self.read_path(disc_path)
-                    found = True
-                    break
-                except FileNotFoundError:
-                    _log.warning(
-                        "re-verify: %s not present for session %03d",
-                        disc_path, s,
-                    )
-                    continue
-                except Exception:
-                    _log.exception(
-                        "re-verify: failed reading %s for session %03d",
-                        disc_path, s,
-                    )
-                    return False
-            if not found:
+            if not self._reverify_session(s):
                 return False
         return True
 
@@ -554,6 +776,25 @@ class DiscBackend(BurnBackend):
             time.sleep(retry_delay)
         return Path(self.device).exists()
 
+    def _read_label(self) -> str:
+        """
+        Input:  None
+        Output: str - ISO volume identifier from the device, or ""
+        Details:
+            Reads the primary volume descriptor from the device node.
+            An unreadable or invalid descriptor gives an empty label.
+        """
+        try:
+            fd = os.open(self.device, os.O_RDONLY)
+            try:
+                descriptor = os.pread(fd, 2048, 32768)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            _log.warning("Cannot read the disc volume label from %s: %s", self.device, exc)
+            return ""
+        return _pvd_label(descriptor)
+
     def mediainfo(self, retries: int = 6, retry_delay: float = 5.0) -> DiscInfo:
         """
         Input:  retries     - number of extra attempts if the drive reports no media
@@ -561,6 +802,7 @@ class DiscBackend(BurnBackend):
         Output: DiscInfo
         Details:
             Runs dvd+rw-mediainfo and parses session count and capacity.
+            Reads the label from the primary volume descriptor.
             Retries when the drive reports "no media". That happens right
             after a burn while the drive reloads the tray (often 5 to 30
             seconds).
@@ -588,21 +830,92 @@ class DiscBackend(BurnBackend):
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
             if result.returncode == 0:
                 stdout = result.stdout.decode("utf-8", errors="replace")
-                return _parse_mediainfo(stdout)
+                info = _parse_mediainfo(stdout)
+                info.label = self._read_label()
+                return info
             last_err = stderr
-            if "non-dvd media" in stderr.lower():
-                _log.warning("mediainfo: CD media detected on %s", self.device)
-                _raise_cd_unsupported()
-            if "no media" in stderr.lower() and attempt < retries:
-                print(
-                    f"  Drive not ready (attempt {attempt + 1}/{retries + 1}); "
-                    f"waiting {retry_delay:.0f}s for disc...",
-                    flush=True,
-                )
-                time.sleep(retry_delay)
-            else:
+            if not _retry_mediainfo_error(
+                stderr, attempt, retries, retry_delay, self.device,
+            ):
                 break
         raise RuntimeError(f"dvd+rw-mediainfo failed: {last_err}")
+
+    def list_session_numbers(self) -> list[int]:
+        """
+        Input:  None
+        Output: session numbers in the disc root
+        Details:
+            One `xorriso -ls /` call lists the root names without
+            extracting files. xorriso quotes each name. The result is
+            cached on the backend so one command pays for one listing.
+            A burn or a disc change calls invalidate_session_list().
+            A failure retries once, then raises RuntimeError. This
+            backend never falls back to probing 3000 control paths.
+        """
+        if self._session_numbers_cache is not None:
+            return list(self._session_numbers_cache)
+        last_err = ""
+        for _attempt in range(2):
+            result = subprocess.run(
+                ["xorriso", "-indev", self.device, "-ls", "/"],
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                entries = result.stdout.decode("utf-8", errors="replace").splitlines()
+                numbers = sorted(
+                    int(match.group(1))
+                    for line in entries
+                    if (match := re.fullmatch(r"'session_(\d{3})'", line.strip()))
+                )
+                self._session_numbers_cache = numbers
+                return numbers
+            last_err = result.stderr.decode("utf-8", errors="replace").strip()
+            _log.warning(
+                "Cannot list sessions on %s (attempt %d): %s",
+                self.device, _attempt + 1, last_err,
+            )
+        raise RuntimeError(
+            f"Cannot list sessions on {self.device} after 2 attempts: {last_err}"
+        )
+
+    def invalidate_session_list(self) -> None:
+        """
+        Input:  None
+        Output: None
+        Details: Clears the cached root listing so the next call lists fresh.
+        """
+        self._session_numbers_cache = None
+
+    def _read_xorriso_attempt(
+        self, unique_paths: list[str],
+    ) -> tuple[dict[str, bytes], str, bool]:
+        """
+        Input:  unique_paths - validated disc paths to extract
+        Output: found bytes, xorriso stderr, and whether reading is complete
+        """
+        with tempfile.TemporaryDirectory(prefix="oddarchiver_read_") as tmp:
+            tmp_path = Path(tmp)
+            dests: list[tuple[str, Path]] = []
+            cmd = [
+                "xorriso", "-indev", self.device,
+                "-osirrox", "on",
+                "-abort_on", "NEVER",
+            ]
+            for i, path in enumerate(unique_paths):
+                dest = tmp_path / f"{i:04d}"
+                cmd.extend(["-extract", "/" + path, str(dest)])
+                dests.append((path, dest))
+            result = subprocess.run(cmd, capture_output=True)
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            found: dict[str, bytes] = {}
+            for path, dest in dests:
+                if dest.is_file():
+                    size = dest.stat().st_size
+                    cap = _control_file_cap(path)
+                    if cap is not None and size > cap:
+                        raise RuntimeError(f"Control file exceeds size limit: {path}")
+                    found[path] = dest.read_bytes()
+            return found, stderr, bool(found) or "Cannot determine attributes of" in stderr
 
     def read_paths(
         self,
@@ -640,54 +953,14 @@ class DiscBackend(BurnBackend):
 
         last_err = ""
         for attempt in range(retries + 1):
-            with tempfile.TemporaryDirectory(prefix="oddarchiver_read_") as tmp:
-                tmp_path = Path(tmp)
-                dests: list[tuple[str, Path]] = []
-                cmd = [
-                    "xorriso", "-indev", self.device,
-                    "-osirrox", "on",
-                    "-abort_on", "NEVER",
-                ]
-                for i, path in enumerate(unique_paths):
-                    dest = tmp_path / f"{i:04d}"
-                    cmd.extend(["-extract", "/" + path, str(dest)])
-                    dests.append((path, dest))
-                result = subprocess.run(cmd, capture_output=True)
-                stderr = result.stderr.decode("utf-8", errors="replace")
-                found = {
-                    path: dest.read_bytes()
-                    for path, dest in dests
-                    if dest.exists() and dest.is_file()
-                }
-                if found:
-                    return found
-                if "Cannot determine attributes of" in stderr:
-                    return {}
+            found, stderr, complete = self._read_xorriso_attempt(unique_paths)
+            if complete:
+                return found
             last_err = next(
                 (line for line in reversed(stderr.strip().splitlines()) if line.strip()),
                 "unknown xorriso failure",
             )
-            if "no media" in stderr.lower() and attempt < retries:
-                print(
-                    f"  Drive not ready (attempt {attempt + 1}/{retries + 1}); "
-                    f"waiting {retry_delay:.0f}s for disc...",
-                    flush=True,
-                )
-                time.sleep(retry_delay)
-            elif (
-                ("busy device" in stderr.lower() or "resource busy" in stderr.lower())
-                and attempt < retries
-            ):
-                print(
-                    f"  Drive busy (attempt {attempt + 1}/{retries + 1}); "
-                    "releasing an automount and retrying...",
-                    flush=True,
-                )
-                subprocess.run(
-                    ["udisksctl", "unmount", "-b", self.device],
-                    capture_output=True,
-                )
-            else:
+            if not _retry_xorriso_read(self.device, stderr, attempt, retries, retry_delay):
                 break
         raise RuntimeError(
             f"Failed to read {len(unique_paths)} path(s) from {self.device} "
@@ -709,6 +982,30 @@ class DiscBackend(BurnBackend):
             raise FileNotFoundError(f"Path not found on disc: {path!r}")
         return found[path]
 
+    def _extract_xorriso_attempt(self, path: str, dest: Path) -> tuple[bool, str]:
+        """
+        Input:  path - relative path on the disc filesystem
+                dest - destination file path
+        Output: whether dest was extracted, and xorriso stderr
+        """
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            _log.exception("Could not remove stale extract dest %s", dest)
+        cmd = [
+            "xorriso", "-indev", self.device,
+            "-osirrox", "on",
+            "-abort_on", "NEVER",
+            "-extract", "/" + path, str(dest),
+        ]
+        result = subprocess.run(cmd, capture_output=True)
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        if dest.exists() and dest.is_file():
+            return True, stderr
+        if "Cannot determine attributes of" in stderr:
+            raise FileNotFoundError(f"Path not found on disc: {path!r}")
+        return False, stderr
+
     def extract_path_to_file(
         self, path: str, dest: Path, retries: int = 6, retry_delay: float = 5.0,
     ) -> None:
@@ -728,52 +1025,147 @@ class DiscBackend(BurnBackend):
         validate_disc_read_path(path)
         last_err = ""
         for attempt in range(retries + 1):
-            try:
-                dest.unlink(missing_ok=True)
-            except OSError:
-                _log.exception("Could not remove stale extract dest %s", dest)
-            cmd = [
-                "xorriso", "-indev", self.device,
-                "-osirrox", "on",
-                "-abort_on", "NEVER",
-                "-extract", "/" + path, str(dest),
-            ]
-            result = subprocess.run(cmd, capture_output=True)
-            stderr = result.stderr.decode("utf-8", errors="replace")
-            if dest.exists() and dest.is_file():
+            extracted, stderr = self._extract_xorriso_attempt(path, dest)
+            if extracted:
                 return
-            if "Cannot determine attributes of" in stderr:
-                raise FileNotFoundError(f"Path not found on disc: {path!r}")
             last_err = next(
                 (line for line in reversed(stderr.strip().splitlines()) if line.strip()),
                 "unknown xorriso failure",
             )
-            if "no media" in stderr.lower() and attempt < retries:
-                print(
-                    f"  Drive not ready (attempt {attempt + 1}/{retries + 1}); "
-                    f"waiting {retry_delay:.0f}s for disc...",
-                    flush=True,
-                )
-                time.sleep(retry_delay)
-            elif (
-                ("busy device" in stderr.lower() or "resource busy" in stderr.lower())
-                and attempt < retries
-            ):
-                print(
-                    f"  Drive busy (attempt {attempt + 1}/{retries + 1}); "
-                    "releasing an automount and retrying...",
-                    flush=True,
-                )
-                subprocess.run(
-                    ["udisksctl", "unmount", "-b", self.device],
-                    capture_output=True,
-                )
-            else:
+            if not _retry_xorriso_read(self.device, stderr, attempt, retries, retry_delay):
                 break
         raise RuntimeError(
             f"Failed to read 1 path(s) from {self.device} "
             f"via xorriso: {last_err}"
         )
+
+    def _paths_within_disc_budget(
+        self, unique_paths: list[str], max_bytes: int,
+    ) -> list[str]:
+        """
+        Input:  unique_paths - requested paths in extraction order
+                max_bytes - maximum total listed bytes
+        Output: listed paths that fit the budget
+        """
+        cmd = [
+            "xorriso", "-indev", self.device,
+            "-find", "/", "-type", "f", "-exec", "report_lba", "--",
+        ]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            error = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Cannot list disc file sizes: {error}")
+        sizes: dict[str, int] = {}
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            match = re.fullmatch(
+                r"File data lba:\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,"
+                r"\s*(\d+)\s*,\s*'(/[^']+)'", line,
+            )
+            if match:
+                sizes[match.group(2)[1:]] = int(match.group(1))
+        written = 0
+        for path in unique_paths:
+            size = sizes.get(path)
+            if size is None:
+                continue
+            if written + size > max_bytes:
+                raise RuntimeError("Not enough local space to extract archive blobs.")
+            written += size
+        return [path for path in unique_paths if path in sizes]
+
+    def extract_paths(
+        self,
+        paths: Sequence[str],
+        dest_root: Path,
+        max_bytes: int | None = None,
+        retries: int = 6,
+        retry_delay: float = 5.0,
+    ) -> int:
+        """
+        Input:  paths     - relative paths on the disc filesystem
+                dest_root - local directory that receives the files
+                max_bytes - optional cap on total bytes written
+                retries, retry_delay - drive-not-ready policy
+        Output: total bytes written
+        Details:
+            When max_bytes is set, one xorriso listing checks the real
+            file sizes before extraction. A batch above the cap is
+            refused before the backend writes a scratch file.
+        """
+        from oddarchiver.manifest import validate_disc_read_path
+
+        unique_paths = list(dict.fromkeys(paths))
+        for path in unique_paths:
+            validate_disc_read_path(path)
+        if not unique_paths:
+            return 0
+        if max_bytes is not None:
+            unique_paths = self._paths_within_disc_budget(unique_paths, max_bytes)
+            if not unique_paths:
+                return 0
+        dest_root = Path(dest_root)
+        dest_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="oddarchiver_extract_", dir=str(dest_root),
+        ) as scratch_name:
+            scratch = Path(scratch_name)
+            self._xorriso_extract_all(unique_paths, scratch, retries, retry_delay)
+            return _publish_extracted_paths(unique_paths, scratch, dest_root, max_bytes)
+
+    def _xorriso_extract_attempt(
+        self, paths: list[str], scratch: Path,
+    ) -> tuple[bool, str]:
+        """
+        Input: paths and scratch root
+        Output: whether extraction is complete and xorriso stderr
+        """
+        dests: list[tuple[str, Path]] = []
+        cmd = [
+            "xorriso", "-indev", self.device,
+            "-osirrox", "on",
+            "-abort_on", "NEVER",
+        ]
+        for path in paths:
+            dest = scratch / path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            cmd.extend(["-extract", "/" + path, str(dest)])
+            dests.append((path, dest))
+        result = subprocess.run(cmd, capture_output=True)
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        if any(dest.is_file() for _path, dest in dests):
+            return True, stderr
+        if "Cannot determine attributes of" in stderr:
+            return True, stderr
+        return False, stderr
+
+    def _xorriso_extract_all(
+        self,
+        paths: list[str],
+        scratch: Path,
+        retries: int,
+        retry_delay: float,
+    ) -> None:
+        """
+        Input: disc paths, scratch root, retry policy
+        Output: None
+        Details: One xorriso call for the whole batch. Missing paths stay absent.
+        """
+        last_err = ""
+        for attempt in range(retries + 1):
+            complete, stderr = self._xorriso_extract_attempt(paths, scratch)
+            if complete:
+                return
+            last_err = next(
+                (line for line in reversed(stderr.strip().splitlines()) if line.strip()),
+                "unknown xorriso failure",
+            )
+            if not _retry_xorriso_read(self.device, stderr, attempt, retries, retry_delay):
+                break
+        raise RuntimeError(
+            f"Failed to read {len(paths)} path(s) from {self.device} "
+            f"via xorriso: {last_err}"
+        )
+
 
     def _guard(
         self,
@@ -828,6 +1220,66 @@ class DiscBackend(BurnBackend):
             )
 
 
+def _recover_publish_item(
+    entry: Path, match: re.Match[str], sessions_root: Path,
+) -> None:
+    """
+    Input: interrupted publish entry, match, and sessions root
+    Output: None
+    """
+    from oddarchiver.session import remove_tree
+
+    target = sessions_root / match.group(1)
+    is_tree = entry.is_dir() and not entry.is_symlink()
+    if match.group(2) == "prior" and is_tree and not os.path.lexists(target):
+        _log.warning(
+            "Restoring %s from interrupted ISO publish item %s",
+            target, entry,
+        )
+        os.replace(entry, target)
+        return
+    _log.warning("Removing stale ISO publish item %s", entry)
+    if is_tree:
+        if not remove_tree(entry, "stale ISO publish directory"):
+            raise RuntimeError(
+                f"Cannot remove stale ISO publish directory: {entry}"
+            )
+    else:
+        entry.unlink()
+
+
+def _copy_iso_blob(src: Path, dest: Path, size: int, path: str) -> None:
+    """
+    Input:  src  - source blob in the ISO sessions tree
+            dest - destination file path
+            size - expected source size in bytes
+            path - relative disc path, for logging
+    Output: None (writes dest atomically with mode 0600)
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=dest.name + ".", suffix=".tmp", dir=str(dest.parent),
+    )
+    tmp = Path(name)
+    owned = True
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as outf, src.open("rb") as inf:
+            owned = False
+            shutil.copyfileobj(inf, outf)
+        if tmp.stat().st_size != size:
+            raise RuntimeError(f"Extracted blob size differs: {tmp}")
+        os.replace(tmp, dest)
+        os.chmod(dest, 0o600)
+    except (OSError, RuntimeError):
+        _log.exception("Failed to extract %s to %s", path, dest)
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        if owned:
+            os.close(fd)
+
+
 class ISOBackend(BurnBackend):
     """
     Input:  iso_path  - filesystem path for the ISO file
@@ -838,7 +1290,10 @@ class ISOBackend(BurnBackend):
         Sessions accumulate in a sibling directory that replaces the .iso
         suffix with .d. The backend rebuilds the ISO from that tree on
         every write. read_paths()/read_path() read from that directory.
-        The code needs no loop mount.
+        The code needs no loop mount. _copy_staging publishes each
+        session with one directory rename, so a killed write leaves no
+        partial session_NNN directory. The next write removes the
+        leftover temp directories.
     """
 
     DEFAULT_DISC_BYTES = 23 * 2**30   # 23 GiB (~25 GB BD-R usable headroom)
@@ -852,6 +1307,7 @@ class ISOBackend(BurnBackend):
         self._meta_path = self.iso_path.with_name(
             self.iso_path.name + self._META_SUFFIX
         )
+        self._session_numbers_cache: list[int] | None = None
 
     # --- public interface ---
 
@@ -868,16 +1324,20 @@ class ISOBackend(BurnBackend):
                 expected_archive_id, expected_volume_index
         Output: None
         Details:
-            Copies staging contents into sessions_root and builds a new UDF ISO.
+            Removes leftover publish temp items, then copies staging
+            contents into sessions_root and builds a new UDF ISO.
         """
+        self._recover_interrupted_publish()
         self._guard(
             expected_session_count,
             expected_archive_id=expected_archive_id,
             expected_volume_index=expected_volume_index,
         )
+        self.invalidate_session_list()
         self._sessions_root.mkdir(parents=True, exist_ok=True)
         _copy_staging(staging, self._sessions_root)
         self._build_iso(label)
+        self.invalidate_session_list()
 
     def append(
         self,
@@ -892,16 +1352,20 @@ class ISOBackend(BurnBackend):
                 expected_archive_id, expected_volume_index
         Output: None
         Details:
-            Adds a new session to sessions_root and rebuilds the ISO from all sessions.
+            Removes leftover publish temp items, then adds a new session
+            to sessions_root and rebuilds the ISO from all sessions.
         """
+        self._recover_interrupted_publish()
         self._guard(
             expected_session_count,
             expected_archive_id=expected_archive_id,
             expected_volume_index=expected_volume_index,
         )
+        self.invalidate_session_list()
         self._sessions_root.mkdir(parents=True, exist_ok=True)
         _copy_staging(staging, self._sessions_root)
         self._build_iso(label)
+        self.invalidate_session_list()
 
     def prefill(self, prefill_bytes: int) -> None:
         """
@@ -919,8 +1383,10 @@ class ISOBackend(BurnBackend):
         Input:  None
         Output: DiscInfo
         Details:
-            Counts session_* directories in sessions_root, measures ISO size,
-            adds prefill_bytes from metadata, and computes remaining capacity.
+            Counts session_NNN directories in sessions_root, measures ISO
+            size, adds prefill_bytes from metadata, and computes remaining
+            capacity. Publish temp directories do not match session_NNN,
+            so they do not count.
         """
         if not self._sessions_root.exists():
             return DiscInfo(
@@ -929,19 +1395,44 @@ class ISOBackend(BurnBackend):
                 used_bytes=0,
                 label="",
             )
-        sessions = sorted(self._sessions_root.glob("session_*"))
-        session_count = len(sessions)
+        numbers = self._scan_session_numbers()
+        session_count = len(numbers)
         iso_bytes = self.iso_path.stat().st_size if self.iso_path.exists() else 0
         prefill_bytes = self._read_prefill()
         used_bytes = iso_bytes + prefill_bytes
         remaining_bytes = max(0, self.disc_size - used_bytes)
-        label = self._read_label(sessions)
+        label = self._read_label(
+            [self._sessions_root / f"session_{n:03d}" for n in numbers]
+        )
         return DiscInfo(
             session_count=session_count,
             remaining_bytes=remaining_bytes,
             used_bytes=used_bytes,
             label=label,
         )
+
+    def list_session_numbers(self) -> list[int]:
+        """
+        Input:  None
+        Output: session numbers in the ISO staging root
+        Details:
+            Lists only root directories, without reading file contents.
+            The result is cached so one command lists once. A burn
+            clears the cache.
+        """
+        if self._session_numbers_cache is not None:
+            return list(self._session_numbers_cache)
+        numbers = self._scan_session_numbers()
+        self._session_numbers_cache = numbers
+        return numbers
+
+    def invalidate_session_list(self) -> None:
+        """
+        Input:  None
+        Output: None
+        Details: Clears the cached session tree listing after a write.
+        """
+        self._session_numbers_cache = None
 
     def read_paths(self, paths: Sequence[str]) -> dict[str, bytes]:
         """
@@ -959,6 +1450,10 @@ class ISOBackend(BurnBackend):
             validate_disc_read_path(path)
             target = self._sessions_root / path
             if target.is_file():
+                size = target.stat().st_size
+                cap = _control_file_cap(path)
+                if cap is not None and size > cap:
+                    raise RuntimeError(f"Control file exceeds size limit: {path}")
                 found[path] = target.read_bytes()
         return found
 
@@ -994,7 +1489,80 @@ class ISOBackend(BurnBackend):
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
 
+    def extract_paths(
+        self,
+        paths: Sequence[str],
+        dest_root: Path,
+        max_bytes: int | None = None,
+    ) -> int:
+        """
+        Input:  paths     - relative paths within the disc filesystem
+                dest_root - local directory that receives the files
+                max_bytes - optional cap on total bytes written
+        Output: total bytes written
+        Details:
+            Copy from sessions_root. Check the source size before the copy
+            so an understated manifest cannot pass the budget.
+        """
+        from oddarchiver.manifest import validate_disc_read_path
+
+        written = 0
+        dest_root = Path(dest_root)
+        for path in dict.fromkeys(paths):
+            validate_disc_read_path(path)
+            src = self._sessions_root / path
+            if not src.is_file():
+                continue
+            size = src.stat().st_size
+            if max_bytes is not None and written + size > max_bytes:
+                raise RuntimeError(
+                    "Not enough local space to extract archive blobs."
+                )
+            _copy_iso_blob(src, dest_root / path, size, path)
+            written += size
+        return written
+
+
     # --- private helpers ---
+
+    def _scan_session_numbers(self) -> list[int]:
+        """
+        Input:  None
+        Output: sorted session numbers of the session_NNN directories
+        Details:
+            Lists the sessions_root directory with no cache. Only
+            directories whose full name matches session_NNN count.
+        """
+        if not self._sessions_root.exists():
+            return []
+        return sorted(
+            int(match.group(1))
+            for entry in self._sessions_root.iterdir() if entry.is_dir()
+            if (match := _SESSION_DIR_RE.fullmatch(entry.name))
+        )
+
+    def _recover_interrupted_publish(self) -> None:
+        """
+        Input:  None
+        Output: None
+        Details:
+            Runs at the start of each write. A killed _copy_staging can
+            leave ".<name>.partial-*" temp items and, during a swap, a
+            ".<name>.prior-*" directory. This function removes each
+            partial item. When <name> is missing, it moves the prior
+            directory back to <name>. Otherwise it removes the prior
+            directory. Each action logs a warning. A failed removal
+            raises RuntimeError, so the leftover never goes into the ISO.
+        """
+
+        if not self._sessions_root.is_dir():
+            return
+        for entry in sorted(self._sessions_root.iterdir()):
+            match = _PUBLISH_TEMP_RE.fullmatch(entry.name)
+            if match is None:
+                continue
+            _recover_publish_item(entry, match, self._sessions_root)
+        self.invalidate_session_list()
 
     def _guard(
         self,
@@ -1091,17 +1659,42 @@ class ISOBackend(BurnBackend):
 
     def _read_label(self, sessions: list[Path]) -> str:
         """
-        Input:  sessions - sorted list of session_NNN directories
-        Output: str - label from the first readable manifest.json, or ""
+        Input:  sessions - sorted list of session_NNN directories (unused)
+        Output: str - ISO volume identifier from the image, or ""
+        Details:
+            Reads the volume identifier from the primary volume
+            descriptor at offset 32768 + 40 (32 bytes). The label lives
+            in the image, not in a plaintext manifest.json, so an
+            encrypted archive still shows its label. No image yet is ""
+            and a short or unreadable image logs a warning and returns "".
         """
-        for session_dir in sessions:
-            manifest = session_dir / "manifest.json"
-            if manifest.exists():
-                try:
-                    return json.loads(manifest.read_text()).get("label", "")
-                except (json.JSONDecodeError, OSError):
-                    pass
+        if not self.iso_path.exists():
+            return ""
+        try:
+            with self.iso_path.open("rb") as handle:
+                handle.seek(32768)
+                descriptor = handle.read(2048)
+        except OSError as exc:
+            _log.warning("Cannot read the ISO volume label from %s: %s", self.iso_path, exc)
+            return ""
+        return _pvd_label(descriptor)
+
+
+def _pvd_label(descriptor: bytes) -> str:
+    """
+    Input:  descriptor - 2048-byte ISO9660 primary volume descriptor
+    Output: str - ASCII volume identifier, or "" for invalid data
+    Details:
+        Checks the descriptor type and identifier before reading the label.
+    """
+    if len(descriptor) != 2048 or descriptor[0] != 1 or descriptor[1:6] != b"CD001":
+        _log.warning("Cannot read ISO volume label: invalid primary volume descriptor")
         return ""
+    raw = descriptor[40:72]
+    if not raw.isascii():
+        _log.warning("Cannot read ISO volume label: non-ASCII volume identifier")
+        return ""
+    return raw.decode("ascii").strip()
 
 
 # --- module-level helpers ---
@@ -1167,6 +1760,57 @@ _XORRISO_PROFILE_HEX_RE = re.compile(r"\(([0-9A-Fa-f]{4})h\)")
 
 
 
+def _display_burn_progress(line: str) -> bool:
+    """
+    Input: output line
+    Output: whether the line was rendered as progress
+    """
+    from oddarchiver.session import _print_bar
+
+    progress = _GROWISOFS_PROGRESS_RE.search(line)
+    if progress:
+        written, total, pct, speed, mins, secs = progress.groups()
+        _print_bar(
+            int(written), int(total),
+            suffix=f"{pct}% @{speed}, {mins}:{secs} remaining",
+        )
+        return True
+    added = _XORRISO_FILES_ADDED_RE.search(line)
+    if added:
+        print(f"\r  Building ISO image: {added.group(1)} files added...", end="", flush=True)
+        return True
+    percent_done = _XORRISO_PERCENT_DONE_RE.search(line)
+    if percent_done:
+        pct_str, finish = percent_done.groups()
+        _print_bar(
+            round(float(pct_str)), 100,
+            suffix=f"estimate finish {finish.strip()}",
+        )
+        return True
+    genisoimage_percent_done = _GENISOIMAGE_PERCENT_DONE_RE.search(line)
+    if genisoimage_percent_done:
+        pct_str, finish = genisoimage_percent_done.groups()
+        _print_bar(
+            round(float(pct_str)), 100,
+            suffix=f"estimate finish {finish.strip()}",
+        )
+        return True
+    return False
+
+
+def _log_burn_signal(cmd: list[str], returncode: int) -> None:
+    """
+    Input: command and process return code
+    Output: None
+    """
+    if returncode < 0:
+        _log.warning(
+            "%s terminated by signal %d (returncode %d)",
+            cmd[0] if cmd else "burn command",
+            -returncode, returncode,
+        )
+
+
 def _run_burn_cmd(
     cmd: list[str], env: dict[str, str] | None = None,
 ) -> tuple[int, list[str]]:
@@ -1193,7 +1837,6 @@ def _run_burn_cmd(
         Anything else prints through unchanged so nothing real is
         ever swallowed.
     """
-    from oddarchiver.session import _print_bar
 
     popen_kwargs: dict = {
         "stdout": subprocess.PIPE,
@@ -1210,36 +1853,7 @@ def _run_burn_cmd(
         for line in proc.stdout:
             line = line.rstrip("\n")
             output_lines.append(line)
-            progress = _GROWISOFS_PROGRESS_RE.search(line)
-            if progress:
-                written, total, pct, speed, mins, secs = progress.groups()
-                _print_bar(
-                    int(written), int(total),
-                    suffix=f"{pct}% @{speed}, {mins}:{secs} remaining",
-                )
-                bar_active = True
-                continue
-            added = _XORRISO_FILES_ADDED_RE.search(line)
-            if added:
-                print(f"\r  Building ISO image: {added.group(1)} files added...", end="", flush=True)
-                bar_active = True
-                continue
-            percent_done = _XORRISO_PERCENT_DONE_RE.search(line)
-            if percent_done:
-                pct_str, finish = percent_done.groups()
-                _print_bar(
-                    round(float(pct_str)), 100,
-                    suffix=f"estimate finish {finish.strip()}",
-                )
-                bar_active = True
-                continue
-            genisoimage_percent_done = _GENISOIMAGE_PERCENT_DONE_RE.search(line)
-            if genisoimage_percent_done:
-                pct_str, finish = genisoimage_percent_done.groups()
-                _print_bar(
-                    round(float(pct_str)), 100,
-                    suffix=f"estimate finish {finish.strip()}",
-                )
+            if _display_burn_progress(line):
                 bar_active = True
                 continue
             if bar_active:
@@ -1250,12 +1864,7 @@ def _run_burn_cmd(
         if bar_active:
             print()
     returncode = proc.wait()
-    if returncode < 0:
-        _log.warning(
-            "%s terminated by signal %d (returncode %d)",
-            cmd[0] if cmd else "burn command",
-            -returncode, returncode,
-        )
+    _log_burn_signal(cmd, returncode)
     return returncode, output_lines
 
 
@@ -1318,9 +1927,15 @@ def _is_disc_full_signature(output_lines: list[str]) -> bool:
 
 
 
-def archive_session_count(backend: BurnBackend) -> int:
+def archive_session_count(
+    backend: BurnBackend,
+    listed: list[int] | None = None,
+    first_session: int | None = None,
+) -> int:
     """
-    Input:  backend - BurnBackend to read the current volume from
+    Input:  backend       - BurnBackend to read the current volume from
+            listed        - session numbers the caller already knows
+            first_session - first session on this volume, if the caller knows it
     Output: int - first_session plus the number of archive sessions on
             this volume
     Details:
@@ -1329,28 +1944,31 @@ def archive_session_count(backend: BurnBackend) -> int:
         the first burn, because growisofs appends each new archive
         session as a track inside one MMC session.
 
-        A missing volume marker treats first_session as 0 (legacy or
-        single-volume). DiscBackend counts manifests from
-        first_session via load_session_manifests. Encrypted manifests
-        still occupy a slot.
+        When the caller passes a session listing, the count is the
+        listing size plus the first session, with no control-file read.
+        Without a listing, the backend lists once (cached per command).
+        A backend that cannot list falls back to loading session
+        manifests from first_session.
 
-        ISOBackend counts session_* directories in the session tree.
-        That matches the manifest count when every session has a
-        manifest, and it still increments when a test ISO omits
-        manifests.
+        A missing volume marker treats first_session as 0 (legacy or
+        single-volume).
     """
     from oddarchiver.volume import read_volume_marker
     from oddarchiver.manifest import load_session_manifests
 
+    if listed is None:
+        listed = backend.list_session_numbers()
+    if listed is not None:
+        if first_session is None:
+            first_session = min(listed, default=0)
+        return first_session + len(listed)
     marker = read_volume_marker(backend)
-    first = marker.first_session if marker else 0
-    if isinstance(backend, ISOBackend):
-        root = backend._sessions_root
-        n = 0
-        if root.exists():
-            n = sum(1 for p in root.glob("session_*") if p.is_dir())
-        return first + n
-    return first + len(load_session_manifests(backend, start_session=first))
+    first = first_session if first_session is not None else (
+        marker.first_session if marker else 0
+    )
+    return first + len(load_session_manifests(
+        backend, start_session=first, marker=marker,
+    ))
 
 
 def check_volume_identity(
@@ -1510,14 +2128,132 @@ def _copy_staging(staging: Path, dest_root: Path) -> None:
             dest_root - destination root to merge into
     Output: None
     Details:
-        Copies each top-level item from staging into dest_root, merging trees.
+        Publishes each top-level item from staging into dest_root.
+        A directory goes through _publish_dir and a file through
+        _publish_file. Each one appears at its final name with one
+        rename, so a killed copy never leaves a partial session_NNN.
+        At the end, fsyncs dest_root so the renames are durable.
     """
     for item in staging.iterdir():
-        dest = dest_root / item.name
         if item.is_dir():
-            shutil.copytree(item, dest, dirs_exist_ok=True)
+            _publish_dir(item, dest_root)
         else:
-            shutil.copy2(item, dest)
+            _publish_file(item, dest_root)
+    _fsync_dir(dest_root)
+
+
+def _restore_failed_publish(
+    prior: Path | None, dest: Path, tmp: Path,
+) -> None:
+    """
+    Input: prior tree, destination, and temporary tree
+    Output: None
+    """
+    from oddarchiver.session import remove_tree
+
+    if prior is not None and not os.path.lexists(dest):
+        try:
+            os.replace(prior, dest)
+        except OSError:
+            _log.exception("Cannot move %s back to %s", prior, dest)
+    if prior is not None and prior.is_dir() and os.path.lexists(dest):
+        remove_tree(prior, "replaced ISO publish directory")
+    remove_tree(tmp, "partial ISO publish directory")
+
+
+def _publish_dir(item: Path, dest_root: Path) -> None:
+    """
+    Input:  item      - staging directory, for example session_NNN/
+            dest_root - destination root
+    Output: None
+    Details:
+        Builds the complete tree in ".<name>.partial-<random>" under
+        dest_root, then renames it to <name>. When <name> already exists
+        (for example a changed oddarchiver-software/), the temp tree
+        first gets a copy of the existing tree, then the staging tree on
+        top. This keeps the old merge result. The existing tree moves
+        aside to ".<name>.prior-<random>" just before the rename, and
+        the function removes it after. On any exception, the function
+        moves the prior tree back, removes the temp tree, and re-raises.
+        ISOBackend._recover_interrupted_publish cleans up after a kill.
+    """
+    from oddarchiver.session import remove_tree
+
+    dest = dest_root / item.name
+    tmp = Path(tempfile.mkdtemp(dir=dest_root, prefix=f".{item.name}.partial-"))
+    prior: Path | None = None
+    try:
+        if dest.is_dir():
+            shutil.copytree(dest, tmp, dirs_exist_ok=True, copy_function=_copy_file_synced)
+        shutil.copytree(item, tmp, dirs_exist_ok=True, copy_function=_copy_file_synced)
+        for root, _dirs, _files in os.walk(tmp):
+            _fsync_dir(Path(root))
+        if os.path.lexists(dest):
+            prior = Path(tempfile.mkdtemp(dir=dest_root, prefix=f".{item.name}.prior-"))
+            os.replace(dest, prior)
+        os.replace(tmp, dest)
+    except BaseException:
+        _log.exception("Cannot publish %s into %s", item.name, dest_root)
+        _restore_failed_publish(prior, dest, tmp)
+        raise
+    if prior is not None:
+        remove_tree(prior, "replaced ISO publish directory")
+
+
+def _publish_file(item: Path, dest_root: Path) -> None:
+    """
+    Input:  item      - staging file at the staging root, for example volume.json
+            dest_root - destination root
+    Output: None
+    Details:
+        Copies the file to ".<name>.partial-<random>" under dest_root,
+        then renames it over <name>. On any exception, the function
+        removes the temp file and re-raises.
+    """
+    fd, name = tempfile.mkstemp(dir=dest_root, prefix=f".{item.name}.partial-")
+    os.close(fd)
+    tmp = Path(name)
+    try:
+        _copy_file_synced(item, tmp)
+        os.replace(tmp, dest_root / item.name)
+    except BaseException:
+        _log.exception("Cannot publish %s into %s", item.name, dest_root)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            _log.exception("Cannot remove partial ISO publish file %s", tmp)
+        raise
+
+
+def _copy_file_synced(src: str | Path, dst: str | Path) -> str | Path:
+    """
+    Input:  src - source file
+            dst - destination file
+    Output: dst
+    Details:
+        shutil.copy2 followed by fsync of dst, so the data is on disk
+        before the publish rename. Used as the copytree copy_function.
+    """
+    shutil.copy2(src, dst)
+    fd = os.open(dst, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return dst
+
+
+def _fsync_dir(path: Path) -> None:
+    """
+    Input:  path - directory
+    Output: None
+    Details: fsyncs the directory so its entries are durable.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _is_no_media_text(text: str) -> bool:
@@ -1615,13 +2351,27 @@ def _raise_cd_unsupported() -> None:
     )
 
 
+def _remaining_media_bytes(
+    remaining_match: re.Match[str] | None, free_blocks_all: list[str],
+) -> int:
+    """
+    Input: remaining_match, free_blocks_all
+    Output: remaining media capacity in bytes
+    """
+    if remaining_match:
+        return int(remaining_match.group(1)) * 2048
+    if free_blocks_all:
+        return int(free_blocks_all[-1]) * 2048
+    return 0
+
+
 def _parse_mediainfo(stdout: str) -> DiscInfo:
     """
     Input:  stdout - text output from dvd+rw-mediainfo
     Output: DiscInfo
     Details:
-        Extracts session count, remaining blocks (2KB units), total capacity,
-        and label. The parser multiplies remaining and capacity blocks by 2048.
+        Extracts session count, remaining blocks (2KB units), and total capacity.
+        The parser multiplies remaining and capacity blocks by 2048.
         Blank BD-R discs report "Number of Sessions: 1" with an implicit empty
         session. The parser treats those discs as 0 written sessions.
     """
@@ -1632,7 +2382,6 @@ def _parse_mediainfo(stdout: str) -> DiscInfo:
     # Free Blocks: appears once per track. The last entry is the writable track.
     free_blocks_all = re.findall(r"Free Blocks:\s+" + _BLOCKS_RE, stdout)
     capacity_match = re.search(r"READ CAPACITY:\s+" + _BLOCKS_RE, stdout)
-    label_match = re.search(r"Volume id:\s+(\S+)", stdout, re.IGNORECASE)
     disc_status_match = re.search(r"Disc status:\s+(\S+)", stdout, re.IGNORECASE)
     last_session_match = re.search(r"State of Last Session:\s+(\S+)", stdout, re.IGNORECASE)
 
@@ -1642,16 +2391,10 @@ def _parse_mediainfo(stdout: str) -> DiscInfo:
     # Blocks entry: the invisible/writable track on BD-R SRM, which holds
     # the actual remaining capacity. Earlier tracks show 0, so the
     # parser must ignore them.
-    if remaining_match:
-        remaining_bytes = int(remaining_match.group(1)) * 2048
-    elif free_blocks_all:
-        remaining_bytes = int(free_blocks_all[-1]) * 2048
-    else:
-        remaining_bytes = 0
+    remaining_bytes = _remaining_media_bytes(remaining_match, free_blocks_all)
 
     total_bytes = int(capacity_match.group(1)) * 2048 if capacity_match else 0
     used_bytes = max(0, total_bytes - remaining_bytes)
-    label = label_match.group(1) if label_match else ""
 
     disc_status = disc_status_match.group(1).lower() if disc_status_match else ""
     last_session_state = last_session_match.group(1).lower() if last_session_match else ""
@@ -1665,5 +2408,5 @@ def _parse_mediainfo(stdout: str) -> DiscInfo:
         session_count=session_count,
         remaining_bytes=remaining_bytes,
         used_bytes=used_bytes,
-        label=label,
+        label="",
     )

@@ -13,13 +13,30 @@ Description:
     all without touching real hardware or requiring root.
 """
 # Imports
+import logging
 from pathlib import Path
 
 import pytest
 
 from oddarchiver.usb_reauth import main
 
+logger = logging.getLogger(__name__)
+
 # Functions
+
+
+def _patch_block_path(monkeypatch, tmp_path: Path) -> None:
+    """Input: monkeypatch, tmp_path. Output: None. Redirect sysfs block paths."""
+    import oddarchiver.usb_reauth as mod
+
+    real_path = mod.Path
+
+    def fake_path(arg, *args):
+        if arg == "/sys/class/block":
+            return real_path(tmp_path / "sys" / "class" / "block")
+        return real_path(arg, *args)
+
+    monkeypatch.setattr(mod, "Path", fake_path)
 
 
 def test_rejects_device_name_with_shell_metacharacters(monkeypatch, caplog):
@@ -53,16 +70,7 @@ def test_rejects_nonexistent_block_device(monkeypatch, caplog, tmp_path):
         A syntactically valid device name with no corresponding sysfs
         entry must be rejected, not silently proceed.
     """
-    import oddarchiver.usb_reauth as mod
-
-    real_path = mod.Path
-
-    def fake_path(arg, *args):
-        if arg == "/sys/class/block":
-            return real_path(tmp_path / "sys" / "class" / "block")
-        return real_path(arg, *args)
-
-    monkeypatch.setattr(mod, "Path", fake_path)
+    _patch_block_path(monkeypatch, tmp_path)
 
     with caplog.at_level("WARNING"):
         assert main(["sr0"]) == 1
@@ -84,14 +92,7 @@ def test_rejects_device_with_no_usb_ancestor(monkeypatch, caplog, tmp_path):
     block_dir = tmp_path / "sys" / "class" / "block" / "sr0"
     block_dir.mkdir(parents=True)
 
-    real_path = mod.Path
-
-    def fake_path(arg, *args):
-        if arg == "/sys/class/block":
-            return real_path(tmp_path / "sys" / "class" / "block")
-        return real_path(arg, *args)
-
-    monkeypatch.setattr(mod, "Path", fake_path)
+    _patch_block_path(monkeypatch, tmp_path)
     monkeypatch.setattr(mod, "_resolve_usb_device_sysfs_path", lambda name: None)
 
     with caplog.at_level("WARNING"):
@@ -117,14 +118,7 @@ def test_toggles_authorized_zero_then_one(monkeypatch, tmp_path):
     authorized = usb_dir / "authorized"
     authorized.write_text("1")
 
-    real_path = mod.Path
-
-    def fake_path(arg, *args):
-        if arg == "/sys/class/block":
-            return real_path(tmp_path / "sys" / "class" / "block")
-        return real_path(arg, *args)
-
-    monkeypatch.setattr(mod, "Path", fake_path)
+    _patch_block_path(monkeypatch, tmp_path)
     monkeypatch.setattr(mod, "_resolve_usb_device_sysfs_path", lambda name: usb_dir)
     monkeypatch.setattr(mod.time, "sleep", lambda seconds: None)
 
@@ -158,14 +152,7 @@ def test_logs_exception_on_permission_denied(monkeypatch, caplog, tmp_path):
     usb_dir = tmp_path / "usb_device"
     usb_dir.mkdir()
 
-    real_path = mod.Path
-
-    def fake_path(arg, *args):
-        if arg == "/sys/class/block":
-            return real_path(tmp_path / "sys" / "class" / "block")
-        return real_path(arg, *args)
-
-    monkeypatch.setattr(mod, "Path", fake_path)
+    _patch_block_path(monkeypatch, tmp_path)
     monkeypatch.setattr(mod, "_resolve_usb_device_sysfs_path", lambda name: usb_dir)
 
     def raising_write_text(self, *args, **kwargs):

@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from oddarchiver.cli import dispatch
+from oddarchiver.crypto import generate_keyfile
 from oddarchiver.disc import ISOBackend, parse_disc_size
 from oddarchiver.manifest import read_manifest
 
@@ -224,6 +225,66 @@ def test_status_shows_suspect_on_bad_checksum(tmp_path, capsys):
     assert "SUSPECT" in out
 
 
+def test_unsafe_keyfile_refused_with_clean_error(tmp_path, capsys):
+    """
+    Input:  tmp_path, capsys
+    Output: None
+    Details:
+        A keyfile archive opened with a group- or world-readable keyfile
+        exits 1. stderr names the chmod fix and holds no traceback.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"hello")
+    key = tmp_path / "archive.key"
+    generate_keyfile(str(key))
+    iso = tmp_path / "test.iso"
+    assert dispatch(_make_args(
+        command="init", source=str(source), test_iso=str(iso),
+        encrypt="keyfile", key=str(key),
+    )) == 0
+    key.chmod(0o644)
+    capsys.readouterr()
+
+    rc = dispatch(_make_args(command="status", test_iso=str(iso), key=str(key)))
+
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert f"chmod 600 {key}" in err
+    assert "Traceback" not in err
+
+
+def test_status_counts_archive_sessions_not_mmc_sessions(tmp_path, capsys, monkeypatch):
+    """
+    Input:  tmp_path, capsys, monkeypatch
+    Output: None
+    Details:
+        BD-R SRM+POW reports one MMC session after any number of appends.
+        A two-session archive whose mediainfo says 1 must still show
+        "Sessions:  2" in status, the same count that history lists.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"hello")
+    iso = tmp_path / "test.iso"
+    assert dispatch(_make_args(command="init", source=str(source), test_iso=str(iso))) == 0
+    (source / "b.txt").write_bytes(b"second session")
+    assert dispatch(_make_args(command="sync", source=str(source), test_iso=str(iso))) == 0
+
+    real_mediainfo = ISOBackend.mediainfo
+
+    def pow_mediainfo(self):
+        info = real_mediainfo(self)
+        info.session_count = 1
+        return info
+
+    monkeypatch.setattr(ISOBackend, "mediainfo", pow_mediainfo)
+    capsys.readouterr()
+    assert dispatch(_make_args(command="status", test_iso=str(iso))) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "Sessions:  2" in lines
+
+
 class _CorruptAfterBurnISO(ISOBackend):
     """ISOBackend that overwrites stored full blobs after each burn."""
 
@@ -333,7 +394,7 @@ def test_post_burn_verify_cannot_be_skipped_via_config(tmp_path, monkeypatch):
     """
     cfg = tmp_path / "config.toml"
     cfg.write_text("post_burn_verify = false\n", encoding="utf-8")
-    monkeypatch.setattr("oddarchiver.config.DEFAULT_CONFIG_PATH", cfg)
+    monkeypatch.setattr("oddarchiver.config.default_config_path", lambda: cfg)
     levels = _spy_verify_levels(monkeypatch)
     source = tmp_path / "src"
     source.mkdir()

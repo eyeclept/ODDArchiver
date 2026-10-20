@@ -28,6 +28,7 @@ from oddarchiver.ledger import check_session_coverage, ledger_path, load_ledger,
 from oddarchiver.verify import _read_all_manifests, detect_incomplete_session, verify
 
 # Globals
+logger = logging.getLogger(__name__)
 SMALL_DISC = 50 * 2**20
 _crypto = NullCrypto()
 
@@ -126,8 +127,7 @@ def test_torn_read_below_known_good_raises(tmp_path, monkeypatch):
         an empty list; the coverage check after that list must raise instead
         of treating the disc as empty.
     """
-    source, iso = _init_and_sync_two_sessions(tmp_path)
-    del source
+    _, iso = _init_and_sync_two_sessions(tmp_path)
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     monkeypatch.setattr(ISOBackend, "read_paths", _torn_session_000(backend))
 
@@ -175,14 +175,13 @@ def test_probe_above_known_good_does_not_raise(tmp_path, monkeypatch):
         A read failure for session 2 when confirmed_sessions=2 is a
         legitimate end-of-scan and must not raise.
     """
-    source, iso = _init_and_sync_two_sessions(tmp_path)
-    del source
+    _, iso = _init_and_sync_two_sessions(tmp_path)
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     original = ISOBackend.read_paths
 
     def wrapped(self, paths):
         found = original(self, paths)
-        for key in list(found):
+        for key in list(found):  # scbc ignore[unnecessary-list-call] keys are removed during iteration
             if key.startswith("session_002/"):
                 found.pop(key, None)
         return found
@@ -236,7 +235,7 @@ def test_append_raises_burn_interrupted_signal_prior_readable(monkeypatch, tmp_p
     message = str(exc_info.value)
     assert "burn for session 001 failed (exit -15)" in message
     assert "re-verified readable" in message
-    assert type(exc_info.value) is BurnInterrupted
+    assert type(exc_info.value) is BurnInterrupted  # scbc ignore[type-equality] exact type excludes subclasses
 
 
 def test_append_raises_burn_interrupted_signal_prior_unreadable(monkeypatch, tmp_path):
@@ -313,7 +312,7 @@ def test_append_hardware_fault_is_burn_interrupted(monkeypatch, tmp_path):
     )
     with pytest.raises(RuntimeError) as exc_info:
         backend.append(staging, "TEST", 1)
-    assert type(exc_info.value) is RuntimeError
+    assert type(exc_info.value) is RuntimeError  # scbc ignore[type-equality] exact type excludes BurnInterrupted
 
 
 def test_ledger_round_trip_missing_is_cautious(tmp_path):
@@ -456,6 +455,20 @@ def test_recover_scan_proceeds_and_warns(tmp_path, monkeypatch, caplog):
     assert "000" in text and "001" in text
 
 
+def _assert_incomplete_output(out: str) -> None:
+    """
+    Input:  out - fast verification output
+    Output: None
+    """
+    assert "Session 000" in out and "OK" in out
+    assert "Session 001" in out and "OK" in out
+    assert "INCOMPLETE (interrupted burn, not corruption)" in out
+    for line in out.splitlines():
+        if line.startswith("Session 002"):
+            assert "FAIL" not in line
+            assert "INCOMPLETE" in line
+
+
 def test_verify_fast_reports_trailing_incomplete_not_fail(tmp_path, capsys):
     """
     Input:  tmp_path, capsys
@@ -464,8 +477,7 @@ def test_verify_fast_reports_trailing_incomplete_not_fail(tmp_path, capsys):
         A truncated trailing manifest reports INCOMPLETE, not FAIL.
         Prior complete sessions still report OK.
     """
-    source, iso = _init_and_sync_two_sessions(tmp_path)
-    del source
+    _, iso = _init_and_sync_two_sessions(tmp_path)
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     sess2 = backend._sessions_root / "session_002"
     sess2.mkdir()
@@ -475,13 +487,7 @@ def test_verify_fast_reports_trailing_incomplete_not_fail(tmp_path, capsys):
         verify(backend, _crypto, level="fast")
     assert exc.value.code == 1
     out = capsys.readouterr().out
-    assert "Session 000" in out and "OK" in out
-    assert "Session 001" in out and "OK" in out
-    assert "INCOMPLETE (interrupted burn, not corruption)" in out
-    for line in out.splitlines():
-        if line.startswith("Session 002"):
-            assert "FAIL" not in line
-            assert "INCOMPLETE" in line
+    _assert_incomplete_output(out)
     tmp = tmp_path / "vm"
     tmp.mkdir()
     loaded = _read_all_manifests(backend, tmp, crypto=_crypto)
@@ -523,11 +529,11 @@ def test_recover_scan_flag_on_init_sync_status():
     """
     parser = build_parser()
     init_args = parser.parse_args(["init", "/src", "--recover-scan"])
-    assert init_args.recover_scan is True
+    assert init_args.recover_scan is True  # scbc ignore[is-true-false-strict] argparse Namespace value is unannotated
     sync_args = parser.parse_args(["sync", "/src"])
-    assert sync_args.recover_scan is False
+    assert sync_args.recover_scan is False  # scbc ignore[is-true-false-strict] argparse Namespace value is unannotated
     status_args = parser.parse_args(["status", "--recover-scan"])
-    assert status_args.recover_scan is True
+    assert status_args.recover_scan is True  # scbc ignore[is-true-false-strict] argparse Namespace value is unannotated
 
 
 def test_status_surfaces_incomplete_trailing_session(tmp_path, capsys):
@@ -538,8 +544,7 @@ def test_status_surfaces_incomplete_trailing_session(tmp_path, capsys):
         status must name an incomplete trailing session and tell the
         user not to eject.
     """
-    source, iso = _init_and_sync_two_sessions(tmp_path)
-    del source
+    _, iso = _init_and_sync_two_sessions(tmp_path)
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     sess2 = backend._sessions_root / "session_002"
     sess2.mkdir()

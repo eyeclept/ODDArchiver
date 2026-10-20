@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,8 +32,8 @@ if TYPE_CHECKING:
     from oddarchiver.manifest import Manifest
 
 # Globals
-_log = logging.getLogger(__name__)
-
+logger = logging.getLogger(__name__)
+_log = logger
 _SAFE_LABEL_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -79,9 +80,13 @@ def ledger_dir() -> Path:
         ~/.local/state/oddarchiver, as specified in Assist/TODO.md 22c.
     """
     xdg = os.environ.get("XDG_STATE_HOME")
-    if xdg:
-        return Path(xdg) / "oddarchiver"
-    return Path.home() / ".local" / "state" / "oddarchiver"
+    directory = Path(xdg) / "oddarchiver" if xdg else Path.home() / ".local" / "state" / "oddarchiver"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise RuntimeError(f"State directory is not owned by this user: {directory}")
+    directory.chmod(0o700)
+    return directory
 
 
 def ledger_path(label: str, backend_id: str) -> Path:
@@ -305,6 +310,24 @@ def _handle_shortfall(
     raise RuntimeError(message)
 
 
+def _missing_gap_description(disc_path: str, exc: FileNotFoundError) -> str:
+    """
+    Input:  disc_path - missing manifest path on disc
+            exc       - missing-path error returned by the backend
+    Output: description of the missing session manifest
+    """
+    text = str(exc)
+    if "Cannot determine attributes of" in text:
+        return (
+            f"Underlying failure: xorriso reports the medium tree "
+            f"lacks {disc_path!r} (Cannot determine attributes of)."
+        )
+    return (
+        f"Underlying failure: {disc_path!r} is not present "
+        f"({text})."
+    )
+
+
 def _describe_gap_error(backend: "BurnBackend", session_idx: int) -> str:
     """
     Input:  backend     - BurnBackend to re-probe
@@ -327,16 +350,7 @@ def _describe_gap_error(backend: "BurnBackend", session_idx: int) -> str:
             backend.read_path(disc_path)
         except FileNotFoundError as exc:
             _log.warning("Gap probe %s: %s", disc_path, exc)
-            text = str(exc)
-            if "Cannot determine attributes of" in text:
-                return (
-                    f"Underlying failure: xorriso reports the medium tree "
-                    f"lacks {disc_path!r} (Cannot determine attributes of)."
-                )
-            return (
-                f"Underlying failure: {disc_path!r} is not present "
-                f"({text})."
-            )
+            return _missing_gap_description(disc_path, exc)
         except RuntimeError as exc:
             _log.exception("Gap probe %s exhausted retries", disc_path)
             return (
@@ -346,7 +360,6 @@ def _describe_gap_error(backend: "BurnBackend", session_idx: int) -> str:
         except (OSError, ValueError) as exc:
             _log.exception("Gap probe %s failed", disc_path)
             last_exc = exc
-            continue
     if last_exc is not None:
         return f"Underlying failure: {last_exc}."
     return "Underlying failure: session unreadable."

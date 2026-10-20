@@ -1,0 +1,1 @@
+{"nodes": [{"id": "volume_marker", "label": "VolumeMarker", "file_type": "concept", "source_file": "docs/volumes.md"}], "edges": [{"source": "oddarchiver_manifest", "target": "volume_marker", "relation": "references", "confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "docs/volumes.md"}], "hyperedges": []}

@@ -10,15 +10,26 @@ Description:
 """
 # Imports
 import argparse
+import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Globals
-DEFAULT_CONFIG_PATH = Path.home() / ".config" / "oddarchiver" / "config.toml"
-
+logger = logging.getLogger(__name__)
 
 # Functions
+
+
+def default_config_path() -> Path:
+    """
+    Input:  None
+    Output: ~/.config/oddarchiver/config.toml for the current HOME
+    Details:
+        Reads HOME at each call, not at import. A changed HOME (tests,
+        sudo -H) then selects its own config file.
+    """
+    return Path.home() / ".config" / "oddarchiver" / "config.toml"
+
 
 @dataclass
 class Config:
@@ -55,7 +66,7 @@ def _try_import_tomllib():
         import tomllib  # type: ignore[no-redef]
         return tomllib
     except ImportError:
-        pass
+        logger.warning("tomllib unavailable; trying tomli")
     try:
         import tomli as tomllib  # type: ignore[no-redef]
         return tomllib
@@ -63,37 +74,24 @@ def _try_import_tomllib():
         return None
 
 
-def load_config(path: Path | None = None) -> Config:
+def _apply_config_paths(cfg: Config, data: dict) -> None:
     """
-    Input:  path - the path to config.toml. If path is None, the function uses DEFAULT_CONFIG_PATH.
-    Output: A Config object. File values override the defaults. If the file is absent, the function returns the defaults.
-    Details:
-        The config file is optional. If the file is absent, or the tomllib module is not available, the function returns the defaults.
-        The function reads these top-level keys: device, cache_dir, staging_dir, delta_threshold,
-        space_safety_margin, log_file, post_burn_verify, and disc_size.
-        The function also reads an encryption sub-table, [encryption], with the key mode.
+    Input:  cfg - the configuration to update; data - parsed TOML values
+    Output: None
     """
-    if path is None:
-        path = DEFAULT_CONFIG_PATH
-
-    cfg = Config()
-
-    if not path.exists():
-        return cfg
-
-    tomllib = _try_import_tomllib()
-    if tomllib is None:
-        return cfg
-
-    with open(path, "rb") as fh:
-        data = tomllib.load(fh)
-
     if "device" in data:
         cfg.device = str(data["device"])
     if "cache_dir" in data:
         cfg.cache_dir = Path(str(data["cache_dir"])).expanduser()
     if "staging_dir" in data:
         cfg.staging_dir = Path(str(data["staging_dir"])).expanduser()
+
+
+def _apply_config_options(cfg: Config, data: dict) -> None:
+    """
+    Input:  cfg - the configuration to update; data - parsed TOML values
+    Output: None
+    """
     if "delta_threshold" in data:
         cfg.delta_threshold = float(data["delta_threshold"])
     if "space_safety_margin" in data:
@@ -108,13 +106,42 @@ def load_config(path: Path | None = None) -> Config:
     if isinstance(enc, dict) and "mode" in enc:
         cfg.encryption_mode = str(enc["mode"])
 
+
+def load_config(path: Path | None = None) -> Config:
+    """
+    Input:  path - the path to config.toml. If path is None, the function uses default_config_path().
+    Output: A Config object. File values override the defaults. If the file is absent, the function returns the defaults.
+    Details:
+        The config file is optional. If the file is absent, or the tomllib module is not available, the function returns the defaults.
+        The function reads these top-level keys: device, cache_dir, staging_dir, delta_threshold,
+        space_safety_margin, log_file, post_burn_verify, and disc_size.
+        The function also reads an encryption sub-table, [encryption], with the key mode.
+    """
+    if path is None:
+        path = default_config_path()
+
+    cfg = Config()
+
+    if not path.exists():
+        return cfg
+
+    tomllib = _try_import_tomllib()
+    if tomllib is None:
+        return cfg
+
+    with open(path, "rb") as fh:
+        data = tomllib.load(fh)
+
+    _apply_config_paths(cfg, data)
+    _apply_config_options(cfg, data)
+
     return cfg
 
 
 def resolve_config(args: argparse.Namespace, path: Path | None = None) -> Config:
     """
     Input:  args - the parsed argparse.Namespace object. Attributes that are not None override the config.
-            path - the path to config.toml. If None, the function uses DEFAULT_CONFIG_PATH.
+            path - the path to config.toml. If None, the function uses default_config_path().
     Output: A Config object with the CLI flag values applied on top of the file values or the defaults.
     Details:
         Only the attributes present and not None on args override the config.

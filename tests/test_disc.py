@@ -11,13 +11,16 @@ Description:
 # Imports
 import argparse
 import hashlib
+import logging
+import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from oddarchiver.cli import dispatch
+from oddarchiver.cli import _burn_verify_commit, dispatch
 
 from oddarchiver.disc import (
     BDXL_DISC_BYTES,
@@ -25,6 +28,7 @@ from oddarchiver.disc import (
     CD_DISC_BYTES,
     DVD_DL_DISC_BYTES,
     DVD_SL_DISC_BYTES,
+    BurnInterrupted,
     DiscBackend,
     DiscInfo,
     ISOBackend,
@@ -33,9 +37,11 @@ from oddarchiver.disc import (
     parse_disc_size,
 )
 from oddarchiver.volume import VolumeMarker, write_volume_marker
+from oddarchiver.log import setup_logging
 
 # Globals
 SMALL_DISC = 10 * 2**20  # 10 MiB. Keeps ISO builds fast in tests.
+logger = logging.getLogger(__name__)
 
 # Blob name for the test file in session_000 (sha256("0:hello.txt"))
 _HELLO_BLOB = hashlib.sha256(b"0:hello.txt").hexdigest()
@@ -138,6 +144,22 @@ def test_mediainfo_remaining_bytes(tmp_path):
     assert info.remaining_bytes + info.used_bytes == SMALL_DISC
 
 
+def _assert_remaining_after_init(empty: DiscInfo, after_init: DiscInfo) -> None:
+    """Input: empty and initialized disc info. Output: None."""
+    assert after_init.used_bytes > empty.used_bytes
+    assert after_init.remaining_bytes == SMALL_DISC - after_init.used_bytes
+    assert after_init.remaining_bytes < empty.remaining_bytes
+    assert after_init.remaining_bytes >= 0
+
+
+def _assert_remaining_after_append(after_init: DiscInfo, after_append: DiscInfo) -> None:
+    """Input: initialized and appended disc info. Output: None."""
+    assert after_append.used_bytes > after_init.used_bytes
+    assert after_append.remaining_bytes < after_init.remaining_bytes
+    assert after_append.remaining_bytes == max(0, SMALL_DISC - after_append.used_bytes)
+    assert after_append.remaining_bytes >= 0
+
+
 def test_remaining_bytes_decreases_and_clamps_at_zero(tmp_path):
     """
     Input:  tmp_path
@@ -154,20 +176,14 @@ def test_remaining_bytes_decreases_and_clamps_at_zero(tmp_path):
 
     backend.init(_make_staging(tmp_path), label="TEST", expected_session_count=0)
     after_init = backend.mediainfo()
-    assert after_init.used_bytes > empty.used_bytes
-    assert after_init.remaining_bytes == SMALL_DISC - after_init.used_bytes
-    assert after_init.remaining_bytes < empty.remaining_bytes
-    assert after_init.remaining_bytes >= 0
+    _assert_remaining_after_init(empty, after_init)
 
     staging1 = tmp_path / "staging2"
     (staging1 / "session_001").mkdir(parents=True)
     (staging1 / "session_001" / "b.txt").write_bytes(b"second session")
     backend.append(staging1, label="TEST", expected_session_count=1)
     after_append = backend.mediainfo()
-    assert after_append.used_bytes > after_init.used_bytes
-    assert after_append.remaining_bytes < after_init.remaining_bytes
-    assert after_append.remaining_bytes == max(0, SMALL_DISC - after_append.used_bytes)
-    assert after_append.remaining_bytes >= 0
+    _assert_remaining_after_append(after_init, after_append)
 
     backend.prefill(SMALL_DISC)
     clamped = backend.mediainfo()
@@ -423,7 +439,7 @@ def test_parse_mediainfo_parses_fields():
     Output: None
     Details:
         _parse_mediainfo must extract session count, remaining bytes,
-        used bytes, and the volume label from dvd+rw-mediainfo text.
+        and used bytes, but not infer a label from dvd+rw-mediainfo text.
         Remaining: wins over Free Blocks when both are present.
     """
     fixture = (
@@ -444,7 +460,106 @@ def test_parse_mediainfo_parses_fields():
     assert info.session_count == 2
     assert info.remaining_bytes == 8000 * 2048
     assert info.used_bytes == (12000 - 8000) * 2048
-    assert info.label == "MYDISC"
+    assert info.label == ""
+
+
+def _pvd_bytes(label: str = "KILLTEST") -> bytes:
+    """
+    Input:  label - volume identifier
+    Output: 2048-byte primary volume descriptor
+    Details:
+        Builds a descriptor for label tests without an optical device.
+    """
+    descriptor = bytearray(2048)
+    descriptor[0] = 1
+    descriptor[1:6] = b"CD001"
+    descriptor[40:72] = label.encode("ascii").ljust(32, b" ")
+    return bytes(descriptor)
+
+
+def _stub_mediainfo_run(monkeypatch) -> None:
+    """
+    Input:  monkeypatch - pytest patch helper
+    Output: None
+    Details:
+        Supplies a dvd+rw-mediainfo response without a drive.
+    """
+    monkeypatch.setattr(
+        "oddarchiver.disc.subprocess.run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 0, _MEDIAINFO_BLANK_BD.encode(), b"",
+        ),
+    )
+
+
+def test_disc_mediainfo_reads_pvd_label(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        A valid descriptor provides the disc label and preserves capacity.
+    """
+    device = tmp_path / "device"
+    device.write_bytes(b"\0" * 32768 + _pvd_bytes())
+    _stub_mediainfo_run(monkeypatch)
+    info = DiscBackend(str(device)).mediainfo()
+    assert info.label == "KILLTEST"
+    assert info.session_count == 0
+    assert info.remaining_bytes == 12088320 * 2048
+
+
+@pytest.mark.parametrize("descriptor", [b"short", b"\0" * 2048,
+                                           b"\x01BADID" + b"\0" * 2042])
+def test_disc_mediainfo_invalid_pvd_warns(monkeypatch, tmp_path, caplog, descriptor):
+    """
+    Input:  monkeypatch, tmp_path, caplog, descriptor
+    Output: None
+    Details:
+        Short or invalid descriptors give no label and log a warning.
+    """
+    device = tmp_path / "device"
+    device.write_bytes(b"\0" * 32768 + descriptor)
+    _stub_mediainfo_run(monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        info = DiscBackend(str(device)).mediainfo()
+    assert info.label == ""
+    assert info.remaining_bytes == 12088320 * 2048
+    assert "invalid primary volume descriptor" in caplog.text
+
+
+def test_disc_mediainfo_pread_error_preserves_capacity(monkeypatch, tmp_path, caplog):
+    """
+    Input:  monkeypatch, tmp_path, caplog
+    Output: None
+    Details:
+        A device read error warns but does not fail mediainfo.
+    """
+    device = tmp_path / "device"
+    device.write_bytes(b"\0" * 32768 + _pvd_bytes())
+    _stub_mediainfo_run(monkeypatch)
+
+    def fail_pread(fd, count, offset):
+        raise OSError("Input/output error")
+
+    monkeypatch.setattr(os, "pread", fail_pread)
+    with caplog.at_level(logging.WARNING):
+        info = DiscBackend(str(device)).mediainfo()
+    assert info.label == ""
+    assert info.session_count == 0
+    assert info.remaining_bytes == 12088320 * 2048
+    assert "Input/output error" in caplog.text
+
+
+def test_iso_backend_reads_valid_pvd_label(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        The ISO backend reads the same primary volume descriptor.
+    """
+    image = tmp_path / "test.iso"
+    image.write_bytes(b"\0" * 32768 + _pvd_bytes())
+    assert ISOBackend(image, disc_size=SMALL_DISC)._read_label([]) == "KILLTEST"
 
 
 def test_parse_mediainfo_blank_disc_returns_zero_sessions():
@@ -911,6 +1026,144 @@ def test_append_recovers_via_usb_reauth_and_succeeds(monkeypatch, tmp_path):
     assert len(attempts) == 2  # original attempt + one retry after reauth
 
 
+_STALE_PVD_LINES = [
+    ":-( unable to pread64(2) primary volume descriptor: Input/output error",
+]
+
+
+def _script_append_retry(monkeypatch, responses, *, reauth=True, node_ready=True):
+    """
+    Input:  monkeypatch, responses, reauth, node_ready
+    Output: (backend, attempts, reverify_calls) for an isolated append
+    Details:
+        Replaces growisofs and drive operations with scripted results.
+    """
+    attempts = []
+    scripted = iter(responses)
+    reverify_calls = []
+
+    def fake_run(cmd):
+        attempts.append(cmd)
+        return next(scripted)
+
+    monkeypatch.setattr("oddarchiver.disc._run_growisofs", fake_run)
+    monkeypatch.setattr(DiscBackend, "_guard", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(DiscBackend, "_attempt_usb_reauth", lambda self: reauth)
+    monkeypatch.setattr(DiscBackend, "_wait_for_device_node", lambda self: node_ready)
+    monkeypatch.setattr(
+        DiscBackend, "_reverify_prior_sessions",
+        lambda self, attempted: reverify_calls.append(attempted) or True,
+    )
+    return DiscBackend("/dev/oddarchiver-test-no-drive"), attempts, reverify_calls
+
+
+@pytest.mark.parametrize(
+    ("retry", "error_type", "message", "expected_reverify"),
+    [
+        ((-9, ["growisofs terminated by signal 9"]), BurnInterrupted,
+         "re-verified readable", [1]),
+        ((1, _STALE_PVD_LINES), RuntimeError, "stale kernel", []),
+        ((1, [":-( /dev/sr0: 128 blocks are free, 4096 to be written!",
+              ":-( write failed: No space left on device"]),
+         RuntimeError, "out of space during append", [1]),
+        ((2, ["unexpected failure"]), RuntimeError, "failed with exit code 2", []),
+    ],
+)
+def test_append_retry_classifies_its_own_failure(
+    monkeypatch, tmp_path, retry, error_type, message, expected_reverify,
+):
+    """
+    Input:  monkeypatch, tmp_path, retry, error_type, message, expected_reverify
+    Output: None
+    Details:
+        The retry result determines the diagnosis after a stale first attempt.
+    """
+    staging = tmp_path / "staging"
+    (staging / "session_001").mkdir(parents=True)
+    backend, attempts, reverify = _script_append_retry(
+        monkeypatch, [(1, _STALE_PVD_LINES), retry],
+    )
+    with pytest.raises(error_type, match=message) as exc_info:
+        backend.append(staging, "TEST", 1)
+    assert type(exc_info.value) is error_type  # scbc ignore[type-equality] exact exception type check
+    assert len(attempts) == 2
+    assert reverify == expected_reverify
+
+
+@pytest.mark.parametrize(("reauth", "node_ready"), [(False, True), (True, False)])
+def test_append_stale_without_retry_reports_cache(
+    monkeypatch, tmp_path, reauth, node_ready,
+):
+    """
+    Input:  monkeypatch, tmp_path, reauth, node_ready
+    Output: None
+    Details:
+        Failed reauthorization or an absent node keeps the stale diagnosis.
+    """
+    backend, attempts, reverify = _script_append_retry(
+        monkeypatch, [(1, _STALE_PVD_LINES)], reauth=reauth, node_ready=node_ready,
+    )
+    with pytest.raises(RuntimeError, match="stale kernel"):
+        backend.append(tmp_path, "TEST", 1)
+    assert len(attempts) == 1
+    assert reverify == []
+
+
+def test_append_retry_success_after_stale(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        A successful retry does not carry the first attempt's error.
+    """
+    backend, attempts, reverify = _script_append_retry(
+        monkeypatch, [(1, _STALE_PVD_LINES), (0, ["Burn complete."])],
+    )
+    backend.append(tmp_path, "TEST", 1)
+    assert len(attempts) == 2
+    assert reverify == []
+
+
+def test_cli_reports_retry_kill_without_traceback(monkeypatch, tmp_path, capsys):
+    """
+    Input:  monkeypatch, tmp_path, capsys
+    Output: None
+    Details:
+        The CLI shows the retry kill and re-verify result with exit code 1.
+        Real logging is set up, as the CLI does, so stderr shows no traceback
+        while the log file keeps it.
+    """
+    log_file = tmp_path / "oddarchiver.log"
+    setup_logging(log_file)
+    staging = tmp_path / "staging"
+    (staging / "session_001").mkdir(parents=True)
+    backend, attempts, reverify = _script_append_retry(
+        monkeypatch,
+        [(1, _STALE_PVD_LINES), (-9, ["growisofs terminated by signal 9"])],
+    )
+    monkeypatch.setattr("oddarchiver.cli._patch_manifest", lambda *args, **kwargs: object())
+    verify_levels = []
+    verify_mod = SimpleNamespace(
+        verify=lambda *args, **kwargs: verify_levels.append(kwargs["level"]),
+    )
+    result = _burn_verify_commit(
+        command="sync", staging=staging, session_n=1, backend=backend,
+        label="TEST", enc_block={}, drives=[], crypto=object(), cache=object(),
+        verify_mod=verify_mod, use_init=False, expected_session_count=1,
+        mirror_backend=None, marker_first_session=0,
+    )
+    output = capsys.readouterr()
+    assert result == 1
+    assert "error: burn interrupted for session 001:" in output.err
+    assert "exit -9" in output.err
+    assert "re-verified readable" in output.err
+    assert "Traceback" not in output.err
+    assert "Traceback" in log_file.read_text(encoding="utf-8")
+    assert len(attempts) == 2
+    assert reverify == [1]
+    assert verify_levels == ["fast"]
+
+
 def test_append_raises_clear_error_when_usb_reauth_also_fails(monkeypatch, tmp_path):
     """
     Input:  monkeypatch, tmp_path
@@ -971,7 +1224,7 @@ def test_wait_for_device_node_polls_until_it_reappears(monkeypatch):
     monkeypatch.setattr(Path, "exists", fake_exists)
     monkeypatch.setattr("oddarchiver.disc.time.sleep", lambda seconds: None)
 
-    assert backend._wait_for_device_node(retries=10, retry_delay=1.0) is True
+    assert backend._wait_for_device_node(retries=10, retry_delay=1.0)
     assert len(checks) == 3
 
 
@@ -988,7 +1241,7 @@ def test_wait_for_device_node_gives_up_after_exhausting_retries(monkeypatch):
     monkeypatch.setattr(Path, "exists", lambda self: False)
     monkeypatch.setattr("oddarchiver.disc.time.sleep", lambda seconds: None)
 
-    assert backend._wait_for_device_node(retries=3, retry_delay=1.0) is False
+    assert not backend._wait_for_device_node(retries=3, retry_delay=1.0)
 
 
 def _make_fake_usb_sysfs(tmp_path: Path) -> Path:
@@ -1249,6 +1502,19 @@ def _append_staging(tmp_path: Path) -> Path:
     return staging
 
 
+def _append_identity_error(
+    backend: ISOBackend, tmp_path: Path, archive_id: str, volume_index: int,
+) -> str:
+    """Input: backend, tmp_path, archive_id, volume_index. Output: error text."""
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.append(
+            _append_staging(tmp_path), "TEST", 1,
+            expected_archive_id=archive_id,
+            expected_volume_index=volume_index,
+        )
+    return str(exc_info.value)
+
+
 def test_append_refuses_wrong_archive_id(tmp_path):
     """
     Input:  tmp_path
@@ -1259,13 +1525,7 @@ def test_append_refuses_wrong_archive_id(tmp_path):
         ids and must not write the new session.
     """
     backend = _backend_with_marker(tmp_path, archive_id="id-expected")
-    with pytest.raises(RuntimeError) as exc_info:
-        backend.append(
-            _append_staging(tmp_path), "TEST", 1,
-            expected_archive_id="id-other",
-            expected_volume_index=0,
-        )
-    message = str(exc_info.value)
+    message = _append_identity_error(backend, tmp_path, "id-other", 0)
     assert "wrong disc" in message.lower()
     assert "id-expected" in message
     assert "id-other" in message
@@ -1324,13 +1584,7 @@ def test_append_refuses_wrong_volume_index(tmp_path):
     backend = _backend_with_marker(
         tmp_path, archive_id="id-same", volume_index=0,
     )
-    with pytest.raises(RuntimeError) as exc_info:
-        backend.append(
-            _append_staging(tmp_path), "TEST", 1,
-            expected_archive_id="id-same",
-            expected_volume_index=1,
-        )
-    message = str(exc_info.value)
+    message = _append_identity_error(backend, tmp_path, "id-same", 1)
     assert "wrong disc" in message.lower()
     assert "id-same" in message
     assert "volume_index 1" in message
@@ -1525,6 +1779,34 @@ def test_mediainfo_pow_bdr_is_never_mistaken_for_blank():
     )
 
 
+def _stub_cd_refusal(monkeypatch) -> list:
+    """Refuse CD via dvd+rw-mediainfo and fail if a burn program starts."""
+    popen_calls = []
+
+    def fake_popen(cmd, **kwargs):
+        popen_calls.append(list(cmd))
+        raise AssertionError(f"no burn program may run for CD: {cmd}")
+
+    monkeypatch.setattr(
+        "oddarchiver.disc.subprocess.run",
+        lambda cmd, **kwargs: _mediainfo_completed(
+            returncode=1, stderr=_MEDIAINFO_CD_REFUSAL_STDERR),
+    )
+    monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
+    return popen_calls
+
+
+def _assert_cd_media_refused(monkeypatch, tmp_path: Path, operation: str) -> None:
+    """Input: monkeypatch, tmp_path, operation. Output: None."""
+    _stub_cd_refusal(monkeypatch)
+    backend = DiscBackend("/dev/sr0")
+    with pytest.raises(RuntimeError, match="CD media is not supported"):
+        if operation == "init":
+            backend.init(_make_staging(tmp_path, "session_000"), "TEST", 0)
+        else:
+            backend.append(_make_staging(tmp_path, "session_001"), "TEST", 1)
+
+
 def test_cd_media_is_refused_on_init(monkeypatch, tmp_path):
     """
     Input:  monkeypatch, tmp_path
@@ -1536,18 +1818,7 @@ def test_cd_media_is_refused_on_init(monkeypatch, tmp_path):
         both closed the disc after session 000, leaving 0 writable
         blocks.
     """
-    def fake_popen(cmd, **kwargs):
-        raise AssertionError(f"no burn program may run for CD: {cmd}")
-
-    monkeypatch.setattr(
-        "oddarchiver.disc.subprocess.run",
-        lambda cmd, **kwargs: _mediainfo_completed(
-            returncode=1, stderr=_MEDIAINFO_CD_REFUSAL_STDERR),
-    )
-    monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
-    backend = DiscBackend("/dev/sr0")
-    with pytest.raises(RuntimeError, match="CD media is not supported"):
-        backend.init(_make_staging(tmp_path, "session_000"), "TEST", 0)
+    _assert_cd_media_refused(monkeypatch, tmp_path, "init")
 
 
 def test_cd_media_is_refused_on_append(monkeypatch, tmp_path):
@@ -1558,18 +1829,17 @@ def test_cd_media_is_refused_on_append(monkeypatch, tmp_path):
         Append must refuse a CD for the same reason, and must not run
         a burn program.
     """
-    def fake_popen(cmd, **kwargs):
-        raise AssertionError(f"no burn program may run for CD: {cmd}")
+    _assert_cd_media_refused(monkeypatch, tmp_path, "append")
 
-    monkeypatch.setattr(
-        "oddarchiver.disc.subprocess.run",
-        lambda cmd, **kwargs: _mediainfo_completed(
-            returncode=1, stderr=_MEDIAINFO_CD_REFUSAL_STDERR),
-    )
+
+def _capture_burn_process(monkeypatch, captured: list) -> None:
+    """Input: monkeypatch and command list. Output: None."""
+    def fake_popen(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _FakePopen(["ok\n"], 0)
+
     monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
-    backend = DiscBackend("/dev/sr0")
-    with pytest.raises(RuntimeError, match="CD media is not supported"):
-        backend.append(_make_staging(tmp_path, "session_001"), "TEST", 1)
+
 
 def test_bd_profile_keeps_growisofs_argv(monkeypatch, tmp_path):
     """
@@ -1582,15 +1852,11 @@ def test_bd_profile_keeps_growisofs_argv(monkeypatch, tmp_path):
     """
     captured = []
 
-    def fake_popen(cmd, **kwargs):
-        captured.append(list(cmd))
-        return _FakePopen(["ok\n"], 0)
-
     monkeypatch.setattr(
         "oddarchiver.disc.subprocess.run",
         lambda cmd, **kwargs: _mediainfo_completed(_MEDIAINFO_BLANK_BD),
     )
-    monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
+    _capture_burn_process(monkeypatch, captured)
     staging = _make_staging(tmp_path)
     backend = DiscBackend(_FAKE_SR)
     backend.init(staging, "TEST", 0)
@@ -1613,12 +1879,8 @@ def test_bd_append_keeps_growisofs_argv(monkeypatch, tmp_path):
     """
     captured = []
 
-    def fake_popen(cmd, **kwargs):
-        captured.append(list(cmd))
-        return _FakePopen(["ok\n"], 0)
-
     _stub_disc_mediainfo(monkeypatch, session_count=1)
-    monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
+    _capture_burn_process(monkeypatch, captured)
     staging = _make_staging(tmp_path, "session_001")
     backend = DiscBackend(_FAKE_SR)
     backend.append(staging, "TEST", 1)
@@ -1657,21 +1919,14 @@ def _cli_burn_args(tmp_path: Path, command: str) -> argparse.Namespace:
     )
 
 
-def _stub_cd_refusal(monkeypatch) -> list:
-    """Refuse CD via dvd+rw-mediainfo and fail if a burn program starts."""
-    popen_calls = []
-
-    def fake_popen(cmd, **kwargs):
-        popen_calls.append(list(cmd))
-        raise AssertionError(f"no burn program may run for CD: {cmd}")
-
-    monkeypatch.setattr(
-        "oddarchiver.disc.subprocess.run",
-        lambda cmd, **kwargs: _mediainfo_completed(
-            returncode=1, stderr=_MEDIAINFO_CD_REFUSAL_STDERR),
-    )
-    monkeypatch.setattr("oddarchiver.disc.subprocess.Popen", fake_popen)
-    return popen_calls
+def _assert_cli_cd_refusal(monkeypatch, tmp_path: Path, capsys, command: str) -> None:
+    """Input: CLI fixtures and command. Output: None."""
+    popen_calls = _stub_cd_refusal(monkeypatch)
+    rc = dispatch(_cli_burn_args(tmp_path, command))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "CD media is not supported" in err
+    assert popen_calls == []
 
 
 def test_cli_init_refuses_cd(monkeypatch, tmp_path, capsys):
@@ -1683,12 +1938,7 @@ def test_cli_init_refuses_cd(monkeypatch, tmp_path, capsys):
         must exit 1 with the unsupported-media error and must not start
         growisofs.
     """
-    popen_calls = _stub_cd_refusal(monkeypatch)
-    rc = dispatch(_cli_burn_args(tmp_path, "init"))
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "CD media is not supported" in err
-    assert popen_calls == []
+    _assert_cli_cd_refusal(monkeypatch, tmp_path, capsys, "init")
 
 
 def test_cli_sync_refuses_cd(monkeypatch, tmp_path, capsys):
@@ -1699,12 +1949,7 @@ def test_cli_sync_refuses_cd(monkeypatch, tmp_path, capsys):
         CLI sync also reads mediainfo before any append. A CD must exit
         1 with the unsupported-media error and must not start growisofs.
     """
-    popen_calls = _stub_cd_refusal(monkeypatch)
-    rc = dispatch(_cli_burn_args(tmp_path, "sync"))
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "CD media is not supported" in err
-    assert popen_calls == []
+    _assert_cli_cd_refusal(monkeypatch, tmp_path, capsys, "sync")
 
 
 # Verbatim growisofs output captured from a real mid-burn USB unplug: a
@@ -1732,8 +1977,8 @@ def test_disconnect_needs_both_io_error_and_missing_device(tmp_path):
     """
     present = tmp_path / "sr0"
     present.write_bytes(b"")
-    assert _is_disconnect(_REAL_DISCONNECT_OUTPUT, str(present)) is False
-    assert _is_disconnect(_REAL_DISCONNECT_OUTPUT, str(tmp_path / "gone")) is True
+    assert not _is_disconnect(_REAL_DISCONNECT_OUTPUT, str(present))
+    assert _is_disconnect(_REAL_DISCONNECT_OUTPUT, str(tmp_path / "gone"))
 
 
 def test_disc_full_text_is_not_a_disconnect(tmp_path):
@@ -1748,7 +1993,7 @@ def test_disc_full_text_is_not_a_disconnect(tmp_path):
         "1234 blocks are free, 5678 to be written!",
         ":-( write failed: No space left on device",
     ]
-    assert _is_disconnect(full, str(tmp_path / "gone")) is False
+    assert not _is_disconnect(full, str(tmp_path / "gone"))
 
 
 def test_append_disconnect_raises_diagnosed_error(monkeypatch, tmp_path):

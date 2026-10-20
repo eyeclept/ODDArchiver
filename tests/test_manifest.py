@@ -8,9 +8,12 @@ Description:
     SUSPECT detection, disc-state replay, and atomic write.
 """
 # Imports
+from collections.abc import Callable
 import json
 import logging
+import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -22,36 +25,29 @@ from oddarchiver.manifest import (
     read_manifest,
     write_manifest,
 )
+from tests.helpers import _make_entry, _make_manifest
 
 # Globals
+logger = logging.getLogger(__name__)
 _TIMESTAMP = "2026-04-19T12:00:00Z"
 
 # Functions
 
 
-def _make_manifest(session: int = 0, entries=None, deleted=None) -> Manifest:
-    """Build a minimal valid Manifest for testing."""
-    return Manifest(
-        version=1,
-        session=session,
-        timestamp=_TIMESTAMP,
-        source="/home/user/docs",
-        label="TEST",
-        based_on_session=None if session == 0 else session - 1,
-        encryption={"mode": "none"},
-        entries=entries or [],
-        deleted=deleted or [],
-        manifest_checksum="",
-    )
-
-
-def _make_entry(path: str, checksum: str = "abc123") -> ManifestEntry:
-    return ManifestEntry(
-        path=path,
-        type="full",
-        result_checksum=checksum,
-        full_size_bytes=100,
-    )
+def _assert_round_trip_fields(loaded: Manifest, original: Manifest) -> None:
+    """
+    Input:  loaded and original manifests
+    Output: None
+    """
+    assert loaded.version == original.version
+    assert loaded.session == original.session
+    assert loaded.timestamp == original.timestamp
+    assert loaded.source == original.source
+    assert loaded.label == original.label
+    assert loaded.encryption == original.encryption
+    assert len(loaded.entries) == 1
+    assert loaded.entries[0].path == "a/b.txt"
+    assert loaded.entries[0].result_checksum == "dead"
 
 
 def test_round_trip_preserves_all_fields(tmp_path):
@@ -66,16 +62,8 @@ def test_round_trip_preserves_all_fields(tmp_path):
     write_manifest(tmp_path, m)
     loaded = read_manifest(tmp_path / "manifest.json")
 
-    assert loaded.version == m.version
-    assert loaded.session == m.session
-    assert loaded.timestamp == m.timestamp
-    assert loaded.source == m.source
-    assert loaded.label == m.label
-    assert loaded.encryption == m.encryption
-    assert len(loaded.entries) == 1
-    assert loaded.entries[0].path == "a/b.txt"
-    assert loaded.entries[0].result_checksum == "dead"
-    assert loaded.suspect is False
+    _assert_round_trip_fields(loaded, m)
+    assert not loaded.suspect
 
 
 def test_tampered_manifest_is_suspect(tmp_path):
@@ -93,7 +81,7 @@ def test_tampered_manifest_is_suspect(tmp_path):
     manifest_path.write_text(json.dumps(raw))
 
     loaded = read_manifest(manifest_path)
-    assert loaded.suspect is True
+    assert loaded.suspect
 
 
 def test_tampered_manifest_logs_warning(tmp_path, caplog):
@@ -111,7 +99,7 @@ def test_tampered_manifest_logs_warning(tmp_path, caplog):
 
     with caplog.at_level(logging.WARNING):
         loaded = read_manifest(manifest_path)
-    assert loaded.suspect is True
+    assert loaded.suspect
     assert any("SUSPECT" in r.message for r in caplog.records)
 
 
@@ -136,6 +124,19 @@ def test_build_disc_state_replays_sessions(tmp_path):
     assert state["c.txt"] == "cv1"
 
 
+def _assert_deleted_path(
+    build: Callable[[list[Manifest]], dict[str, str] | dict[str, int]],
+) -> None:
+    """
+    Input:  build - disc state or origin builder
+    Output: None
+    """
+    m0 = _make_manifest(0, entries=[_make_entry("remove_me.txt", "x")])
+    m1 = _make_manifest(1, deleted=["remove_me.txt"])
+    result = build([m0, m1])
+    assert "remove_me.txt" not in result
+
+
 def test_build_disc_state_applies_deleted(tmp_path):
     """
     Input:  tmp_path
@@ -144,10 +145,7 @@ def test_build_disc_state_applies_deleted(tmp_path):
         Paths listed in a manifest's deleted list must be absent from the
         resulting disc state.
     """
-    m0 = _make_manifest(0, entries=[_make_entry("remove_me.txt", "x")])
-    m1 = _make_manifest(1, deleted=["remove_me.txt"])
-    state = build_disc_state([m0, m1])
-    assert "remove_me.txt" not in state
+    _assert_deleted_path(build_disc_state)
 
 
 def test_build_disc_state_skips_suspect(tmp_path, caplog):
@@ -200,10 +198,7 @@ def test_build_disc_origin_applies_deleted(tmp_path):
         Paths listed in a manifest's deleted list must be absent from the
         resulting origin map, same as build_disc_state().
     """
-    m0 = _make_manifest(0, entries=[_make_entry("remove_me.txt", "x")])
-    m1 = _make_manifest(1, deleted=["remove_me.txt"])
-    origin = build_disc_origin([m0, m1])
-    assert "remove_me.txt" not in origin
+    _assert_deleted_path(build_disc_origin)
 
 
 def test_build_disc_origin_skips_suspect(tmp_path, caplog):
@@ -261,7 +256,7 @@ def test_read_manifest_invalid_json_returns_suspect(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         m = read_manifest(bad)
 
-    assert m.suspect is True
+    assert m.suspect
     assert any("cannot parse JSON" in r.message for r in caplog.records)
 
 
@@ -281,7 +276,7 @@ def test_read_manifest_appended_garbage_returns_suspect(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         m = read_manifest(manifest_path)
 
-    assert m.suspect is True
+    assert m.suspect
 
 
 def test_read_manifest_missing_streamed_defaults_false(tmp_path):
@@ -326,10 +321,10 @@ def test_read_manifest_missing_streamed_defaults_false(tmp_path):
     dest.write_text(json.dumps(payload), encoding="utf-8")
 
     loaded = read_manifest(dest)
-    assert loaded.suspect is False
+    assert not loaded.suspect
     assert len(loaded.entries) == 1
-    assert loaded.entries[0].streamed is False
-    assert manifest_checksum_ok(loaded) is True
+    assert not loaded.entries[0].streamed
+    assert manifest_checksum_ok(loaded)
 
 
 
@@ -377,11 +372,11 @@ def test_read_manifest_missing_volume_chunk_fields_defaults_none(tmp_path):
     dest.write_text(json.dumps(payload), encoding="utf-8")
 
     loaded = read_manifest(dest)
-    assert loaded.suspect is False
+    assert not loaded.suspect
     assert len(loaded.entries) == 1
     assert loaded.entries[0].volume_chunk is None
     assert loaded.entries[0].volume_chunk_count is None
-    assert manifest_checksum_ok(loaded) is True
+    assert manifest_checksum_ok(loaded)
 
 
 def test_volume_chunk_fields_round_trip(tmp_path):
@@ -404,7 +399,93 @@ def test_volume_chunk_fields_round_trip(tmp_path):
     write_manifest(tmp_path, m)
     loaded = read_manifest(tmp_path / "manifest.json")
 
-    assert loaded.suspect is False
+    assert not loaded.suspect
     assert len(loaded.entries) == 1
     assert loaded.entries[0].volume_chunk == 2
     assert loaded.entries[0].volume_chunk_count == 5
+
+
+@pytest.mark.parametrize("mode", ["none", "keyfile", "passphrase"])
+def test_load_session_manifests_does_not_create_temp_directory(
+    tmp_path, monkeypatch, mode,
+):
+    """
+    Input: tmp_path, monkeypatch, encryption mode
+    Output: None
+    Details: Loading a manifest parses disc bytes without a temporary directory.
+    """
+    from oddarchiver.crypto import KeyfileCrypto, PassphraseCrypto, generate_keyfile
+    from oddarchiver.manifest import load_session_manifests
+
+    if mode == "keyfile":
+        key = tmp_path / "key.bin"
+        generate_keyfile(str(key))
+        crypto = KeyfileCrypto(str(key))
+    elif mode == "passphrase":
+        crypto = PassphraseCrypto(passphrase="test passphrase")
+    else:
+        crypto = None
+    write_manifest(tmp_path, _make_manifest(), crypto=crypto)
+    suffix = "enc" if crypto else "json"
+    raw = {f"session_000/manifest.{suffix}": (
+        tmp_path / f"manifest.{suffix}"
+    ).read_bytes()}
+    if crypto:
+        raw["session_000/enc_mode.json"] = (
+            tmp_path / "enc_mode.json"
+        ).read_bytes()
+    backend = MagicMock()
+    backend.list_session_numbers.return_value = [0]
+
+    def forbid_temp_directory(*args, **kwargs):
+        raise AssertionError("Manifest load created a temporary directory")
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", forbid_temp_directory)
+    loaded = load_session_manifests(backend, crypto=crypto, raw=raw)
+    assert len(loaded) == 1
+    assert loaded[0].session == 0
+    assert not loaded[0].suspect
+    assert not list(tmp_path.glob("oddarchiver_manifests_*"))
+
+
+def test_read_manifest_refuses_plaintext_on_encrypted_format2(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        With a real key, refuse every plaintext manifest.json.
+        Without a real key, allow a plaintext archive manifest.
+    """
+    from oddarchiver.crypto import KeyfileCrypto, generate_keyfile
+    key = tmp_path / "k.key"
+    generate_keyfile(str(key))
+    crypto = KeyfileCrypto(str(key))
+    write_manifest(tmp_path, _make_manifest())
+    path = tmp_path / "manifest.json"
+    with pytest.raises(ValueError, match="manifest.json"):
+        read_manifest(path, crypto, format_2=True)
+    with pytest.raises(ValueError, match="manifest.json"):
+        read_manifest(path, crypto, encrypted_mode=True)
+    with pytest.raises(ValueError, match="manifest.json"):
+        read_manifest(path, crypto)
+    loaded = read_manifest(path)
+    assert not loaded.suspect
+    assert loaded.session == 0
+
+
+def test_read_manifest_wrong_key_stays_suspect(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        A manifest.enc that does not decrypt stays a SUSPECT manifest.
+        The format 2 change does not alter this path.
+    """
+    from oddarchiver.crypto import KeyfileCrypto, generate_keyfile
+    right, wrong = tmp_path / "r.key", tmp_path / "w.key"
+    generate_keyfile(str(right))
+    generate_keyfile(str(wrong))
+    write_manifest(tmp_path, _make_manifest(), KeyfileCrypto(str(right)))
+    loaded = read_manifest(tmp_path / "manifest.enc", KeyfileCrypto(str(wrong)))
+    assert loaded.suspect
+    assert loaded.session == -1

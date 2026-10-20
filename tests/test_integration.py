@@ -12,21 +12,21 @@ Description:
 # Imports
 import argparse
 import hashlib
+import logging
 import json
 import shutil
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 
 from oddarchiver.cli import dispatch
 from oddarchiver.disc import ISOBackend
-from oddarchiver.session import build_staging
-from oddarchiver.crypto import NullCrypto
 import oddarchiver.session as session_mod
+from tests.helpers import _assert_staging_sigint
 
 # Globals
 SMALL_DISC = 100 * 2**20  # 100 MiB - room for several sessions
+logger = logging.getLogger(__name__)
 
 
 # Functions
@@ -178,28 +178,15 @@ def test_sigint_during_staging_removes_staging_dir(tmp_path):
     staging_root.mkdir()
     expected_staging = staging_root / "oddarchiver_staging_003"
 
-    real_sha256 = session_mod._sha256_file
+    real_hash = session_mod.hash_file
 
-    def sha256_then_signal(path: Path) -> str:
+    def hash_then_signal(path, chunk_size, digest=None):
         session_mod._sigint_received = True
-        return real_sha256(path)
+        return real_hash(path, chunk_size, digest)
 
-    original_sha = session_mod._sha256_file
-    session_mod._sha256_file = sha256_then_signal
-    try:
-        with pytest.raises(KeyboardInterrupt):
-            build_staging(
-                session_n=3,
-                source=source,
-                disc_state={},
-                disc_origin={},
-                backend=backend,
-                cache=cache,
-                crypto=NullCrypto(),
-                _staging_root=staging_root,
-            )
-    finally:
-        session_mod._sha256_file = original_sha
+    _assert_staging_sigint(
+        3, source, backend, cache, staging_root, hash_then_signal, real_hash,
+    )
 
     assert not expected_staging.exists(), "staging dir must be removed after SIGINT"
 

@@ -11,52 +11,30 @@ Description:
 """
 # Imports
 import argparse
+import io
 import json
+import logging
+import re
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from oddarchiver.cache import CacheManager
-from oddarchiver.cli import _volume_iso_path, dispatch
+from oddarchiver.cli import _volume_iso_path, build_parser, dispatch
+from oddarchiver.crypto import generate_keyfile
 from oddarchiver.disc import ISOBackend, parse_disc_size
-from oddarchiver.volume import read_volume_marker
+from oddarchiver.volume import VolumeMarker, read_volume_marker
+from tests.helpers import _make_args
 
 # Globals
 SMALL_DISC = 50 * 2**20  # 50 MiB. Room for a non-splitting session 0.
 _FILE_BYTES = 80_000
 _DISC_THAT_SPLITS = 100_000  # 0.95 * this holds one 80 KB file, not two.
+logger = logging.getLogger(__name__)
 
 
 # Functions
-
-
-def _make_args(**kwargs) -> argparse.Namespace:
-    """
-    Input:  kwargs - field overrides for the Namespace
-    Output: argparse.Namespace with sensible defaults for test commands
-    """
-    defaults = {
-        "command": "init",
-        "source": None,
-        "dest": None,
-        "device": "/dev/sr0",
-        "test_iso": None,
-        "label": "TEST",
-        "encrypt": "none",
-        "key": None,
-        "dry_run": False,
-        "no_cache": False,
-        "disc_size": "50mb",
-        "prefill": None,
-        "session": None,
-        "force": False,
-        "level": "fast",
-        "mirror": None,
-        "recover_scan": False,
-    }
-    defaults.update(kwargs)
-    return argparse.Namespace(**defaults)
 
 
 def _tree_bytes(root: Path) -> dict[str, bytes]:
@@ -178,6 +156,39 @@ def test_init_without_split_writes_volume_marker(tmp_path):
     assert marker.created_at
 
 
+def _assert_marker_fields(
+    marker: VolumeMarker | None, index: int, first_session: int, label: str,
+) -> None:
+    """Input: marker and expected fields. Output: None; checks marker."""
+    assert marker is not None
+    assert marker.volume_index == index
+    assert marker.first_session == first_session
+    assert marker.previous_volume_label == label
+
+
+def _assert_volume_markers(backends: list[ISOBackend]) -> None:
+    """Input: three ISO backends. Output: None; checks volume markers."""
+    marker0 = read_volume_marker(backends[0])
+    marker1 = read_volume_marker(backends[1])
+    marker2 = read_volume_marker(backends[2])
+    _assert_marker_fields(marker0, 0, 0, "")
+    _assert_marker_fields(marker1, 1, 1, "TEST")
+    _assert_marker_fields(marker2, 2, 2, "TEST")
+    assert marker0.archive_id == marker1.archive_id == marker2.archive_id
+
+
+def _assert_reconstructed_tree(
+    union: dict[str, bytes], source: Path, dest: Path,
+) -> None:
+    """Input: volume bytes and tree paths. Output: None; checks reconstruction."""
+    dest.mkdir()
+    for rel, data in union.items():
+        path = dest / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    assert _tree_bytes(dest) == _tree_bytes(source)
+
+
 def test_init_across_three_iso_volumes_covers_source(tmp_path, monkeypatch):
     """
     Input:  tmp_path, monkeypatch
@@ -224,28 +235,55 @@ def test_init_across_three_iso_volumes_covers_source(tmp_path, monkeypatch):
     union = _union_volume_files(backends)
     assert union == _tree_bytes(source)
 
-    dest = tmp_path / "restored"
-    dest.mkdir()
-    for rel, data in union.items():
-        path = dest / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-    assert _tree_bytes(dest) == _tree_bytes(source)
+    _assert_reconstructed_tree(union, source, tmp_path / "restored")
 
-    marker0 = read_volume_marker(backends[0])
-    marker1 = read_volume_marker(backends[1])
-    marker2 = read_volume_marker(backends[2])
-    assert marker0 is not None and marker1 is not None and marker2 is not None
-    assert marker0.volume_index == 0
-    assert marker1.volume_index == 1
-    assert marker2.volume_index == 2
-    assert marker0.first_session == 0
-    assert marker1.first_session == 1
-    assert marker2.first_session == 2
-    assert marker0.archive_id == marker1.archive_id == marker2.archive_id
-    assert marker0.previous_volume_label == ""
-    assert marker1.previous_volume_label == "TEST"
-    assert marker2.previous_volume_label == "TEST"
+    _assert_volume_markers(backends)
+
+
+def _dispatch_promptable(args: argparse.Namespace, response: str) -> int:
+    """Input: CLI arguments and prompt reply. Output: dispatch exit code."""
+    with patch("oddarchiver.cli._make_backend", _promptable_factory), \
+         patch("builtins.input", return_value=response):
+        return dispatch(args)
+
+
+def _assert_cache_commit(
+    cache_dir: Path, committed: dict[str, bytes], leftover: set[str],
+) -> None:
+    """Input: cache path and file sets. Output: None; checks cached files."""
+    cache = CacheManager(cache_dir)
+    for rel in committed:
+        assert cache.get(rel, 0) is not None
+    for rel in leftover:
+        assert cache.get(rel, 0) is None
+
+
+def _assert_resumed_files(
+    tmp_path: Path, iso: Path, source: Path,
+    committed: dict[str, bytes], leftover: set[str],
+) -> None:
+    """Input: volume paths and file sets. Output: None; checks resumed files."""
+    vol0_after = _files_on_backend(ISOBackend(iso, disc_size=_DISC_THAT_SPLITS))
+    assert set(committed).issubset(vol0_after)
+    assert not leftover.intersection(vol0_after)
+
+    later = []
+    vol1_path = tmp_path / "archive.vol1.iso"
+    if vol1_path.is_file():
+        later.append(ISOBackend(vol1_path, disc_size=_DISC_THAT_SPLITS))
+    vol2_path = tmp_path / "archive.vol2.iso"
+    if vol2_path.is_file():
+        later.append(ISOBackend(vol2_path, disc_size=_DISC_THAT_SPLITS))
+    resumed = {}
+    for backend in later:
+        resumed.update(_files_on_backend(backend))
+    # An empty first-chunk append on the full volume 0 is allowed; leftover
+    # file bytes must still land on a later volume, never as a duplicate.
+    assert set(resumed) >= leftover
+    union = _union_volume_files(
+        [ISOBackend(iso, disc_size=_DISC_THAT_SPLITS), *later]
+    )
+    assert union == _tree_bytes(source)
 
 
 def test_abort_after_volume_0_then_sync_resumes_leftovers(tmp_path, monkeypatch):
@@ -277,9 +315,7 @@ def test_abort_after_volume_0_then_sync_resumes_leftovers(tmp_path, monkeypatch)
         disc_size=str(_DISC_THAT_SPLITS),
     )
 
-    with patch("oddarchiver.cli._make_backend", _promptable_factory), \
-         patch("builtins.input", return_value="q"):
-        rc = dispatch(args)
+    rc = _dispatch_promptable(args, "q")
     assert rc == 1
     assert iso.is_file()
     assert not (tmp_path / "archive.vol1.iso").exists()
@@ -291,11 +327,7 @@ def test_abort_after_volume_0_then_sync_resumes_leftovers(tmp_path, monkeypatch)
     leftover = set(_tree_bytes(source)) - set(committed)
     assert leftover
 
-    cache = CacheManager(cache_dir)
-    for rel in committed:
-        assert cache.get(rel, 0) is not None
-    for rel in leftover:
-        assert cache.get(rel, 0) is None
+    _assert_cache_commit(cache_dir, committed, leftover)
 
     rc = dispatch(_make_args(
         command="sync",
@@ -305,27 +337,92 @@ def test_abort_after_volume_0_then_sync_resumes_leftovers(tmp_path, monkeypatch)
     ))
     assert rc == 0
 
-    vol0_after = _files_on_backend(ISOBackend(iso, disc_size=_DISC_THAT_SPLITS))
-    assert set(committed).issubset(vol0_after)
-    assert not leftover.intersection(vol0_after)
+    _assert_resumed_files(tmp_path, iso, source, committed, leftover)
 
-    later = []
-    vol1_path = tmp_path / "archive.vol1.iso"
-    if vol1_path.is_file():
-        later.append(ISOBackend(vol1_path, disc_size=_DISC_THAT_SPLITS))
-    vol2_path = tmp_path / "archive.vol2.iso"
-    if vol2_path.is_file():
-        later.append(ISOBackend(vol2_path, disc_size=_DISC_THAT_SPLITS))
-    resumed = {}
-    for backend in later:
-        resumed.update(_files_on_backend(backend))
-    # An empty first-chunk append on the full volume 0 is allowed; leftover
-    # file bytes must still land on a later volume, never as a duplicate.
-    assert set(resumed) >= leftover
-    union = _union_volume_files(
-        [ISOBackend(iso, disc_size=_DISC_THAT_SPLITS), *later]
+
+def _assert_rescue_not_logged(log_text: str, home: Path, code: str) -> None:
+    """Input: log text, home path, code. Output: None; checks log secrecy."""
+    assert code not in log_text
+    log_file = home / "logs" / "oddarchiver.log"
+    assert log_file.is_file()
+    assert code not in log_file.read_text(encoding="utf-8")
+
+
+def _assert_rescue_output(
+    rc: int, before_prompt: list[str], output: str,
+    log_text: str, home: Path, iso: Path, tmp_path: Path,
+) -> str:
+    """Input: dispatch results and paths. Output: checked rescue code."""
+    assert rc == 1
+    assert len(before_prompt) == 1
+    assert "RESCUE KEY" in before_prompt[0]
+    assert output.count("RESCUE KEY") == 1
+    code_match = re.search(
+        r"(?m)^[A-Z2-7]{4}(?:-[A-Z2-7]{4}){12}$", output,
     )
-    assert union == _tree_bytes(source)
+    assert code_match is not None
+    code = code_match.group()
+    assert output.count(code) == 1
+    _assert_rescue_not_logged(log_text, home, code)
+    assert iso.is_file()
+    assert not (tmp_path / "archive.vol1.iso").exists()
+    return code
+
+
+def test_encrypted_abort_prints_rescue_before_prompt_and_restores(
+    tmp_path, monkeypatch, capsys, caplog,
+):
+    """A stopped init prints one rescue code for the verified first volume."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(
+        "oddarchiver.cli.CacheManager",
+        lambda *a, **k: CacheManager(cache_dir),
+    )
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.bin").write_bytes(b"A" * _FILE_BYTES)
+    (source / "b.bin").write_bytes(b"B" * _FILE_BYTES)
+    keyfile = tmp_path / "archive.key"
+    generate_keyfile(str(keyfile))
+    iso = tmp_path / "archive.iso"
+    args = _make_args(
+        source=str(source),
+        test_iso=str(iso),
+        disc_size=str(_DISC_THAT_SPLITS),
+        encrypt="keyfile",
+        key=str(keyfile),
+    )
+    before_prompt = []
+
+    def abort_at_prompt(_prompt):
+        before_prompt.append(capsys.readouterr().out)
+        return "q"
+
+    with caplog.at_level(logging.INFO), \
+         patch("oddarchiver.cli._make_backend", _promptable_factory), \
+         patch("builtins.input", side_effect=abort_at_prompt):
+        rc = dispatch(args)
+    output = "".join(before_prompt) + capsys.readouterr().out
+    code = _assert_rescue_output(
+        rc, before_prompt, output, caplog.text, home, iso, tmp_path,
+    )
+
+    keyfile.unlink()
+    dest = tmp_path / "dest"
+    monkeypatch.setattr("oddarchiver.cli.sys.stdin", io.StringIO(code + "\n"))
+    rc = dispatch(build_parser().parse_args([
+        "restore", str(dest), "--test-iso", str(iso), "--rescue-key",
+    ]))
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    restored = _tree_bytes(dest)
+    expected = _tree_bytes(source)
+    assert restored
+    assert set(restored) < set(expected)
+    assert all(expected[name] == data for name, data in restored.items())
 
 
 def test_confirm_without_swapping_disc_refuses_nonblank(tmp_path):
@@ -349,9 +446,7 @@ def test_confirm_without_swapping_disc_refuses_nonblank(tmp_path):
         disc_size=str(_DISC_THAT_SPLITS),
     )
 
-    with patch("oddarchiver.cli._make_backend", _promptable_factory), \
-         patch("builtins.input", return_value=""):
-        rc = dispatch(args)
+    rc = _dispatch_promptable(args, "")
     assert rc == 1
     assert iso.is_file()
     committed = _files_on_backend(ISOBackend(iso, disc_size=_DISC_THAT_SPLITS))

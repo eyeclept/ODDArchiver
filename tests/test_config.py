@@ -29,7 +29,7 @@ def test_default_values(tmp_path):
     assert cfg.device == "/dev/sr0"
     assert cfg.delta_threshold == pytest.approx(0.90)
     assert cfg.space_safety_margin == pytest.approx(0.95)
-    assert cfg.post_burn_verify is True
+    assert cfg.post_burn_verify
     assert cfg.encryption_mode == "none"
     assert cfg.disc_size == "25gb"
     assert cfg.staging_dir is None
@@ -52,7 +52,7 @@ def test_config_file_loaded(tmp_path):
     assert cfg.device == "/dev/sr1"
     assert cfg.delta_threshold == pytest.approx(0.75)
     assert cfg.disc_size == "50gb"
-    assert cfg.post_burn_verify is False
+    assert not cfg.post_burn_verify
     assert cfg.encryption_mode == "passphrase"
 
 

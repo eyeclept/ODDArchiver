@@ -18,7 +18,8 @@ from pathlib import Path
 
 # Globals
 DELTA_THRESHOLD = 0.90  # Store the full file when the delta is more than 90% of the full size.
-_log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+_log = logger
 
 # Functions
 
@@ -58,6 +59,35 @@ def compute_delta(old_bytes: bytes, new_path: Path) -> bytes:
         delta, err = proc.communicate()
     finally:
         os.close(fd)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"xdelta3 encode failed (exit {proc.returncode}): {err.decode()}"
+        )
+    return delta
+
+
+def compute_delta_bytes(old_bytes: bytes, new_bytes: bytes) -> bytes:
+    """
+    Input: old_bytes and new_bytes - previous and captured file content
+    Output: Raw xdelta3 delta bytes
+    Details: Send both versions through anonymous file descriptors.
+    """
+    old_fd = _memfd_with_bytes("oddarchiver_delta_src", old_bytes)
+    try:
+        new_fd = _memfd_with_bytes("oddarchiver_delta_new", new_bytes)
+        try:
+            proc = subprocess.Popen(
+                ["xdelta3", "-e", "-c", "-s", f"/proc/self/fd/{old_fd}",
+                 f"/proc/self/fd/{new_fd}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                pass_fds=(old_fd, new_fd),
+            )
+            delta, err = proc.communicate()
+        finally:
+            os.close(new_fd)
+    finally:
+        os.close(old_fd)
     if proc.returncode != 0:
         raise RuntimeError(
             f"xdelta3 encode failed (exit {proc.returncode}): {err.decode()}"
@@ -109,7 +139,7 @@ def delta_or_full(old_bytes: bytes, new_path: Path) -> tuple[str, bytes]:
     full_kb = len(full_bytes) // 1024
     delta_kb = len(delta_bytes) // 1024
 
-    if len(full_bytes) > 0 and len(delta_bytes) > DELTA_THRESHOLD * len(full_bytes):
+    if full_bytes and len(delta_bytes) > DELTA_THRESHOLD * len(full_bytes):
         _log.info(
             "%s: delta %dKB vs full %dKB -- storing full",
             new_path.name,
@@ -127,6 +157,42 @@ def delta_or_full(old_bytes: bytes, new_path: Path) -> tuple[str, bytes]:
     return ("delta", delta_bytes)
 
 
+def _ordered_delta_results(
+    futures: dict, size: int,
+) -> list[tuple[str, bytes]]:
+    """Input: futures and result count. Output: results in input order."""
+    results: list[tuple[str, bytes] | None] = [None] * size
+    for future in as_completed(futures):
+        idx = futures[future]
+        results[idx] = future.result()
+    return results  # type: ignore[return-value]
+
+
+def process_bytes_files(
+    jobs: list[tuple[bytes, bytes]],
+    max_workers: int = 4,
+) -> list[tuple[str, bytes]]:
+    """
+    Input: jobs - previous and new content pairs
+    Output: One ("delta", bytes) or ("full", bytes) result per job
+    Details: Run every captured-content encode in one parallel batch.
+    """
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_delta_or_full_bytes, old, new): idx
+            for idx, (old, new) in enumerate(jobs)
+        }
+        return _ordered_delta_results(futures, len(jobs))
+
+
+def _delta_or_full_bytes(old_bytes: bytes, new_bytes: bytes) -> tuple[str, bytes]:
+    """Input: old and new content. Output: delta or full content and kind."""
+    delta_bytes = compute_delta_bytes(old_bytes, new_bytes)
+    if new_bytes and len(delta_bytes) > DELTA_THRESHOLD * len(new_bytes):
+        return ("full", new_bytes)
+    return ("delta", delta_bytes)
+
+
 def process_files(
     jobs: list[tuple[bytes, Path]],
     max_workers: int = 4,
@@ -141,16 +207,12 @@ def process_files(
         The results stay in input order. The order does not depend on the
         order in which the jobs complete.
     """
-    results: list[tuple[str, bytes] | None] = [None] * len(jobs)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(delta_or_full, old, path): idx
             for idx, (old, path) in enumerate(jobs)
         }
-        for future in as_completed(futures):
-            idx = futures[future]
-            results[idx] = future.result()
-    return results  # type: ignore[return-value]
+        return _ordered_delta_results(futures, len(jobs))
 
 
 if __name__ == "__main__":

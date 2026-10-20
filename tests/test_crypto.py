@@ -7,7 +7,9 @@ Description:
     Tests for oddarchiver.crypto. NullCrypto, PassphraseCrypto, KeyfileCrypto.
 """
 # Imports
+import logging
 import os
+import stat
 import tempfile
 
 import pytest
@@ -21,9 +23,19 @@ from oddarchiver.crypto import (
 )
 import oddarchiver.crypto as crypto_mod
 
+# Globals
+logger = logging.getLogger(__name__)
+_log = logger
+
 # Functions
 
 SAMPLE_PLAINTEXT = b"Hello, ODDArchiver! \x00\xff\xde\xad\xbe\xef"
+
+
+def _assert_null_crypto_identity(operation: str) -> None:
+    """Input: operation - encryption or decryption method. Output: None."""
+    nc = NullCrypto()
+    assert getattr(nc, operation)(SAMPLE_PLAINTEXT) == SAMPLE_PLAINTEXT
 
 
 class TestNullCrypto:
@@ -32,12 +44,10 @@ class TestNullCrypto:
         assert nc.decrypt(nc.encrypt(SAMPLE_PLAINTEXT)) == SAMPLE_PLAINTEXT
 
     def test_encrypt_is_identity(self):
-        nc = NullCrypto()
-        assert nc.encrypt(SAMPLE_PLAINTEXT) == SAMPLE_PLAINTEXT
+        _assert_null_crypto_identity("encrypt")
 
     def test_decrypt_is_identity(self):
-        nc = NullCrypto()
-        assert nc.decrypt(SAMPLE_PLAINTEXT) == SAMPLE_PLAINTEXT
+        _assert_null_crypto_identity("decrypt")
 
 
 class TestPassphraseCrypto:
@@ -105,8 +115,68 @@ class TestKeyfileCrypto:
         bad = str(tmp_path / "bad.bin")
         with open(bad, "wb") as fh:
             fh.write(b"short")
-        with pytest.raises(ValueError):
+        os.chmod(bad, 0o600)
+        with pytest.raises(ValueError, match="exactly 32 bytes"):
             KeyfileCrypto(bad)
+
+    def test_generate_keyfile_uses_private_mode_under_umask(self, tmp_path):
+        path = tmp_path / "keyfile.bin"
+        previous = os.umask(0o022)
+        try:
+            generate_keyfile(str(path))
+        finally:
+            os.umask(previous)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert len(path.read_bytes()) == 32
+
+    def test_generate_keyfile_refuses_existing_file(self, tmp_path):
+        path = tmp_path / "keyfile.bin"
+        path.write_bytes(b"keep this key")
+        with pytest.raises(FileExistsError, match="already exists"):
+            generate_keyfile(str(path))
+        assert path.read_bytes() == b"keep this key"
+
+    def test_generate_keyfile_cleans_up_failed_write(self, tmp_path, monkeypatch):
+        path = tmp_path / "keyfile.bin"
+        def fail_write(_fd, _data):
+            raise OSError("test write failure")
+        monkeypatch.setattr(crypto_mod.os, "write", fail_write)
+        with pytest.raises(OSError, match="test write failure"):
+            generate_keyfile(str(path))
+        assert not path.exists()
+
+    def test_world_readable_keyfile_is_refused(self, tmp_path):
+        path = tmp_path / "keyfile.bin"
+        path.write_bytes(b"x" * 32)
+        path.chmod(0o644)
+        with pytest.raises(ValueError, match="mode 0644") as error:
+            KeyfileCrypto(str(path))
+        assert str(path) in str(error.value)
+        assert f"chmod 600 {path}" in str(error.value)
+
+    def test_symlinked_keyfile_is_refused(self, tmp_path):
+        target = tmp_path / "keyfile.bin"
+        generate_keyfile(str(target))
+        link = tmp_path / "link.bin"
+        link.symlink_to(target)
+        with pytest.raises(ValueError, match="symlink"):
+            KeyfileCrypto(str(link))
+
+    def test_nonregular_keyfile_is_refused(self, tmp_path):
+        path = tmp_path / "pipe.bin"
+        os.mkfifo(path, 0o600)
+        with pytest.raises(ValueError, match="Use a regular file"):
+            KeyfileCrypto(str(path))
+
+    def test_other_users_keyfile_is_refused(self, tmp_path, monkeypatch):
+        path = tmp_path / "keyfile.bin"
+        generate_keyfile(str(path))
+        uid = os.getuid()
+        monkeypatch.setattr(crypto_mod.os, "getuid", lambda: uid + 1)
+        with pytest.raises(ValueError, match="Use a regular file that you own") as error:
+            KeyfileCrypto(str(path))
+        assert str(path) in str(error.value)
+        assert "mode 0600" in str(error.value)
 
     def test_no_plaintext_in_tmp(self, keyfile):
         # Encrypt does not write any temp files

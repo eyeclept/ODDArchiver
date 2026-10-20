@@ -9,6 +9,7 @@ Description:
 """
 # Imports
 import hashlib
+import logging
 import os
 import time
 from pathlib import Path
@@ -17,75 +18,21 @@ import pytest
 
 from oddarchiver.crypto import NullCrypto
 from oddarchiver.disc import ISOBackend
-from oddarchiver.manifest import Manifest, ManifestEntry, write_manifest
 from oddarchiver.restore import restore
+from tests.helpers import _make_staging
 
 # Globals
 SMALL_DISC = 20 * 2**20  # 20 MiB - fast ISO builds
 _crypto = NullCrypto()
+logger = logging.getLogger(__name__)
 
 
 # Functions
 
 
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def _blob_id(session_n: int, rel_path: str) -> str:
-    """Matching session.py _blob_id: sha256(session_n:rel_path)."""
+    """Input: session and path. Output: a legacy blob name for this fixture."""
     return hashlib.sha256(f"{session_n}:{rel_path}".encode()).hexdigest()
-
-
-def _make_staging(tmp_path: Path, session_n: int, files: dict[str, bytes],
-                  deleted: list[str] | None = None,
-                  based_on: int | None = None) -> Path:
-    """
-    Input:  tmp_path  - base temp directory
-            session_n - session index
-            files     - {rel_path: content} for this session (all written as "full")
-            deleted   - list of rel_paths deleted in this session
-            based_on  - based_on_session field
-    Output: Path to staging directory ready for backend.init/append
-    Details:
-        Writes each file as an unencrypted blob (NullCrypto identity).
-        Blob filenames are sha256(session_n:rel_path) matching session.py.
-        Builds a valid manifest.json with correct checksums.
-    """
-    session_name = f"session_{session_n:03d}"
-    staging = tmp_path / f"staging_{session_n}"
-    session_dir = staging / session_name
-    full_dir = session_dir / "full"
-    full_dir.mkdir(parents=True)
-
-    entries = []
-    for rel_path, content in files.items():
-        blob = _crypto.encrypt(content)  # NullCrypto: blob == content
-        blob_name = _blob_id(session_n, rel_path)
-        dest = full_dir / blob_name
-        dest.write_bytes(blob)
-        entries.append(ManifestEntry(
-            path=rel_path,
-            type="full",
-            result_checksum=_sha256(content),
-            full_size_bytes=len(content),
-            file=f"{session_name}/full/{blob_name}",
-        ))
-
-    manifest = Manifest(
-        version=1,
-        session=session_n,
-        timestamp="2026-04-23T00:00:00Z",
-        source="/src",
-        label="TEST",
-        based_on_session=based_on,
-        encryption={},
-        entries=entries,
-        deleted=deleted or [],
-        manifest_checksum="",
-    )
-    write_manifest(session_dir, manifest)
-    return staging
 
 
 def _burn(backend: ISOBackend, staging: Path, session_n: int) -> None:
@@ -218,6 +165,32 @@ def test_checksum_mismatch_logs_error_no_corrupt_file(tmp_path, caplog):
     assert restored == 0
     assert not (dest / "a.txt").exists()
     assert any("Checksum mismatch" in r.message for r in caplog.records)
+
+
+def test_suspect_manifest_in_range_counts_as_failure(tmp_path, caplog):
+    """
+    Input:  tmp_path, caplog
+    Output: None
+    Details:
+        A suspect manifest inside the requested session range must make
+        restore report a failure. It must not silently skip its files.
+    """
+    iso = tmp_path / "test.iso"
+    backend = ISOBackend(iso, disc_size=SMALL_DISC)
+    _burn(backend, _make_staging(tmp_path, 0, {"a.txt": b"alpha"}), session_n=0)
+    _burn(backend, _make_staging(tmp_path, 1, {"b.txt": b"bravo"}, based_on=0), session_n=1)
+
+    manifest_path = backend._sessions_root / "session_001" / "manifest.json"
+    manifest_path.write_bytes(manifest_path.read_bytes() + b"tamper")
+
+    dest = tmp_path / "dest"
+    with caplog.at_level(logging.ERROR, logger="oddarchiver.restore"):
+        restored, failures = restore(dest, backend, _crypto)
+
+    assert failures >= 1
+    assert not (dest / "b.txt").exists()
+    assert (dest / "a.txt").read_bytes() == b"alpha"
+    assert any("session 1" in r.message for r in caplog.records)
 
 
 def test_deleted_files_not_restored(tmp_path):

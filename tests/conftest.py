@@ -7,7 +7,11 @@ Description:
     Session-wide test fixtures.
 """
 # Imports
+import logging
 import pytest
+
+# Globals
+logger = logging.getLogger(__name__)
 
 # Fixtures
 
@@ -18,23 +22,30 @@ def _isolated_staging_root(tmp_path, monkeypatch):
     Input:  tmp_path, monkeypatch - pytest built-in fixtures
     Output: None
     Details:
-        Forces oddarchiver.session._default_staging_root() to resolve under a
-        fresh per-test tmp_path by overriding XDG_RUNTIME_DIR, for every test
-        in the suite. Without this, any code path that reaches build_staging()
-        without an explicit _staging_root override -- notably cli.py's
-        _run_init/_run_sync, exercised directly (not mocked) by
-        tests/test_cli_e2e.py -- falls back to the real
-        $XDG_RUNTIME_DIR/oddarchiver location also used by production
-        oddarchiver processes on this machine. A test run landing there while
-        a real oddarchiver burn is staging into the same deterministically
-        named session directory silently deletes the real build's in-flight
-        files mid-burn; see Assist/HANDOVER_disc_sync_bug.md for the incident
-        this fixture exists to prevent from recurring.
-        Individual tests that need to exercise _default_staging_root() itself
-        (e.g. tests/test_security.py) still set XDG_RUNTIME_DIR explicitly via
-        their own monkeypatch call; that later setenv simply overrides this
-        fixture's value for the remainder of that test, and monkeypatch
-        restores both in the correct order on teardown.
+        Give each test private HOME, runtime, cache, and state directories.
+        A test can override these values with its own monkeypatch.
     """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "xdg_runtime"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg_cache"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
+
+
+@pytest.fixture(autouse=True)
+def _restore_root_logging():
+    """
+    Input:  None
+    Output: None
+    Details:
+        Remove and close root handlers a test adds, and restore the root level.
+        A leaked stderr handler would write to a closed capture stream in later tests.
+    """
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+    yield
+    for handler in root.handlers[:]:
+        if handler not in saved_handlers:
+            root.removeHandler(handler)
+            handler.close()
+    root.setLevel(saved_level)

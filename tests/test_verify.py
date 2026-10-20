@@ -8,82 +8,28 @@ Description:
 """
 # Imports
 import hashlib
+import logging
 from pathlib import Path
 
 import pytest
 
 from oddarchiver.crypto import NullCrypto
 from oddarchiver.disc import ISOBackend
-from oddarchiver.manifest import Manifest, ManifestEntry, write_manifest
 from oddarchiver.verify import verify
+from tests.helpers import _make_staging
 
 # Globals
 SMALL_DISC = 20 * 2**20  # 20 MiB
 _crypto = NullCrypto()
+logger = logging.getLogger(__name__)
 
 
 # Functions
 
 
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def _blob_id(session_n: int, rel_path: str) -> str:
-    """Matching session.py _blob_id: sha256(session_n:rel_path)."""
+    """Input: session and path. Output: a legacy blob name for this fixture."""
     return hashlib.sha256(f"{session_n}:{rel_path}".encode()).hexdigest()
-
-
-def _make_staging(
-    tmp_path: Path,
-    session_n: int,
-    files: dict[str, bytes],
-    deleted: list[str] | None = None,
-    based_on: int | None = None,
-    timestamp: str = "2026-04-23T00:00:00Z",
-) -> Path:
-    """
-    Input:  tmp_path, session_n, files - base dir, session index, file contents
-            deleted, based_on, timestamp - optional manifest fields
-    Output: staging Path ready for ISOBackend.init / append
-    Details:
-        Writes NullCrypto blobs (plaintext == ciphertext) and a valid manifest.
-        Blob filenames are sha256(session_n:rel_path) matching session.py.
-    """
-    session_name = f"session_{session_n:03d}"
-    staging = tmp_path / f"staging_{session_n}"
-    session_dir = staging / session_name
-    full_dir = session_dir / "full"
-    full_dir.mkdir(parents=True)
-
-    entries = []
-    for rel_path, content in files.items():
-        blob = _crypto.encrypt(content)
-        blob_name = _blob_id(session_n, rel_path)
-        dest = full_dir / blob_name
-        dest.write_bytes(blob)
-        entries.append(ManifestEntry(
-            path=rel_path,
-            type="full",
-            result_checksum=_sha256(content),
-            full_size_bytes=len(content),
-            file=f"{session_name}/full/{blob_name}",
-        ))
-
-    manifest = Manifest(
-        version=1,
-        session=session_n,
-        timestamp=timestamp,
-        source="/src",
-        label="TEST",
-        based_on_session=based_on,
-        encryption={},
-        entries=entries,
-        deleted=deleted or [],
-        manifest_checksum="",
-    )
-    write_manifest(session_dir, manifest)
-    return staging
 
 
 def _burn(backend: ISOBackend, staging: Path, session_n: int) -> None:
@@ -109,7 +55,7 @@ def test_fast_ok_on_clean_iso(tmp_path):
     _burn(backend, _make_staging(tmp_path, 0, {"a.txt": b"hello"}), session_n=0)
 
     result = verify(backend, _crypto, level="fast")
-    assert result is True
+    assert result
 
 
 def test_fast_fail_on_tampered_manifest(tmp_path, capsys):
@@ -174,7 +120,7 @@ def test_full_ok_on_clean_iso(tmp_path):
     _burn(backend, _make_staging(tmp_path, 1, {"b.txt": b"beta"}, based_on=0, timestamp="2026-04-23T01:00:00Z"), session_n=1)
 
     result = verify(backend, _crypto, level="full")
-    assert result is True
+    assert result
 
 
 def test_failed_session_reported_per_session_others_ok(tmp_path, capsys):

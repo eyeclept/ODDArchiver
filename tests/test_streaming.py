@@ -7,6 +7,7 @@ Description:
     Tests for streaming encryption and I/O of files above STREAM_CHUNK_SIZE.
 """
 # Imports
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -26,8 +27,10 @@ from oddarchiver.disc import DiscInfo, ISOBackend
 from oddarchiver.manifest import read_manifest
 from oddarchiver.restore import restore
 from oddarchiver.verify import verify
+from tests.helpers import _assert_build_staging_interrupted
 
 # Globals
+logger = logging.getLogger(__name__)
 CHUNK = 64
 SMALL_DISC = 50 * 2**20
 _LARGE_REMAINING = 25 * 2**30
@@ -42,7 +45,7 @@ def _patch_chunk(monkeypatch) -> None:
     monkeypatch.setattr(session_mod, "STREAM_CHUNK_SIZE", CHUNK)
     import oddarchiver.restore as restore_mod
     import oddarchiver.verify as verify_mod
-    monkeypatch.setattr(restore_mod, "STREAM_CHUNK_SIZE", CHUNK)
+    monkeypatch.setattr(restore_mod, "HASH_CHUNK_SIZE", CHUNK)
     monkeypatch.setattr(verify_mod, "STREAM_CHUNK_SIZE", CHUNK)
 
 
@@ -86,7 +89,7 @@ def _wrap_aead(monkeypatch, chunk: int) -> list[int]:
 
     def wrapped(self, nonce, data, associated_data=None):
         caller = inspect.stack()[1].function
-        if caller == "_encrypt_chunks":
+        if caller in ("_encrypt_chunks", "_encrypt_bound_chunks"):
             seen.append(len(data))
             assert len(data) <= chunk, (
                 f"streaming AEAD encrypt saw {len(data)} bytes, chunk is {chunk}"
@@ -95,6 +98,19 @@ def _wrap_aead(monkeypatch, chunk: int) -> list[int]:
 
     monkeypatch.setattr(ChaCha20Poly1305, "encrypt", wrapped)
     return seen
+
+
+def _assert_streamed_entry(backend: ISOBackend, crypto: PassphraseCrypto) -> None:
+    """
+    Input:  backend - archive backend; crypto - manifest decryptor
+    Output: None
+    """
+    from oddarchiver.manifest import load_session_manifests
+    manifests = load_session_manifests(backend, crypto=crypto)
+    assert manifests
+    entries = [e for e in manifests[0].entries if e.path == "big.bin"]
+    assert entries and entries[0].streamed
+    assert entries[0].type == "full"
 
 
 def test_init_restore_streamed_file_no_overflow(tmp_path, monkeypatch):
@@ -126,12 +142,7 @@ def test_init_restore_streamed_file_no_overflow(tmp_path, monkeypatch):
 
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     crypto = PassphraseCrypto(passphrase="stream-e2e-pass")
-    from oddarchiver.manifest import load_session_manifests
-    manifests = load_session_manifests(backend, crypto=crypto)
-    assert manifests
-    entries = [e for e in manifests[0].entries if e.path == "big.bin"]
-    assert entries and entries[0].streamed is True
-    assert entries[0].type == "full"
+    _assert_streamed_entry(backend, crypto)
 
     dest = tmp_path / "dest"
     restored, failures = restore(dest, backend, crypto)
@@ -173,6 +184,21 @@ def test_init_restore_streamed_keyfile(tmp_path, monkeypatch):
     assert (dest / "big.bin").read_bytes() == payload
 
 
+def _assert_resized_entries(backend: ISOBackend, crypto: PassphraseCrypto) -> None:
+    """
+    Input:  backend - archive backend; crypto - manifest decryptor
+    Output: None
+    """
+    from oddarchiver.manifest import load_session_manifests
+    manifests = load_session_manifests(backend, crypto=crypto)
+    assert len(manifests) >= 2
+    s1 = {e.path: e for e in manifests[1].entries}
+    assert s1["shrink.bin"].type == "full"
+    assert not s1["shrink.bin"].streamed
+    assert s1["grow.bin"].type == "full"
+    assert s1["grow.bin"].streamed
+
+
 def test_shrink_large_then_grow_small(tmp_path, monkeypatch):
     """
     Input:  tmp_path, monkeypatch
@@ -206,14 +232,7 @@ def test_shrink_large_then_grow_small(tmp_path, monkeypatch):
 
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     # Session 1 entries: shrink must be a non-streamed full; grow streamed full.
-    from oddarchiver.manifest import load_session_manifests
-    manifests = load_session_manifests(backend, crypto=crypto)
-    assert len(manifests) >= 2
-    s1 = {e.path: e for e in manifests[1].entries}
-    assert s1["shrink.bin"].type == "full"
-    assert s1["shrink.bin"].streamed is False
-    assert s1["grow.bin"].type == "full"
-    assert s1["grow.bin"].streamed is True
+    _assert_resized_entries(backend, crypto)
 
     dest = tmp_path / "dest"
     restored, failures = restore(dest, backend, crypto)
@@ -221,6 +240,48 @@ def test_shrink_large_then_grow_small(tmp_path, monkeypatch):
     assert restored >= 1
     assert (dest / "shrink.bin").read_bytes() == b"small-now"
     assert (dest / "grow.bin").read_bytes() == b"G" * (CHUNK + 8)
+
+
+def test_force_restore_corrupt_streamed_blob_preserves_existing(tmp_path, monkeypatch):
+    """
+    Input:  tmp_path, monkeypatch
+    Output: None
+    Details:
+        A corrupted streamed blob with --force must fail and leave the
+        existing destination bytes untouched. No plaintext temp file remains.
+    """
+    _patch_chunk(monkeypatch)
+    monkeypatch.setenv("ODDARCHIVER_PASSPHRASE", "stream-force-pass")
+
+    source = tmp_path / "src"
+    source.mkdir()
+    payload = b"F" * (CHUNK + 3)
+    (source / "big.bin").write_bytes(payload)
+
+    iso = tmp_path / "test.iso"
+    rc = _dispatch([
+        "init", str(source), "--test-iso", str(iso),
+        "--encrypt", "passphrase", "--disc-size", "50mb", "--label", "TEST",
+    ])
+    assert rc == 0
+
+    backend = ISOBackend(iso, disc_size=SMALL_DISC)
+    from oddarchiver.manifest import load_session_manifests
+    entry = load_session_manifests(backend, PassphraseCrypto("stream-force-pass"))[0].entries[0]
+    blob_path = backend._sessions_root / entry.file
+    blob_path.write_bytes(b"CORRUPTED GARBAGE")
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    dest_file = dest / "big.bin"
+    dest_file.write_bytes(b"old destination bytes")
+
+    rc = _dispatch([
+        "restore", str(dest), "--test-iso", str(iso), "--force",
+    ])
+    assert rc == 1
+    assert dest_file.read_bytes() == b"old destination bytes"
+    assert not list(dest.glob(".oddarchiver_restore_*"))
 
 
 def test_verify_checksum_streamed_entry(tmp_path, monkeypatch, capsys):
@@ -246,10 +307,11 @@ def test_verify_checksum_streamed_entry(tmp_path, monkeypatch, capsys):
 
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
     crypto = NullCrypto()
-    assert verify(backend, crypto, level="checksum") is True
+    assert verify(backend, crypto, level="checksum")
 
-    from oddarchiver.session import _blob_id
-    blob_path = backend._sessions_root / "session_000" / "full" / _blob_id(0, "big.bin")
+    from oddarchiver.manifest import load_session_manifests
+    entry = load_session_manifests(backend, crypto)[0].entries[0]
+    blob_path = backend._sessions_root / entry.file
     blob_path.write_bytes(b"CORRUPTED GARBAGE")
 
     with pytest.raises(SystemExit) as exc:
@@ -271,7 +333,7 @@ def test_sigint_mid_encode_cleans_scratch(tmp_path, monkeypatch):
     _patch_chunk(monkeypatch)
     (tmp_path / "big.bin").write_bytes(b"Q" * (CHUNK + 1))
 
-    def boom(self, src: Path, dest: Path) -> None:
+    def boom(self, src: Path, dest: Path, offset=0, length=None, digest=None) -> None:
         dest.write_bytes(b"partial")
         raise KeyboardInterrupt
 
@@ -282,17 +344,9 @@ def test_sigint_mid_encode_cleans_scratch(tmp_path, monkeypatch):
     scratch = staging_root / "oddarchiver_scratch_000"
     staging = staging_root / "oddarchiver_staging_000"
 
-    with pytest.raises(KeyboardInterrupt):
-        session_mod.build_staging(
-            session_n=0,
-            source=tmp_path,
-            disc_state={},
-            disc_origin={},
-            backend=_make_backend(),
-            cache=_make_cache(),
-            crypto=NullCrypto(),
-            _staging_root=staging_root,
-        )
+    _assert_build_staging_interrupted(
+        tmp_path, _make_backend(), _make_cache(), staging_root,
+    )
 
     assert not scratch.exists(), "scratch dir must be removed after SIGINT"
     assert not staging.exists(), "staging dir must be removed after SIGINT"
@@ -324,9 +378,9 @@ def test_build_staging_marks_large_file_streamed(tmp_path, monkeypatch):
     try:
         manifest = read_manifest(staging / "session_000" / "manifest.json")
         by_path = {e.path: e for e in manifest.entries}
-        assert by_path["big.bin"].streamed is True
+        assert by_path["big.bin"].streamed
         assert by_path["big.bin"].type == "full"
-        assert by_path["tiny.txt"].streamed is False
+        assert not by_path["tiny.txt"].streamed
         assert (staging / by_path["big.bin"].file).exists()
         assert not (tmp_path / "staging" / "oddarchiver_scratch_000").exists()
     finally:
@@ -352,8 +406,8 @@ def test_iso_extract_path_to_file(tmp_path):
     ]) == 0
 
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
-    from oddarchiver.session import _blob_id
-    rel = f"session_000/full/{_blob_id(0, 'a.txt')}"
+    from oddarchiver.manifest import load_session_manifests
+    rel = load_session_manifests(backend, NullCrypto())[0].entries[0].file
     dest = tmp_path / "out.bin"
     backend.extract_path_to_file(rel, dest)
     assert dest.read_bytes() == b"hello"

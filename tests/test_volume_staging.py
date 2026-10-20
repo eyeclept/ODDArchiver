@@ -9,6 +9,7 @@ Description:
     than one volume is range-split across dedicated bins.
 """
 # Imports
+import logging
 import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -17,9 +18,10 @@ import pytest
 
 from oddarchiver.crypto import NullCrypto
 from oddarchiver.disc import ISOBackend
-from oddarchiver.manifest import read_manifest
+from oddarchiver.manifest import ManifestEntry, read_manifest
 from oddarchiver.session import build_staging
 
+logger = logging.getLogger(__name__)
 # Globals
 _DISC_THAT_SPLITS = 100_000   # two 60 KB files exceed 0.95 * this
 _FILE_BYTES = 60_000
@@ -54,6 +56,13 @@ def _chunk_blobs(chunks: list[tuple[Path, int, bool]]) -> dict[str, bytes]:
     return covered
 
 
+def _assert_chunk_sequence(chunks: list[tuple[Path, int, bool]]) -> None:
+    """Input: staging chunks. Output: None; checks volume order."""
+    assert len(chunks) >= 2
+    assert not chunks[0][2]
+    assert all(is_new for _, _, is_new in chunks[1:])
+
+
 def test_changeset_larger_than_iso_disc_returns_multiple_chunks(tmp_path):
     """
     Input:  tmp_path
@@ -81,9 +90,7 @@ def test_changeset_larger_than_iso_disc_returns_multiple_chunks(tmp_path):
         _staging_root=tmp_path / "staging",
     )
     try:
-        assert len(chunks) >= 2
-        assert chunks[0][2] is False
-        assert all(is_new for _, _, is_new in chunks[1:])
+        _assert_chunk_sequence(chunks)
         session_numbers = [session_n for _, session_n, _ in chunks]
         assert session_numbers == list(range(session_numbers[0], session_numbers[0] + len(chunks)))
 
@@ -94,6 +101,38 @@ def test_changeset_larger_than_iso_disc_returns_multiple_chunks(tmp_path):
     finally:
         for staging, _session_n, _is_new in chunks:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def _assert_split_entry(
+    entry: ManifestEntry, index: int, count: int | None,
+) -> int | None:
+    """Input: manifest entry and chunk indexes. Output: checked chunk count."""
+    assert entry.path == "huge.bin"
+    assert entry.streamed
+    assert entry.volume_chunk == index
+    if count is None:
+        count = entry.volume_chunk_count
+    assert entry.volume_chunk_count == count
+    assert entry.full_size_bytes == _HUGE_BYTES
+    return count
+
+
+def _assert_oversized_chunks(
+    chunks: list[tuple[Path, int, bool]], payload: bytes,
+) -> None:
+    """Input: staging chunks and source bytes. Output: None; checks split data."""
+    parts: list[bytes] = []
+    count = None
+    for i, (staging, session_n, _is_new) in enumerate(chunks):
+        manifest = read_manifest(
+            staging / f"session_{session_n:03d}" / "manifest.json"
+        )
+        assert len(manifest.entries) == 1
+        entry = manifest.entries[0]
+        count = _assert_split_entry(entry, i, count)
+        parts.append((staging / entry.file).read_bytes())
+    assert count == len(chunks)
+    assert b"".join(parts) == payload
 
 
 def test_single_file_larger_than_disc_splits_without_prompt(tmp_path, monkeypatch):
@@ -129,27 +168,8 @@ def test_single_file_larger_than_disc_splits_without_prompt(tmp_path, monkeypatc
         _staging_root=staging_root,
     )
     try:
-        assert len(chunks) >= 2
-        assert chunks[0][2] is False
-        assert all(is_new for _, _, is_new in chunks[1:])
-        parts: list[bytes] = []
-        count = None
-        for i, (staging, session_n, _is_new) in enumerate(chunks):
-            manifest = read_manifest(
-                staging / f"session_{session_n:03d}" / "manifest.json"
-            )
-            assert len(manifest.entries) == 1
-            entry = manifest.entries[0]
-            assert entry.path == "huge.bin"
-            assert entry.streamed is True
-            assert entry.volume_chunk == i
-            if count is None:
-                count = entry.volume_chunk_count
-            assert entry.volume_chunk_count == count
-            assert entry.full_size_bytes == _HUGE_BYTES
-            parts.append((staging / entry.file).read_bytes())
-        assert count == len(chunks)
-        assert b"".join(parts) == payload
+        _assert_chunk_sequence(chunks)
+        _assert_oversized_chunks(chunks, payload)
     finally:
         for staging, _session_n, _is_new in chunks:
             shutil.rmtree(staging, ignore_errors=True)

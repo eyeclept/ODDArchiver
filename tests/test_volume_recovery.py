@@ -4,26 +4,32 @@ Date:   2026
 Email:  eyeclept@pm.me
 
 Description:
-    Tests for restore --skip-volume recovery mode: a 3-volume archive
-    whose middle volume is permanently lost, bucketing files into
-    restored / stale / missing, and confirming the same scenario without
-    --skip-volume keeps today's failed/unresolved behaviour.
+    Tests for fallback after a missing disc and single-disc recovery.
 """
 # Imports
 import argparse
 import hashlib
+import logging
 import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
+from oddarchiver.cache import CacheManager
+from oddarchiver.catalog import build_archive_catalog, remember_encryption_mode
 from oddarchiver.cli import _run_restore, build_parser
 from oddarchiver.crypto import NullCrypto
 from oddarchiver.disc import ISOBackend
-from oddarchiver.manifest import read_manifest
+from oddarchiver.manifest import load_session_manifests, read_manifest, write_manifest
 from oddarchiver.restore import restore
+from oddarchiver.restore_plan import restore_archive
 from oddarchiver.restore_state import load_restore_state
 from oddarchiver.session import build_staging
-from oddarchiver.volume import VolumeMarker, write_volume_marker
+from oddarchiver.volume import (
+    VolumeMarker, build_volume_baseline, read_volume_marker,
+    write_volume_baseline, write_volume_marker,
+)
 
 # Globals
 _DISC = 20 * 2**20
@@ -40,6 +46,16 @@ _STALE_V2 = _STALE_V1[:-16] + b"STALE-V2-TAIL!!!!"
 _MISS_V1 = b"MISSING-V1-" + bytes([i % 256 for i in range(_PAYLOAD)])
 _MISS_V2 = _MISS_V1[:-8] + b"V2-TAIL!"
 _LATER = b"LATE" + b"L" * _PAYLOAD
+logger = logging.getLogger(__name__)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cli_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr("oddarchiver.cli.CacheManager", lambda *a, **k: CacheManager(cache))
+
 
 
 # Functions
@@ -72,23 +88,24 @@ def _burn_marked_volume(
     staging: Path,
     session_n: int,
     volume_index: int,
-) -> Path:
-    """Write a VolumeMarker and init a new ISO for this session."""
+    prior=None,
+):
+    """Burn one marked ISO with the previous disc's baseline."""
     prev_label = "" if volume_index == 0 else _LABELS[volume_index - 1]
-    write_volume_marker(
-        staging,
-        VolumeMarker(
-            archive_id=_ARCHIVE_ID,
-            volume_index=volume_index,
-            first_session=session_n,
-            created_at=_CREATED_AT,
-            previous_volume_label=prev_label,
-        ),
-    )
+    marker = VolumeMarker(_ARCHIVE_ID, volume_index, session_n, _CREATED_AT, prev_label)
+    manifest = read_manifest(staging / f"session_{session_n:03d}" / "manifest.json")
+    if prior is not None:
+        write_volume_baseline(staging, prior, _crypto, marker)
+        manifest.baseline_checksum = hashlib.sha256(
+            (staging / "volume_baseline.json").read_bytes(),
+        ).hexdigest()
+        write_manifest(staging / f"session_{session_n:03d}", manifest)
+    write_volume_marker(staging, marker)
+    baseline = build_volume_baseline(prior, [manifest], marker, _LABELS[volume_index])
     iso = tmp_path / f"vol{volume_index}.iso"
     backend = ISOBackend(iso, disc_size=_DISC)
     backend.init(staging, label=_LABELS[volume_index], expected_session_count=0)
-    return iso
+    return iso, baseline
 
 
 def _stage_session(
@@ -120,7 +137,7 @@ def _stage_session(
     assert len(chunks) == 1, f"session {session_n} split into {len(chunks)} chunks"
     staging, returned_n, is_new = chunks[0]
     assert returned_n == session_n
-    assert is_new is False
+    assert not is_new
     return staging
 
 
@@ -145,7 +162,7 @@ def _build_three_volumes(tmp_path: Path) -> tuple[list[Path], dict[str, bytes]]:
         types0 = _entry_types(staging0, 0)
         assert types0["kept.txt"] == "full"
         assert types0["stale.txt"] == "full"
-        iso0 = _burn_marked_volume(tmp_path, staging0, 0, 0)
+        iso0, prior = _burn_marked_volume(tmp_path, staging0, 0, 0)
     finally:
         shutil.rmtree(staging0, ignore_errors=True)
 
@@ -163,7 +180,7 @@ def _build_three_volumes(tmp_path: Path) -> tuple[list[Path], dict[str, bytes]]:
         types1 = _entry_types(staging1, 1)
         assert types1["stale.txt"] == "delta", types1
         assert types1["missing.txt"] == "full"
-        iso1 = _burn_marked_volume(tmp_path, staging1, 1, 1)
+        iso1, prior = _burn_marked_volume(tmp_path, staging1, 1, 1, prior)
     finally:
         shutil.rmtree(staging1, ignore_errors=True)
 
@@ -187,7 +204,7 @@ def _build_three_volumes(tmp_path: Path) -> tuple[list[Path], dict[str, bytes]]:
         assert types2["stale.txt"] == "delta", types2
         assert types2["missing.txt"] == "delta", types2
         assert types2["later.txt"] == "full"
-        iso2 = _burn_marked_volume(tmp_path, staging2, 2, 2)
+        iso2, _prior = _burn_marked_volume(tmp_path, staging2, 2, 2, prior)
     finally:
         shutil.rmtree(staging2, ignore_errors=True)
 
@@ -204,6 +221,38 @@ def _backend(iso: Path) -> ISOBackend:
     return ISOBackend(iso, disc_size=_DISC)
 
 
+def _move_iso(src: Path, dst: Path) -> None:
+    """Move an ISOBackend image with its session folder and metadata file."""
+    src.replace(dst)
+    src.with_suffix(".d").replace(dst.with_suffix(".d"))
+    meta = src.with_name(src.name + ISOBackend._META_SUFFIX)
+    if meta.exists():
+        meta.replace(dst.with_name(dst.name + ISOBackend._META_SUFFIX))
+
+
+def _catalog(backend):
+    marker = read_volume_marker(backend)
+    manifests = load_session_manifests(backend, _crypto, start_session=marker.first_session)
+    return build_archive_catalog(backend, _crypto, manifests, marker)
+
+
+class _Acquire:
+    image = None
+
+    def __init__(self, discs, missing=()):
+        self.discs = discs
+        self.missing = set(missing)
+        self.calls = []
+
+    def acquire(self, needed, catalog, archive_id):
+        self.calls.append(dict(needed))
+        index = min(needed)
+        if index in self.missing:
+            self.missing.remove(index)
+            return None, index, False
+        return _backend(self.discs[index]), None, False
+
+
 def _restore_args(dest: Path, iso: Path, skip_volumes=None) -> argparse.Namespace:
     """Namespace matching _run_restore's getattr usage."""
     return argparse.Namespace(
@@ -218,6 +267,7 @@ def _restore_args(dest: Path, iso: Path, skip_volumes=None) -> argparse.Namespac
         recover_scan=False,
         label="",
         skip_volumes=skip_volumes,
+        all_disks=True,
     )
 
 
@@ -235,114 +285,86 @@ def test_skip_volume_flag_is_repeatable():
     assert args.skip_volumes == [1, 2]
 
 
-def test_recovery_buckets_restored_stale_missing(tmp_path):
-    """
-    Input:  tmp_path
-    Output: None
-    Details:
-        Restore volumes 0 and 2 with --skip-volume 1. kept.txt and later.txt
-        restore. stale.txt lands in stale at session 0. missing.txt is
-        missing and absent from dest. failures stay 0. needed is None.
-    """
+def _assert_recovery_buckets(dest: Path, result, acquisition: _Acquire) -> None:
+    """Input: restore destination, result, acquisition. Output: verified recovery buckets."""
+    assert result.failures == 0
+    assert (dest / "kept.txt").read_bytes() == _KEEP
+    assert (dest / "later.txt").read_bytes() == _LATER
+    assert (dest / "stale.txt").read_bytes() == _STALE_V0
+    assert not (dest / "missing.txt").exists()
+    assert result.stale == [("stale.txt", 0)]
+    assert result.missing == ["missing.txt"]
+    assert acquisition.calls == [{0: 2}]
+
+
+def test_missing_disc_recovery_buckets_restored_stale_missing(tmp_path):
     isos, _latest = _build_three_volumes(tmp_path)
     dest = tmp_path / "dest"
-    skip = [1]
-
-    r0 = restore(dest, _backend(isos[0]), _crypto, skip_volumes=skip)
-    r2 = restore(dest, _backend(isos[2]), _crypto, skip_volumes=skip)
-
-    assert r0.failures == 0
-    assert r2.failures == 0
-    restored, failures = r2
-    assert (restored, failures) == (r2.restored, r2.failures)
-    assert len(r2) == 2
-
-    assert (dest / "kept.txt").read_bytes() == _KEEP
-    assert (dest / "later.txt").read_bytes() == _LATER
-    assert (dest / "stale.txt").read_bytes() == _STALE_V0
-    assert not (dest / "missing.txt").exists()
-
-    assert ("stale.txt", 0) in r2.stale
-    assert r2.missing == ["missing.txt"]
-    assert r2.needed is None
-    assert r0.stale == []
-    assert r0.missing == []
-
+    inserted = _backend(isos[2])
+    acquisition = _Acquire(isos)
+    result = restore_archive(
+        dest, inserted, _crypto, _catalog(inserted),
+        skip_volumes=[1], acquisition=acquisition,
+    )
+    _assert_recovery_buckets(dest, result, acquisition)
     state = load_restore_state(dest, _ARCHIVE_ID)
     assert state is not None
-    assert state.applied_volumes == [0, 2]
+    assert state.missing_discs == [1]
+    assert set(state.read_discs) == {0, 2}
 
 
-def test_recovery_does_not_raise_on_missing(tmp_path):
-    """
-    Input:  tmp_path
-    Output: None
-    Details:
-        A recovery-mode run where every file is restored, stale, or missing
-        returns failures==0. dest is unchanged for the missing path.
-    """
-    isos, _latest = _build_three_volumes(tmp_path)
-    dest = tmp_path / "dest_ok"
-    skip = [1]
-    r0 = restore(dest, _backend(isos[0]), _crypto, skip_volumes=skip)
-    r2 = restore(dest, _backend(isos[2]), _crypto, skip_volumes=skip)
-    assert r0.failures == 0
-    assert r2.failures == 0
-    assert r2.stale
-    assert r2.missing
-    assert not (dest / "missing.txt").exists()
-
-
-def test_without_skip_volume_unresolvable_stays_non_recovery(tmp_path):
-    """
-    Input:  tmp_path
-    Output: None
-    Details:
-        The same 0-then-2 restore without --skip-volume keeps today's
-        behaviour: the volume-1 gap is still needed, missing.txt is not
-        written, and stale.txt is not a recovery stale bucket.
-    """
+def test_single_disc_delta_without_base_is_unresolved(tmp_path):
     isos, _latest = _build_three_volumes(tmp_path)
     dest = tmp_path / "dest_plain"
-    r0 = restore(dest, _backend(isos[0]), _crypto)
-    r2 = restore(dest, _backend(isos[2]), _crypto)
-
-    assert r0.failures == 0
-    assert r2.needed is not None
-    assert r2.needed.volume_index == 1
-    assert r2.needed.label == "VOL1"
-    assert r2.stale == []
-    assert r2.missing == []
-    assert not (dest / "missing.txt").exists()
-    assert (dest / "kept.txt").read_bytes() == _KEEP
-    assert (dest / "stale.txt").read_bytes() == _STALE_V0
-    assert (dest / "later.txt").read_bytes() == _LATER
-    # stale.txt's volume-2 delta cannot apply on volume-0 bytes.
-    assert r2.failures >= 1
-
-    state = load_restore_state(dest, _ARCHIVE_ID)
-    assert state is not None
-    assert 1 not in state.applied_volumes
-    assert 2 not in state.applied_volumes
-
-
-def test_skip_volume_walks_past_to_earlier_needed(tmp_path):
-    """
-    Input:  tmp_path
-    Output: None
-    Details:
-        Restore volume 2 only, with --skip-volume 1. Volume 1 must not be
-        reported as needed. Volume 0 still is.
-    """
-    isos, _latest = _build_three_volumes(tmp_path)
-    dest = tmp_path / "dest_gap"
-    result = restore(dest, _backend(isos[2]), _crypto, skip_volumes=[1])
+    result = restore(dest, _backend(isos[2]), _crypto)
     assert result.failures == 0
-    assert result.needed is not None
-    assert result.needed.volume_index == 0
+    assert result.stale == []
+    assert result.missing == []
+    assert {path for path, _disc in result.unresolved} == {"stale.txt", "missing.txt"}
     assert (dest / "later.txt").read_bytes() == _LATER
     assert not (dest / "stale.txt").exists()
     assert not (dest / "missing.txt").exists()
+
+
+def test_missing_prior_disc_keeps_independent_later_file(tmp_path):
+    isos, _latest = _build_three_volumes(tmp_path)
+    inserted = _backend(isos[2])
+    acquisition = _Acquire(isos)
+    dest = tmp_path / "dest_gap"
+    result = restore_archive(
+        dest, inserted, _crypto, _catalog(inserted),
+        skip_volumes=[0, 1], acquisition=acquisition,
+    )
+    assert result.failures == 0
+    assert (dest / "later.txt").read_bytes() == _LATER
+    assert result.missing == ["kept.txt", "missing.txt", "stale.txt"]
+    assert acquisition.calls == []
+
+def _assert_cli_recovery_output(out: str) -> None:
+    """Input: CLI stdout. Output: verified stale and missing notices."""
+    assert "stale:" in out
+    assert "stale.txt" in out
+    assert "session 0" in out
+    assert "missing:" in out
+    assert "missing.txt" in out
+    assert "Restore needs volume 1" not in out
+
+
+def _assert_cli_recovery_files(dest: Path) -> None:
+    """Input: restore destination. Output: verified recovered file contents."""
+    assert (dest / "kept.txt").read_bytes() == _KEEP
+    assert (dest / "stale.txt").read_bytes() == _STALE_V0
+    assert (dest / "later.txt").read_bytes() == _LATER
+    assert not (dest / "missing.txt").exists()
+    restored = {
+        str(path.relative_to(dest)): path.read_bytes()
+        for path in dest.rglob("*") if path.is_file()
+    }
+    assert restored == {
+        "kept.txt": _KEEP,
+        "stale.txt": _STALE_V0,
+        "later.txt": _LATER,
+    }
 
 
 def test_cli_prints_stale_and_missing_table(tmp_path, capsys):
@@ -350,20 +372,16 @@ def test_cli_prints_stale_and_missing_table(tmp_path, capsys):
     Input:  tmp_path, capsys
     Output: None
     Details:
-        _run_restore on volume 2 after volume 0, with skip_volumes=[1],
-        exits 0 and prints each stale path with its session and each
-        missing path plainly. Stale/missing are not failures.
+        The planner reports stale and missing paths with their sessions.
+        Restored files match the fallback or inserted-disc bytes.
     """
     isos, _latest = _build_three_volumes(tmp_path)
+    remember_encryption_mode(_ARCHIVE_ID, "none")
     dest = tmp_path / "dest_cli"
-    r0 = restore(dest, _backend(isos[0]), _crypto, skip_volumes=[1])
-    assert r0.failures == 0
-    rc = _run_restore(_restore_args(dest, isos[2], skip_volumes=[1]))
+    _move_iso(isos[0], tmp_path / "archive.iso")
+    _move_iso(isos[2], tmp_path / "archive.vol2.iso")
+    rc = _run_restore(_restore_args(dest, tmp_path / "archive.vol2.iso", skip_volumes=[1]))
     assert rc == 0
     out = capsys.readouterr().out
-    assert "stale:" in out
-    assert "stale.txt" in out
-    assert "session 0" in out
-    assert "missing:" in out
-    assert "missing.txt" in out
-    assert "Restore needs volume 1" not in out
+    _assert_cli_recovery_output(out)
+    _assert_cli_recovery_files(dest)

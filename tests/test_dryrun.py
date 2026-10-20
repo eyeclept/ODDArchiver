@@ -15,7 +15,7 @@ import json
 
 from pathlib import Path
 
-from oddarchiver.cache import DEFAULT_CACHE_DIR
+from oddarchiver.cache import default_cache_dir
 from oddarchiver.cli import dispatch, _run_dry_run
 from oddarchiver.disc import DiscInfo, ISOBackend
 
@@ -126,7 +126,7 @@ def test_sync_dry_run_cache_not_updated(tmp_path):
 
     (source / "b.txt").write_bytes(b"modified content for cache test run")
 
-    manifest_path = DEFAULT_CACHE_DIR / "cache_manifest.json"
+    manifest_path = default_cache_dir() / "cache_manifest.json"
     entries_before: dict = (
         json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     )
@@ -169,6 +169,20 @@ def test_sync_dry_run_space_overage_no_exit1(tmp_path, capsys):
     assert "OVERAGE" in out
 
 
+class _PowLyingISO(ISOBackend):
+    """ISO backend that reports one MMC session after each burn."""
+
+    def mediainfo(self):
+        """Input: None. Output: DiscInfo with a fixed MMC session count."""
+        info = super().mediainfo()
+        return DiscInfo(
+            session_count=1,
+            remaining_bytes=info.remaining_bytes,
+            used_bytes=info.used_bytes,
+            label=info.label,
+        )
+
+
 def test_dry_run_next_session_ignores_mmc_session_count(
     tmp_path, capsys, monkeypatch,
 ):
@@ -189,16 +203,6 @@ def test_dry_run_next_session_ignores_mmc_session_count(
     assert dispatch(_make_args(
         command="sync", dry_run=False, source=str(source), test_iso=str(iso),
     )) == 0
-
-    class _PowLyingISO(ISOBackend):
-        def mediainfo(self):
-            info = super().mediainfo()
-            return DiscInfo(
-                session_count=1,
-                remaining_bytes=info.remaining_bytes,
-                used_bytes=info.used_bytes,
-                label=info.label,
-            )
 
     monkeypatch.setattr(
         "oddarchiver.cli._make_backend",
@@ -238,16 +242,6 @@ def test_dry_run_disc_state_line_ignores_mmc_session_count(
     assert dispatch(_make_args(
         command="sync", dry_run=False, source=str(source), test_iso=str(iso),
     )) == 0
-
-    class _PowLyingISO(ISOBackend):
-        def mediainfo(self):
-            info = super().mediainfo()
-            return DiscInfo(
-                session_count=1,
-                remaining_bytes=info.remaining_bytes,
-                used_bytes=info.used_bytes,
-                label=info.label,
-            )
 
     monkeypatch.setattr(
         "oddarchiver.cli._make_backend",
