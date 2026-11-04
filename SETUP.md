@@ -135,6 +135,18 @@ oddarchiver sync ~/ToArchive --test-iso archive.iso --key /path/to/keyfile.bin
 Keep a backup of the keyfile. If you lose it, use the offline rescue key to restore the archive.
 If you lose both keys, you cannot read the archive.
 
+### YubiKey extra factor
+
+You can add a YubiKey challenge-response factor to passphrase or keyfile mode:
+
+```sh
+oddarchiver init ~/ToArchive --test-iso archive.iso --encrypt passphrase --yubikey
+```
+
+`--yubikey-slot {1,2}` picks the challenge-response slot. The default slot is 2.
+The archive then needs the passphrase or keyfile and the YubiKey on every later command.
+`--rescue-key` still works without the YubiKey. See [docs/encryption.md](docs/encryption.md).
+
 ## Configuration file
 
 ODDArchiver reads an optional file at `~/.config/oddarchiver/config.toml`. Every setting has a built-in default. The file is not required.

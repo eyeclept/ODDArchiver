@@ -9,6 +9,7 @@ Description:
 """
 # Imports
 import argparse
+import base64
 import contextlib
 import getpass
 import json
@@ -129,6 +130,14 @@ def _add_init(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--key", metavar="PATH",
         help="Keyfile path. Required with --encrypt keyfile.",
+    )
+    p.add_argument(
+        "--yubikey", action="store_true",
+        help="Require a YubiKey HMAC-SHA1 response to unlock this archive.",
+    )
+    p.add_argument(
+        "--yubikey-slot", type=int, choices=[1, 2], default=None,
+        dest="yubikey_slot", help="YubiKey challenge-response slot (default: 2).",
     )
     _add_test_iso(p)
     _add_dry_run(p)
@@ -962,9 +971,53 @@ def _crypto_for_disc(
     _refuse_plaintext_secret(mode, files, manifest_path, key_path, rescue_key)
 
     if rescue_key is not None:
-        return _rescue_disc_crypto(mode, enc_mode_data)
+        return _copy_stored_enc_blocks(
+            _rescue_disc_crypto(mode, enc_mode_data), enc_mode_data,
+        )
 
-    return _ordinary_disc_crypto(mode, key_path)
+    return _copy_stored_enc_blocks(
+        _maybe_apply_disc_yubikey(
+            _ordinary_disc_crypto(mode, key_path), enc_mode_data,
+        ),
+        enc_mode_data,
+    )
+
+
+def _copy_stored_enc_blocks(
+    crypto: "CryptoBackend", enc_mode_data: dict,
+) -> "CryptoBackend":
+    """Copy rescue and YubiKey metadata onto crypto for later session writes."""
+    rescue = enc_mode_data.get("rescue")
+    if isinstance(rescue, dict) and "wrapped" in rescue:
+        crypto._rescue_block = rescue
+    yubikey = enc_mode_data.get("yubikey")
+    if isinstance(yubikey, dict):
+        crypto._yubikey_block = yubikey
+    return crypto
+
+
+def _maybe_apply_disc_yubikey(
+    crypto: "CryptoBackend", enc_mode_data: dict,
+) -> "CryptoBackend":
+    """Apply the stored YubiKey challenge to an ordinary disc unlock."""
+    if "yubikey" not in enc_mode_data:
+        return crypto
+    if isinstance(crypto, NullCrypto):
+        logger.warning("YubiKey metadata on a disc that reports no encryption")
+        raise ValueError(
+            "This disc reports no encryption but it holds YubiKey metadata. "
+            "Refuse this disc."
+        )
+    from oddarchiver.crypto import (
+        apply_yubikey_mix, parse_yubikey_block, yubikey_challenge_response,
+    )
+    try:
+        slot, challenge = parse_yubikey_block(enc_mode_data["yubikey"])
+    except ValueError:
+        logger.warning("Malformed YubiKey metadata on disc")
+        raise
+    response = yubikey_challenge_response(challenge, slot)
+    return apply_yubikey_mix(crypto, response)
 
 
 def _check_remembered_disc_mode(
@@ -1113,15 +1166,52 @@ def _attach_rescue_code(crypto: "CryptoBackend") -> "CryptoBackend":
     """
     from oddarchiver.crypto import KeyfileCrypto, PassphraseCrypto, generate_rescue_code, wrap_rescue_secret
 
-    code, raw = generate_rescue_code()
     if isinstance(crypto, PassphraseCrypto):
         secret = crypto._passphrase
     elif isinstance(crypto, KeyfileCrypto):
         secret = crypto._kek
     else:
         return crypto
+    code, raw = generate_rescue_code()
     crypto._rescue_block = wrap_rescue_secret(raw, secret)
     crypto._rescue_code = code
+    return crypto
+
+
+def _yubikey_block_dict(slot: int, challenge: bytes) -> dict:
+    """Build the public challenge metadata stored with an encrypted session."""
+    return {
+        "alg": "hmac-sha1",
+        "slot": slot,
+        "challenge": base64.b64encode(challenge).decode("ascii"),
+    }
+
+
+def _apply_init_yubikey(
+    args: argparse.Namespace, crypto: "CryptoBackend",
+) -> "CryptoBackend":
+    """Mix the YubiKey response before wrapping the init rescue secret."""
+    from oddarchiver.crypto import (
+        NullCrypto, apply_yubikey_mix, generate_yubikey_challenge,
+        yubikey_challenge_response,
+    )
+    if not args.yubikey:
+        if args.yubikey_slot is not None:
+            print("error: --yubikey-slot requires --yubikey.", file=sys.stderr)
+            raise SystemExit(1)
+        return crypto
+    if isinstance(crypto, NullCrypto):
+        print(
+            "error: --yubikey requires --encrypt passphrase or keyfile.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    slot = args.yubikey_slot or 2
+    challenge = generate_yubikey_challenge()
+    response = yubikey_challenge_response(challenge, slot)
+    apply_yubikey_mix(crypto, response)
+    crypto._yubikey_block = _yubikey_block_dict(slot, challenge)
+    print("This archive needs the YubiKey for later commands except --rescue-key.")
     return crypto
 
 
@@ -1133,15 +1223,15 @@ def _make_init_crypto(args: argparse.Namespace) -> "CryptoBackend":
         For passphrase: reads ODDARCHIVER_PASSPHRASE env var or prompts twice
         (confirmation loop) to catch typos before any write.
         For keyfile: reads the file at args.key.
-        For passphrase and keyfile, generates a rescue code, wraps the
-        persistent secret with scrypt, and hangs _rescue_block/_rescue_code
-        on the returned backend for write_manifest and the init printout.
+        For YubiKey archives, mixes the response into the primary secret
+        before it makes the rescue code. The rescue code wraps the mixed secret.
+        It attaches both metadata blocks to the backend for the manifest.
     """
 
     mode = getattr(args, "encrypt", "none")
     if mode == "none":
-        return make_crypto("none")
-    if mode == "passphrase":
+        crypto: "CryptoBackend" = make_crypto("none")
+    elif mode == "passphrase":
         crypto: "CryptoBackend" = make_crypto(
             "passphrase", passphrase=_init_passphrase()
         )
@@ -1154,7 +1244,7 @@ def _make_init_crypto(args: argparse.Namespace) -> "CryptoBackend":
     else:
         raise ValueError(f"Unknown mode: {mode!r}")
 
-    return _attach_rescue_code(crypto)
+    return _attach_rescue_code(_apply_init_yubikey(args, crypto))
 
 
 def _encryption_block(crypto: "CryptoBackend") -> dict:
@@ -1162,9 +1252,8 @@ def _encryption_block(crypto: "CryptoBackend") -> dict:
     Input:  crypto - CryptoBackend instance
     Output: dict - encryption metadata to embed in manifest
     Details:
-        Records mode for subsequent commands to reconstruct crypto.
-        Copies crypto._rescue_block into "rescue" when present so
-        write_manifest can put it in session_000/enc_mode.json.
+        Records the mode and copies rescue and YubiKey metadata when present.
+        write_manifest stores both blocks in session_000/enc_mode.json.
     """
     from oddarchiver.crypto import NullCrypto, PassphraseCrypto, KeyfileCrypto
     if isinstance(crypto, NullCrypto):
@@ -1178,6 +1267,9 @@ def _encryption_block(crypto: "CryptoBackend") -> dict:
     rescue = getattr(crypto, "_rescue_block", None)
     if rescue:
         block["rescue"] = rescue
+    yubikey = getattr(crypto, "_yubikey_block", None)
+    if yubikey:
+        block["yubikey"] = yubikey
     return block
 
 

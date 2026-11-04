@@ -83,6 +83,33 @@ def test_init_flags_in_namespace():
     assert args.prefill == "1gb"
 
 
+def test_init_yubikey_options_in_help_and_namespace(capsys):
+    parser = build_parser()
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["init", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--yubikey" in help_text
+    assert "--yubikey-slot" in help_text
+    args = parser.parse_args(["init", "/src", "--yubikey", "--yubikey-slot", "1"])
+    assert args.yubikey is True
+    assert args.yubikey_slot == 1
+    assert parser.parse_args(["init", "/src"]).yubikey_slot is None
+
+
+@pytest.mark.parametrize("flags,error", [
+    (["--yubikey"], "--yubikey requires --encrypt passphrase or keyfile"),
+    (["--yubikey-slot", "1"], "--yubikey-slot requires --yubikey"),
+])
+def test_init_refuses_invalid_yubikey_flags(tmp_path, capsys, flags, error):
+    args = build_parser().parse_args([
+        "init", str(tmp_path), "--test-iso", str(tmp_path / "archive.iso"),
+        *flags,
+    ])
+    assert dispatch(args) == 1
+    assert error in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("preset,expected", [
     ("cd", CD_DISC_BYTES),
     ("dvd-sl", DVD_SL_DISC_BYTES),

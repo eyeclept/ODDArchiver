@@ -55,6 +55,11 @@ class TestPassphraseCrypto:
         pc = PassphraseCrypto(passphrase="correct horse battery staple")
         assert pc.decrypt(pc.encrypt(SAMPLE_PLAINTEXT)) == SAMPLE_PLAINTEXT
 
+    def test_non_2fa_passphrase_round_trip(self):
+        pc = PassphraseCrypto(passphrase=b"standalone secret")
+        ciphertext = pc.encrypt(SAMPLE_PLAINTEXT)
+        assert pc.decrypt(ciphertext) == SAMPLE_PLAINTEXT
+
     def test_round_trip_arbitrary_bytes(self):
         pc = PassphraseCrypto(passphrase="test-pass")
         data = bytes(range(256))

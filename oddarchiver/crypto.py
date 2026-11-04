@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import abc
 import base64
+import binascii
 import errno
 import hashlib
 import logging
@@ -25,6 +26,7 @@ import os
 import secrets
 import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 from argon2.low_level import Type, hash_secret_raw
@@ -34,6 +36,9 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 # Globals
 PASSPHRASE_ENV = "ODDARCHIVER_PASSPHRASE"
 STREAM_CHUNK_SIZE = 256 * 2**20  # 256 MiB, the AEAD chunk size and large-file threshold
+YUBIKEY_CHALLENGE_LEN = 64
+YUBIKEY_HMAC_LEN = 20
+YUBIKEY_MIX_PREFIX = b"oddarchiver-yubikey-v1\x00"
 
 logger = logging.getLogger(__name__)
 _log = logger
@@ -781,6 +786,93 @@ def unwrap_rescue_secret(rescue_code: str, rescue_block: dict) -> bytes:
     except Exception as exc:
         logger.exception("Rescue-key unwrap failed")
         raise ValueError("Decryption failed: authentication error.") from exc
+
+
+def generate_yubikey_challenge() -> bytes:
+    """Input: None. Output: 64 random challenge bytes."""
+    return secrets.token_bytes(YUBIKEY_CHALLENGE_LEN)
+
+
+def mix_yubikey_secret(primary: bytes, hmac_response: bytes) -> bytes:
+    """Input: primary secret and 20-byte HMAC response. Output: mixed 32-byte secret."""
+    if not primary or len(hmac_response) != YUBIKEY_HMAC_LEN:
+        raise ValueError("YubiKey mix requires a nonempty primary and 20-byte response.")
+    return hashlib.sha256(YUBIKEY_MIX_PREFIX + primary + hmac_response).digest()
+
+
+def yubikey_challenge_response(
+    challenge: bytes, slot: int = 2, *, run=None,
+) -> bytes:
+    """Input: challenge, slot, optional command runner. Output: 20-byte HMAC response."""
+    if not 1 <= len(challenge) <= YUBIKEY_CHALLENGE_LEN or type(slot) is not int or slot not in (1, 2):
+        raise ValueError("YubiKey challenge must be 1..64 bytes and slot must be 1 or 2.")
+    if run is None:
+        def run(argv):
+            return subprocess.run(argv, capture_output=True, text=True, timeout=30)
+
+    commands = (
+        ["ykchalresp", f"-{slot}", "-x", challenge.hex()],
+        ["ykman", "otp", "calculate", str(slot), challenge.hex()],
+    )
+    for index, argv in enumerate(commands):
+        tool = argv[0]
+        try:
+            result = run(argv)
+        except FileNotFoundError as exc:
+            if index == 0:
+                logger.warning("YubiKey tool %s not found for slot %s", tool, slot)
+                continue
+            logger.exception("YubiKey tool %s not found for slot %s", tool, slot)
+            raise RuntimeError(f"YubiKey tool {tool} unavailable for slot {slot}.") from exc
+        except Exception as exc:
+            logger.exception("YubiKey tool %s failed for slot %s", tool, slot)
+            raise RuntimeError(f"YubiKey tool {tool} failed for slot {slot}.") from exc
+        try:
+            if result.returncode != 0:
+                raise ValueError("non-zero exit status")
+            output = result.stdout.strip()
+            if len(output) != YUBIKEY_HMAC_LEN * 2:
+                raise ValueError("invalid response length")
+            response = bytes.fromhex(output)
+            if len(response) != YUBIKEY_HMAC_LEN:
+                raise ValueError("invalid response length")
+            return response
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.exception("YubiKey tool %s returned an invalid response for slot %s", tool, slot)
+            raise RuntimeError(f"YubiKey tool {tool} failed for slot {slot}.") from exc
+    raise RuntimeError(f"YubiKey tool ykman unavailable for slot {slot}.")
+
+
+def parse_yubikey_block(block: object) -> tuple[int, bytes]:
+    """Input: YubiKey metadata block. Output: slot and decoded challenge bytes."""
+    if not isinstance(block, dict):
+        logger.warning("Invalid YubiKey block type")
+        raise ValueError("Invalid YubiKey block.")
+    slot = block.get("slot")
+    encoded = block.get("challenge")
+    if block.get("alg") != "hmac-sha1" or type(slot) is not int or slot not in (1, 2) or not isinstance(encoded, str):
+        logger.warning("Invalid YubiKey block fields")
+        raise ValueError("Invalid YubiKey block.")
+    try:
+        challenge = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        logger.warning("Invalid YubiKey block encoding")
+        raise ValueError("Invalid YubiKey block.") from exc
+    if not 1 <= len(challenge) <= YUBIKEY_CHALLENGE_LEN:
+        logger.warning("Invalid YubiKey block challenge length")
+        raise ValueError("Invalid YubiKey block.")
+    return slot, challenge
+
+
+def apply_yubikey_mix(crypto: CryptoBackend, hmac_response: bytes) -> CryptoBackend:
+    """Input: passphrase/keyfile backend and HMAC response. Output: same mixed backend."""
+    if isinstance(crypto, PassphraseCrypto):
+        crypto._passphrase = mix_yubikey_secret(crypto._passphrase, hmac_response)
+    elif isinstance(crypto, KeyfileCrypto):
+        crypto._kek = mix_yubikey_secret(crypto._kek, hmac_response)
+    else:
+        raise TypeError("YubiKey mix requires a passphrase or keyfile backend.")
+    return crypto
 
 
 def make_crypto(mode: str, **kwargs: object) -> CryptoBackend:

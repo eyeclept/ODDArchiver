@@ -285,6 +285,30 @@ ODDArchiver-server handles Vault integration. The server uses Vault to get a key
 
 ODDArchiver supports keyfile as its highest encryption mode (Mode 2). Keep the keyfile on a LUKS volume, an Apricorn USB, or another physically secured medium, not in an online service.
 
+### YubiKey extra factor (passphrase or keyfile)
+
+`init --yubikey` adds a hardware factor on top of passphrase or keyfile mode.
+`--yubikey-slot {1,2}` picks the challenge-response slot. The default slot is 2.
+
+At `init`, ODDArchiver generates a 64-byte random challenge and reads a
+20-byte HMAC-SHA1 response from the YubiKey. It mixes the response into
+the primary secret:
+
+```
+SHA-256(b"oddarchiver-yubikey-v1\x00" + primary_secret + 20-byte HMAC-SHA1)
+```
+
+The mixed value replaces the passphrase or keyfile secret. `enc_mode.json`
+stores the public challenge: `alg` (`hmac-sha1`), `slot`, and `challenge`
+in base64. The challenge is public on disc. The HMAC secret stays on the
+YubiKey. Init prints: `This archive needs the YubiKey for later commands
+except --rescue-key.`
+
+Every later command reads the block, gets a new HMAC response, and mixes
+it the same way. `--rescue-key` unwraps the mixed secret from the rescue
+block and does not call the YubiKey. Discs without a `yubikey` block stay
+passphrase or keyfile only.
+
 ---
 
 ## Encryption Pipeline

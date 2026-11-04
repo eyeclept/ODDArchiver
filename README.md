@@ -76,6 +76,7 @@ All commands accept either `--device DEV` (physical drive, default `/dev/sr0`) o
 ```sh
 oddarchiver init <source> [--device DEV] [--label LABEL]
                           [--encrypt {none,passphrase,keyfile}] [--key PATH]
+                          [--yubikey] [--yubikey-slot {1,2}]
                           [--test-iso PATH] [--disc-size SIZE] [--prefill SIZE]
                           [--mirror DEV_OR_PATH] [--dry-run] [--slow] [--skip-large]
 ```
@@ -83,6 +84,9 @@ oddarchiver init <source> [--device DEV] [--label LABEL]
 `--encrypt` and `--key` apply only to `init`.
 `init` stores the chosen mode in the disc manifest.
 Every later command uses this mode automatically.
+`--yubikey` adds a hardware factor. It requires `--encrypt passphrase` or `--encrypt keyfile`.
+`--yubikey-slot` picks the challenge-response slot. The default slot is 2.
+See [docs/encryption.md](docs/encryption.md) for the YubiKey details.
 Running `init` on a disc that already has session 0 exits 0 with a warning. ODDArchiver does not write a second session.
 
 ### `sync`
@@ -179,6 +183,8 @@ Encryption is optional. Choose a mode once, at `init`.
 | `none` | `--encrypt none` (default) | Plaintext on disc. Readable decades from now with only `xdelta3`. |
 | `passphrase` | `--encrypt passphrase` | Key derived with Argon2id, data encrypted with ChaCha20-Poly1305. Passphrase comes from `ODDARCHIVER_PASSPHRASE` or an interactive prompt. |
 | `keyfile` | `--encrypt keyfile --key PATH` | A 32-byte keyfile wraps a fresh per-file data key. Every command after `init` requires `--key`, and `init` does too. |
+
+`init --yubikey` adds a YubiKey HMAC-SHA1 factor on top of the passphrase or keyfile. The secret becomes the mixed value. Later commands then need both the secret and the YubiKey. `--rescue-key` alone unlocks such an archive without the YubiKey. See [docs/encryption.md](docs/encryption.md).
 
 Later commands read the encryption mode from the disc automatically. ODDArchiver never stores the encryption key itself on disc. The encrypted manifest hides file names, paths, and content. Encrypted discs still show:
 

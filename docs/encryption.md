@@ -6,9 +6,10 @@ encrypted archive. It covers on-disc format 2 and older discs.
 ## Files on an encrypted disc
 
 Each session holds `manifest.enc` and `enc_mode.json`. The manifest is
-encrypted. `enc_mode.json` is plaintext. It holds only the mode
-(`passphrase` or `keyfile`) and an optional rescue block. See
-[rescue_key.md](rescue_key.md).
+encrypted. `enc_mode.json` is plaintext. It holds the mode
+(`none`, `passphrase`, or `keyfile`), an optional rescue block, and an
+optional YubiKey block. See [rescue_key.md](rescue_key.md) and the
+YubiKey section below.
 
 Each disc after volume 0 also holds `volume_baseline.enc`. Every disc
 holds a plaintext `volume.json` marker. See [volumes.md](volumes.md).
@@ -117,3 +118,61 @@ code 1. `sync` stops before it burns anything.
 A manifest that does not decrypt or parse stays a SUSPECT manifest. The
 `status` command lists SUSPECT sessions. See the README troubleshooting
 section.
+
+## YubiKey extra factor
+
+`init --yubikey` adds a hardware factor to passphrase or keyfile mode.
+`--yubikey-slot {1,2}` picks the challenge-response slot. The default
+slot is 2 when you set `--yubikey`.
+
+At `init`, ODDArchiver generates a 64-byte random challenge. It sends
+the challenge to the YubiKey and gets a 20-byte HMAC-SHA1 response. It
+then mixes the response into the primary secret. The mixed value is:
+
+```
+SHA-256(b"oddarchiver-yubikey-v1\x00" + primary_secret + 20-byte HMAC-SHA1)
+```
+
+The mixed value replaces the passphrase or keyfile secret from that
+point on. Init prints: `This archive needs the YubiKey for later
+commands except --rescue-key.`
+
+### What the disc holds
+
+`enc_mode.json` stores a public `yubikey` block. The challenge is not
+secret. Anyone with the disc can read it. The HMAC secret stays on the
+YubiKey:
+
+```json
+{
+  "mode": "passphrase",
+  "yubikey": {
+    "alg": "hmac-sha1",
+    "slot": 2,
+    "challenge": "<base64 64-byte challenge>"
+  }
+}
+```
+
+### Later commands
+
+Every later command that unlocks the disc reads the block. It builds
+the challenge, gets the HMAC response from the YubiKey, and mixes it
+into the secret the same way. This happens after the disc reports the
+mode. It does not change mode detection or downgrade checks.
+
+The tools are `ykchalresp -SLOT -x HEX` and `ykman otp calculate SLOT
+HEX`. ODDArchiver tries `ykchalresp` first, then `ykman`. Install one
+of them. ODDArchiver exits 1 when neither can produce a 20-byte hex
+response.
+
+### Rescue behavior
+
+`--rescue-key` unwraps the mixed 32-byte secret from the rescue block
+with the printed rescue code. It does not call the YubiKey. A YubiKey
+archive stays recoverable with the rescue key alone.
+
+### Existing discs
+
+A disc that has no `yubikey` block in `enc_mode.json` stays
+passphrase or keyfile only. No later command calls the YubiKey on it.

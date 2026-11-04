@@ -81,8 +81,12 @@ If stdin is not a terminal, the command reads one line from stdin.
 You can pipe the code into the command. Do not put the code in command arguments.
 Init still confirms a new passphrase twice. Restore does not.
 
-`--rescue-key` does not need the original passphrase or `--key`. A wrong
-code fails the same way as a wrong passphrase. It raises `ValueError` from
+`--rescue-key` does not need the original passphrase or `--key`.
+It also does not call the YubiKey. Init with `--yubikey` mixes the YubiKey
+HMAC response into the primary secret, and the rescue block wraps that
+mixed secret. `--rescue-key` unwraps it and uses it directly. A YubiKey
+archive stays recoverable with the rescue code alone.
+A wrong code fails the same way as a wrong passphrase. It raises `ValueError` from
 the AEAD unwrap (`Decryption failed: authentication error.`).
 
 An archive with no `"rescue"` object (created before this feature, or

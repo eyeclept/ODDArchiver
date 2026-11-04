@@ -120,6 +120,11 @@ def _write_encrypted_manifest(
         rescue = d.get("encryption", {}).get("rescue")
     if rescue:
         enc_payload["rescue"] = rescue
+    yubikey = getattr(crypto, "_yubikey_block", None)
+    if not yubikey:
+        yubikey = d.get("encryption", {}).get("yubikey")
+    if yubikey:
+        enc_payload["yubikey"] = yubikey
     (staging_path / "enc_mode.json").write_text(
         json.dumps(enc_payload), encoding="utf-8"
     )
@@ -144,9 +149,8 @@ def write_manifest(
         Writes atomically. It first writes a .tmp file and then calls
         rename. The code sets manifest_checksum over plaintext JSON
         before encryption. It removes the opposite format file when
-        that file exists (enc and json swap). enc_mode.json includes a
-        "rescue" object when crypto carries _rescue_block or
-        manifest.encryption contains one.
+        that file exists (enc and json swap). enc_mode.json includes
+        rescue and YubiKey blocks from crypto or manifest.encryption.
     """
     d = dataclasses.asdict(manifest)
     d.pop("suspect", None)
