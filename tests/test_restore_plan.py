@@ -16,8 +16,8 @@ from oddarchiver.restore import restore
 from oddarchiver.restore_plan import restore_archive
 from oddarchiver.restore_state import load_restore_state, state_path
 from oddarchiver.volume import (
-    VolumeBaseline, VolumeMarker, build_volume_baseline, read_volume_marker,
-    write_volume_baseline, write_volume_marker,
+    PathVersion, VolumeBaseline, VolumeMarker, build_volume_baseline,
+    read_volume_marker, write_volume_baseline, write_volume_marker,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,9 +117,10 @@ class Acquisition:
 
 
 def test_newest_version_requests_only_its_disc(tmp_path):
+    """Newest a.txt is on disc 1. Restore still checks disc 0 manifests."""
     discs = _three_discs(tmp_path)
     backend, catalog, manifests = _source(discs[2])
-    acquisition = Acquisition(discs, [1])
+    acquisition = Acquisition(discs, [1, 0])
     dest = tmp_path / "selected"
     result = restore_archive(
         dest, backend, _CRYPTO, catalog, paths=["a.txt"],
@@ -129,8 +130,8 @@ def test_newest_version_requests_only_its_disc(tmp_path):
     assert result.restored == 1
     assert (dest / "a.txt").read_bytes() == b"A-new"
     assert not (dest / "old-only.txt").exists()
-    assert acquisition.calls == [{1: 1}]
-    assert load_restore_state(dest, _ID).read_discs == [1]
+    assert acquisition.calls == [{1: 1}, {0: 0}]
+    assert set(load_restore_state(dest, _ID).read_discs) == {0, 1}
 
 
 def test_mixed_order_acquisition_reads_each_disc_once(tmp_path, monkeypatch):
@@ -484,3 +485,33 @@ def test_session_cutoff_selects_earlier_latest_full(tmp_path, monkeypatch):
     assert result.failures == 0
     assert (dest / "five.txt").read_bytes() == versions[2]
     assert seen == [f"session_002/full/{_blob_id(2, 'five.txt')}"]
+
+
+def _chunk_version(session_n: int, chunk: int, count: int) -> PathVersion:
+    """Input: session, chunk index and chunk count. Output: a verified chunk version."""
+    return PathVersion(
+        session=session_n, volume_index=0, kind="full",
+        result_checksum=f"c{chunk}", full_size_bytes=10,
+        timestamp="t", blob_session=session_n,
+        volume_chunk=chunk, volume_chunk_count=count,
+    )
+
+
+def test_chain_complete_rejects_a_chunk_prefix():
+    """A volume-split chain that stops before the final chunk is not restorable."""
+    from oddarchiver.restore_plan import _chain_complete
+
+    assert not _chain_complete([_chunk_version(0, 0, 3)])
+    assert not _chain_complete([_chunk_version(0, 0, 3), _chunk_version(1, 1, 3)])
+    assert _chain_complete([
+        _chunk_version(0, 0, 3), _chunk_version(1, 1, 3), _chunk_version(1, 2, 3),
+    ])
+
+
+def test_entry_key_separates_chunks_in_one_session():
+    """Two chunks of one file in one session keep separate state keys."""
+    from oddarchiver.restore_plan import _entry_key
+
+    keys = {_entry_key("big.bin", 4, chunk) for chunk in (0, 1, 2)}
+    assert len(keys) == 3
+    assert _entry_key("big.bin", 4, None) == _entry_key("big.bin", 4, 0)

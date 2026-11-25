@@ -17,6 +17,28 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.fixture(autouse=True)
+def _uncompressed_blobs(monkeypatch):
+    """Store raw blobs by default so packing tests keep fixed byte sizes."""
+    import oddarchiver.compress as compress_mod
+    if "compression_on" in _COMPRESS_ON:
+        return
+    monkeypatch.setattr(compress_mod, "DEFAULT_CODEC", compress_mod.CODEC_NONE)
+
+
+_COMPRESS_ON: set[str] = set()
+
+
+@pytest.fixture
+def compression_on(monkeypatch):
+    """Enable LZMA for a test that exercises compression."""
+    import oddarchiver.compress as compress_mod
+    _COMPRESS_ON.add("compression_on")
+    monkeypatch.setattr(compress_mod, "DEFAULT_CODEC", compress_mod.CODEC_LZMA)
+    yield
+    _COMPRESS_ON.discard("compression_on")
+
+
+@pytest.fixture(autouse=True)
 def _isolated_staging_root(tmp_path, monkeypatch):
     """
     Input:  tmp_path, monkeypatch - pytest built-in fixtures

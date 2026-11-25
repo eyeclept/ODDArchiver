@@ -29,12 +29,12 @@ from oddarchiver.delta import apply_delta
 from oddarchiver.disc import ISOBackend
 from oddarchiver.manifest import read_manifest
 from oddarchiver.restore import restore
-from tests.helpers import _args
+from tests.helpers import _args, fill
 
 # Globals
 logger = logging.getLogger(__name__)
 DISC_BYTES = 64 * 2**20
-BASE = b"A" * 34000
+BASE = fill(b"A", 34000)
 CHUNK = 4096
 
 # Functions

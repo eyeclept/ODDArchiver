@@ -18,6 +18,7 @@ from oddarchiver.catalog import (
     CatalogDisc, archive_memory_path, remember_inserted_disc, _memory_path,
 )
 from oddarchiver.cli import _crypto_and_manifests, _crypto_for_disc, dispatch
+from tests.helpers import fill
 from oddarchiver.crypto import KeyfileCrypto, generate_keyfile
 from oddarchiver.disc import ISOBackend
 from oddarchiver.manifest import (
@@ -81,6 +82,8 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "skip_large": False,
         "embed_software": None,
         "read_mode": "sequential",
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -396,7 +399,7 @@ def _assert_h1c_restored(rc, captured, dest: Path) -> None:
     assert {
         p.relative_to(dest).as_posix(): p.read_bytes()
         for p in dest.rglob("*") if p.is_file()
-    } == {"big2.bin": b"C" * 80_000}
+    } == {"big2.bin": fill(b"C", 80_000)}
     missing = captured.out.split("  missing:\n", 1)[1].split()
     assert sorted(missing) == ["big.bin", "keep.txt"]
     assert "forged.txt" not in captured.out
@@ -418,8 +421,8 @@ def test_h1c_catalog_refuses_downgraded_sibling(tmp_path, monkeypatch, capsys):
     iso = tmp_path / "h1c.iso"
     source.mkdir()
     (source / "keep.txt").write_bytes(b"keep-bytes-v1")
-    (source / "big.bin").write_bytes(b"B" * 80_000)
-    (source / "big2.bin").write_bytes(b"C" * 80_000)
+    (source / "big.bin").write_bytes(fill(b"B", 80_000))
+    (source / "big2.bin").write_bytes(fill(b"C", 80_000))
     assert dispatch(_make_args(
         command="init", source=str(source), test_iso=str(iso),
         encrypt="keyfile", key=str(keyfile), disc_size="100000",
@@ -656,8 +659,8 @@ def test_m2_rejected_iso_sibling_counts_as_missing(tmp_path, monkeypatch, capsys
     iso = tmp_path / "m2.iso"
     source.mkdir()
     (source / "keep.txt").write_bytes(b"keep-bytes-v1")
-    (source / "big.bin").write_bytes(b"B" * 80_000)
-    (source / "big2.bin").write_bytes(b"C" * 80_000)
+    (source / "big.bin").write_bytes(fill(b"B", 80_000))
+    (source / "big2.bin").write_bytes(fill(b"C", 80_000))
     assert dispatch(_make_args(
         command="init", source=str(source), test_iso=str(iso),
         encrypt="keyfile", key=str(keyfile), disc_size="100000",
@@ -753,8 +756,8 @@ def test_m6_missing_baseline_format2_is_error(tmp_path, monkeypatch, capsys):
     iso = tmp_path / "m6.iso"
     source.mkdir()
     (source / "keep.txt").write_bytes(b"keep-bytes-v1")
-    (source / "big.bin").write_bytes(b"B" * 80_000)
-    (source / "big2.bin").write_bytes(b"C" * 80_000)
+    (source / "big.bin").write_bytes(fill(b"B", 80_000))
+    (source / "big2.bin").write_bytes(fill(b"C", 80_000))
     assert dispatch(_make_args(
         command="init", source=str(source), test_iso=str(iso),
         encrypt="keyfile", key=str(keyfile), disc_size="100000",

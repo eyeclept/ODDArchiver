@@ -20,6 +20,7 @@ The repository is a local, private working copy with git history. It has no conf
 - **Idempotency**: Users can safely run `init` and `sync` again. An interrupted burn leaves the cache and disc consistent and recoverable. A SIGINT during staging runs the full staging cleanup.
 - **Verification**: The program supports three depths (`fast`, `checksum`, `full`). Per-session pass/fail lets it continue after a bad session.
 - **Configuration**: The optional `~/.config/oddarchiver/config.toml` sets defaults. A CLI flag can override every setting.
+- **Disc usage stats**: `status --stats` estimates usage from manifests. `status --stats-exact` lists real on-disc file sizes. `--json` gives machine-readable output. See [docs/stats.md](docs/stats.md).
 - **23 confirmed bugs fixed** during manual and automated testing, each with a regression test. Fixes covered argument parsing, passphrase handling, and ghost files left after a deletion-only sync. They also covered a corrupt-manifest crash, false "already initialized" reports on blank media, and SIGINT handling. Fixes also covered non-BMP Unicode filenames.
 
   A cache-fallback path guessed the wrong on-disc blob name on a cold cache. A wrong-session cache-fallback lookup crashed sync() whenever the last write of a changed file was more than one session back. A tmpfs staging area could run out of space mid-job on a large real archive. Real-drive reads were unreliable after a multi-GB burn because the kernel block layer stayed stale.
@@ -72,10 +73,11 @@ The program does not implement these future items:
 - `oddarchiver diff --session A --session B`, to show what changed between two historical sessions.
 - Shell completions for bash, zsh, and fish.
 - A Python API for a separate `ODDArchiver-server` project. That project could then call ODDArchiver directly instead of through the CLI, including Vault-backed key retrieval. The `ODDArchiver-server` project does not exist in this repository. ODDArchiver itself has no dependency on Vault or any external service today.
+- A disc visualizer that maps which disc regions hold which data type, per session.
 
 ## Test status
 
-`pytest tests/ -q -k "not rocky and not synth"` exits 0: 383 passed, 2 deselected. Unit tests cover every module. Integration tests cover full init-sync-verify-restore cycles, dry-run invariance, SIGINT cleanup, and interrupted-burn recovery. Every test runs against `ISOBackend` or mocked disc I/O. No physical drive is required.
+`pytest tests/ -q -k "not rocky and not synth and not test_no_plaintext_in_tmp"` exits 0: 911 passed, 4 deselected (as of `816ceca`). Unit tests cover every module. Integration tests cover full init-sync-verify-restore cycles, dry-run invariance, SIGINT cleanup, interrupted-burn recovery, and multi-volume fill and restore. Every test runs against `ISOBackend` or mocked disc I/O. No physical drive is required. Real DVD-R results are in `Assist/REAL_DISC_TESTS.md`.
 
 ## Hardening since initial completion
 
@@ -86,6 +88,8 @@ Mode 31e adds a `--slow` post-burn verify flag (`70c01ac`). The program attempte
 The project rewrote Python source in every `oddarchiver/` module into Simplified Technical English. Markdown docs have not had that pass yet. A later test audit found four defects after the CD refusal shipped. The project fixed and merged all four.
 
 The double-burn guard now compares archive session count instead of the MMC session count (`24e0f7d`). No-ledger session coverage reports "count unknown" instead of fabricated indexes (`5c46c2e`). Dry-run prints the true next-session number (`7eaa757`). A later cleanup deleted an orphaned xorriso helper (`c167115`).
+
+Multi-volume archives and opt-in fill merged in `816ceca`. A sync can span several discs. `--fill` appends new sessions to an older disc with room, using two-phase intent and outcome stubs on the newest disc. `restore --all-disks` reads every available disc, so a lost newest disc does not block restore. Real DVD-R tests T16-T19 passed (packing, `--split-large`, fill, and a cache-free restore). A disc with a confirmed media write error is closed for appends in local memory. A post-merge audit strengthened 21 tests. It also found that a plain sync did not record volume free space; that is fixed. Design and limits: `docs/multi-volume-fill.md` and `docs/volumes.md`.
 
 ## Development notes
 

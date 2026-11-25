@@ -91,6 +91,7 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "mirror": None, "recover_scan": False, "paths": None,
         "show_deleted": False, "path": None, "rescue_key": None,
         "skip_volumes": None, "unskip_volumes": None, "all_disks": False,
+        "yubikey": False, "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -345,7 +346,7 @@ def test_disc_backend_lists_sessions_once_per_command(monkeypatch):
     """
     calls = []
 
-    def fake_run(cmd, capture_output):
+    def fake_run(cmd, capture_output, timeout=None):
         calls.append(cmd)
         return subprocess.CompletedProcess(
             cmd, 0, b"'session_000'\n'session_001'\n", b"",
@@ -397,7 +398,7 @@ def test_disc_backend_session_list_retries_once_then_fails(monkeypatch):
     """
     attempts = []
 
-    def fake_run(cmd, capture_output):
+    def fake_run(cmd, capture_output, timeout=None):
         attempts.append(cmd)
         return subprocess.CompletedProcess(cmd, 1, b"", b"no disc")
 

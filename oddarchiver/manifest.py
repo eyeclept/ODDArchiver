@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+from oddarchiver.compress import CODEC_NONE
+
 
 if TYPE_CHECKING:
     from oddarchiver.crypto import CryptoBackend
@@ -50,7 +52,13 @@ class ManifestEntry:
     streamed: bool = False
     volume_chunk: int | None = None
     volume_chunk_count: int | None = None
+    # Payload bytes this chunk holds. A resume sums the sizes of chunks
+    # 0..k to find the exact offset of chunk k+1 in the payload.
+    volume_chunk_size: int | None = None
     blob_origin_session: int | None = None
+    codec: str = "none"
+    original_size: int | None = None
+
 
 
 @dataclass
@@ -154,6 +162,7 @@ def write_manifest(
     """
     d = dataclasses.asdict(manifest)
     d.pop("suspect", None)
+    _omit_default_codec_fields(d)
     d["manifest_checksum"] = ""
     d["manifest_checksum"] = _compute_checksum(d)
     manifest.manifest_checksum = d["manifest_checksum"]
@@ -214,6 +223,36 @@ def _decrypt_manifest_bytes(
     return raw_bytes, bound
 
 
+def _omit_entry_codec_defaults(entry: dict[str, Any]) -> None:
+    """Input: one serialized entry. Output: None. Drops default fields."""
+    if entry.get("codec", CODEC_NONE) == CODEC_NONE:
+        entry.pop("codec", None)
+        entry.pop("original_size", None)
+    if entry.get("volume_chunk_size") is None:
+        entry.pop("volume_chunk_size", None)
+
+
+def _omit_default_codec_fields(manifest_dict: dict[str, Any]) -> None:
+    """Input: serialized manifest. Output: None. Drops codec none fields."""
+    for entry in manifest_dict.get("entries", []):
+        _omit_entry_codec_defaults(entry)
+
+
+def _entry_from_raw(raw: object) -> ManifestEntry:
+    """Input: one JSON entry. Output: ManifestEntry with codec defaults."""
+    if not isinstance(raw, dict):
+        raise TypeError("manifest entry must be an object")
+    data = dict(raw)
+    codec = data.get("codec") or CODEC_NONE
+    data["codec"] = codec
+    if data.get("original_size") is None:
+        if data.get("type") == "delta":
+            data["original_size"] = data.get("delta_size_bytes", 0)
+        else:
+            data["original_size"] = data.get("full_size_bytes")
+    return ManifestEntry(**data)
+
+
 def _parse_manifest_bytes(raw_bytes: bytes, actual: Path, bound: bool, path: Path) -> Manifest:
     """
     Input:  raw_bytes - plaintext manifest bytes
@@ -240,7 +279,7 @@ def _parse_manifest_bytes(raw_bytes: bytes, actual: Path, bound: bool, path: Pat
     computed = _compute_checksum(check_dict)
     suspect = computed != stored_checksum
 
-    entries = [ManifestEntry(**e) for e in entries_raw]
+    entries = [_entry_from_raw(e) for e in entries_raw]
     manifest = Manifest(
         version=raw["version"],
         session=raw["session"],
@@ -394,35 +433,101 @@ def _parse_session_slot(
     return manifest, name, mode_declared
 
 
-def _check_session_gap_and_plaintext(
-    raw: dict[str, bytes],
+def _sessions_from_raw(raw: dict[str, bytes]) -> set[int]:
+    """Input: control-file bytes. Output: session numbers present in the keys."""
+    found: set[int] = set()
+    for name in raw:
+        match = re.match(r"^session_(\d{3})/", name)
+        if match is not None:
+            found.add(int(match.group(1)))
+    return found
+
+
+def _disc_session_slots(
     listed: object,
-    gap_at: int | None,
-    encrypted: bool,
+    raw: dict[str, bytes],
+    start_session: int,
+) -> list[int]:
+    """
+    Input:  listed - backend session listing, if any
+            raw - control-file bytes
+            start_session - first session this disc may hold
+    Output: session numbers to parse, in order
+    """
+    found = _sessions_from_raw(raw)
+    if isinstance(listed, list):
+        for number in listed:
+            # scbc ignore[type-equality] Reject bool in the disc session listing
+            if type(number) is not int or not 0 <= number < _SESSION_PROBE_LIMIT:
+                raise ValueError(f"Invalid session number on disc: {number!r}")
+            found.add(number)
+    return sorted(
+        number for number in found
+        if start_session <= number < _SESSION_PROBE_LIMIT
+    )
+
+
+def _raise_if_torn_session_gap(
+    slots: list[int],
+    parsed_slots: set[int],
+    elsewhere: set[int],
+    start_session: int,
 ) -> None:
     """
-    Input:  raw - control-file bytes indexed by path
-            listed - session numbers reported by the backend
-            gap_at - first missing directory slot, if any
-            encrypted - whether plaintext manifests are forbidden
-    Output: None; raises for a later session past a gap or plaintext on an encrypted disc
+    Input:  slots - directories on this disc
+            parsed_slots - slots with a readable manifest
+            elsewhere - sessions catalog membership places on other discs
+            start_session - first session this disc may hold
+    Output: None; raises when a missing directory has a later session
+    Details:
+        A listed directory with no readable manifest is a torn slot.
+        Coverage checks handle that. A gap in the directory list with a
+        later session on this disc is an error unless catalog membership
+        places the missing session on another disc.
     """
-    if gap_at is not None and isinstance(listed, list):
-        if gap_at not in listed:
-            # scbc ignore[type-equality] Reject bool in the disc session listing
-            later = [n for n in listed if type(n) is int and n > gap_at]
-            if later:
-                raise ValueError(
-                    f"Session {gap_at} is missing on this disc but session "
-                    f"{min(later)} exists."
-                )
-    if encrypted:
-        for name in raw:
-            if re.fullmatch(r"session_\d{3}/manifest\.json", name):
-                raise ValueError(
-                    f"This encrypted disc has a plaintext {name}. "
-                    "Do not trust this disc."
-                )
+    on_disc = set(slots) | parsed_slots
+    if not on_disc:
+        return
+    last = max(on_disc)
+    for number in range(start_session, last):
+        if number in parsed_slots or number in elsewhere:
+            continue
+        if number in slots:
+            continue
+        later = [slot for slot in on_disc if slot > number]
+        if later:
+            raise ValueError(
+                f"Session {number} is missing on this disc but session "
+                f"{min(later)} exists."
+            )
+
+
+
+def _elsewhere_from_marker(marker: "VolumeMarker | None") -> set[int]:
+    """Input: volume marker. Output: holes in session_ranges on that disc."""
+    ranges = getattr(marker, "session_ranges", None) if marker is not None else None
+    if not ranges:
+        return set()
+    covered: set[int] = set()
+    for pair in ranges:
+        covered.update(range(pair[0], pair[1] + 1))
+    if not covered:
+        return set()
+    return set(range(min(covered), max(covered) + 1)) - covered
+
+
+
+def _check_encrypted_plaintext(raw: dict[str, bytes], encrypted: bool) -> None:
+    """Input: control files and encryption flag. Output: None; raises on plaintext."""
+    if not encrypted:
+        return
+    for name in raw:
+        if re.fullmatch(r"session_\d{3}/manifest\.json", name):
+            raise ValueError(
+                f"This encrypted disc has a plaintext {name}. "
+                "Do not trust this disc."
+            )
+
 
 
 def load_session_manifests(
@@ -431,6 +536,7 @@ def load_session_manifests(
     start_session: int = 0,
     raw: dict[str, bytes] | None = None,
     marker: "VolumeMarker | None" = None,
+    elsewhere_sessions: set[int] | None = None,
 ) -> list[Manifest]:
     """
     Input:  backend       - BurnBackend to read from
@@ -439,23 +545,24 @@ def load_session_manifests(
             raw           - optional already-fetched control-file bytes from
                             session_control_paths(), which skips a second
                             read_paths()
+            elsewhere_sessions - sessions catalog membership places on other discs
     Output: list of Manifest objects in ascending session order (may be empty)
     Details:
         Batch-extracts session_*/manifest.* and session_*/enc_mode.json
         through one backend.read_paths() call (unless the caller passes
         raw). Per session, it prefers manifest.enc over manifest.json. It
-        stops at the first missing session at or after start_session.
-        When list_session_numbers returns a list and a later session
-        directory exists past that gap, the function raises instead of
-        returning a truncated list. A session missing at start_session
-        counts exactly like any other gap, not as a silent skip. A torn
-        or failed read of the first session of the archive therefore
-        never counts as "nothing here yet." start_session exists only so
-        a multi-volume disc whose real first session is not 0 (per its
-        VolumeMarker.first_session) can tell this function where its
-        own sessions start. Callers must never pass it to cover an
-        unexplained gap. The function does not use dvd+rw-mediainfo
-        session count. On BD-R SRM+POW that count is always 1.
+        loads listed session_NNN directories in order. A listed slot with
+        no readable manifest is torn and ends the trusted prefix.
+        Coverage checks handle that slot. A missing directory with a
+        later directory on the same disc raises unless catalog membership
+        or volume.json session_ranges says that slot lives elsewhere.
+        A session missing at start_session counts exactly like any other
+        gap, not as a silent skip. start_session exists only so a
+        multi-volume disc whose real first session is not 0 (per its
+        VolumeMarker.first_session) can tell this function where its own
+        sessions start. Callers must never pass it to cover an unexplained
+        gap. The function does not use dvd+rw-mediainfo session count.
+        On BD-R SRM+POW that count is always 1.
     """
     # scbc boundary: Reject malformed disc or record fields before using them.
     if raw is None:
@@ -468,18 +575,25 @@ def load_session_manifests(
     except (RuntimeError, OSError) as exc:
         _log.warning("Cannot list sessions on this disc: %s", exc)
         listed = None
+    slots = _disc_session_slots(listed, raw, start_session)
     parsed: list[tuple[Manifest, str, bool]] = []
-    s = start_session
-    gap_at: int | None = None
-    while s < _SESSION_PROBE_LIMIT:
-        item = _parse_session_slot(raw, s, crypto, marker, encrypted)
+    parsed_slots: set[int] = set()
+    for slot in slots:
+        item = _parse_session_slot(raw, slot, crypto, marker, encrypted)
         if item is None:
-            gap_at = s
             break
         parsed.append(item)
-        s += 1
-    _check_session_gap_and_plaintext(raw, listed, gap_at, encrypted)
+        parsed_slots.add(slot)
+
+    elsewhere = set(elsewhere_sessions or ())
+    elsewhere |= _elsewhere_from_marker(marker)
+    _raise_if_torn_session_gap(slots, parsed_slots, elsewhere, start_session)
+    _check_encrypted_plaintext(raw, encrypted)
+    parsed.sort(key=lambda item: item[0].session if item[0].session >= 0 else 0)
     return [m for m, _name, _declared in parsed]
+
+
+
 
 
 def session_control_paths(backend: "BurnBackend | None" = None) -> list[str]:
@@ -557,9 +671,142 @@ def build_disc_state(
             continue
         for entry in m.entries:
             state[entry.path] = entry.result_checksum
+            if _split_is_incomplete(entry):
+                # The burn stopped after this chunk, so the file is not
+                # fully on disc. Drop it from state so no caller reports
+                # it as up to date. A resume may still stage only the
+                # missing tail of a clean prefix.
+                _log.warning(
+                    "Session %d holds chunk %d of %d for %s; not up to date",
+                    m.session, entry.volume_chunk, entry.volume_chunk_count,
+                    entry.path,
+                )
+                state.pop(entry.path, None)
         for deleted_path in m.deleted:
             state.pop(deleted_path, None)
     return state
+
+
+def _split_is_incomplete(entry: ManifestEntry) -> bool:
+    """Input: manifest entry. Output: True when later chunks were never burned."""
+    if entry.volume_chunk is None or entry.volume_chunk_count is None:
+        return False
+    return entry.volume_chunk + 1 < entry.volume_chunk_count
+
+
+@dataclass(frozen=True)
+class SplitPrefix:
+    """Chunks 0..next_chunk-1 of an interrupted volume split."""
+    path: str
+    chunk_count: int
+    next_chunk: int
+    payload_offset: int
+    result_checksum: str
+    original_size: int
+    codec: str
+    last_session: int
+
+
+def _prefix_from_first_chunk(
+    entry: ManifestEntry, size: int, session_n: int,
+) -> SplitPrefix | None:
+    """Input: chunk 0 entry, its size, and its session. Output: prefix or None."""
+    if entry.original_size is None or entry.volume_chunk_count is None:
+        return None
+    return SplitPrefix(
+        path=entry.path,
+        chunk_count=entry.volume_chunk_count,
+        next_chunk=1,
+        payload_offset=size,
+        result_checksum=entry.result_checksum,
+        original_size=entry.original_size,
+        codec=entry.codec,
+        last_session=session_n,
+    )
+
+
+def _extend_split_prefix(
+    prefix: SplitPrefix | None, entry: ManifestEntry, size: int,
+    session_n: int,
+) -> SplitPrefix | None:
+    """
+    Input: current prefix, next chunk entry, its size, and its session.
+    Output: extended prefix, or None when the chain is not a clean prefix.
+    """
+    if entry.volume_chunk == 0:
+        return _prefix_from_first_chunk(entry, size, session_n)
+    if prefix is None:
+        return None
+    if (
+        entry.volume_chunk != prefix.next_chunk
+        or entry.volume_chunk_count != prefix.chunk_count
+        or entry.result_checksum != prefix.result_checksum
+        or entry.original_size != prefix.original_size
+        or entry.codec != prefix.codec
+    ):
+        return None
+    return SplitPrefix(
+        path=prefix.path,
+        chunk_count=prefix.chunk_count,
+        next_chunk=prefix.next_chunk + 1,
+        payload_offset=prefix.payload_offset + size,
+        result_checksum=prefix.result_checksum,
+        original_size=prefix.original_size,
+        codec=prefix.codec,
+        last_session=session_n,
+    )
+
+
+def _readable_chunk_size(entry: ManifestEntry) -> int | None:
+    """Input: split chunk entry. Output: its payload size, or None if unusable."""
+    if entry.type != "full" or not entry.file:
+        return None
+    size = entry.volume_chunk_size
+    if size is None or size <= 0:
+        return None
+    chunk = entry.volume_chunk
+    count = entry.volume_chunk_count
+    if chunk is None or count is None or chunk >= count:
+        return None
+    return size
+
+
+def build_split_prefixes(manifests: list[Manifest]) -> dict[str, SplitPrefix]:
+    """
+    Input:  manifests - list of Manifest objects in ascending session order
+    Output: {path: SplitPrefix} for interrupted volume splits
+    Details:
+        Replays manifests like build_disc_state(). A path whose newest
+        entries are consecutive chunks 0..k of one count, with recorded
+        chunk sizes and the same result checksum, original size, and
+        codec, leaves a clean prefix. The resume stages only chunks
+        k+1..n-1 at the recorded offset. Any other shape clears the
+        path, so the caller stages the whole file. Manifests written
+        before volume_chunk_size existed cannot resume a tail; their
+        chains clear here as well.
+    """
+    prefixes: dict[str, SplitPrefix] = {}
+    for m in manifests:
+        if m.suspect:
+            continue
+        for entry in m.entries:
+            if entry.volume_chunk is None or entry.volume_chunk_count is None:
+                prefixes.pop(entry.path, None)
+                continue
+            size = _readable_chunk_size(entry)
+            if size is None:
+                prefixes.pop(entry.path, None)
+                continue
+            prefix = _extend_split_prefix(
+                prefixes.get(entry.path), entry, size, m.session,
+            )
+            if prefix is None or prefix.next_chunk >= prefix.chunk_count:
+                prefixes.pop(entry.path, None)
+            else:
+                prefixes[entry.path] = prefix
+        for deleted_path in m.deleted:
+            prefixes.pop(deleted_path, None)
+    return prefixes
 
 
 def build_disc_origin(
@@ -684,6 +931,7 @@ def _legacy_manifest_checksum_ok(d: dict, stored: str, version: int) -> bool:
             entry.pop("volume_chunk", None)
         if entry.get("volume_chunk_count") is None:
             entry.pop("volume_chunk_count", None)
+        _omit_entry_codec_defaults(entry)
     return _compute_checksum(d) == stored
 
 def manifest_checksum_ok(manifest: Manifest) -> bool:
@@ -703,6 +951,10 @@ def manifest_checksum_ok(manifest: Manifest) -> bool:
     d.pop("suspect", None)
     stored = d.get("manifest_checksum", "")
     d["manifest_checksum"] = ""
+    # Compression added default-valued codec fields that the writer omits.
+    # Drop them before the direct comparison, so a written manifest still
+    # verifies without falling through to the legacy normalizations.
+    _omit_default_codec_fields(d)
     if _compute_checksum(d) == stored:
         return True
     return _legacy_manifest_checksum_ok(d, stored, manifest.version)

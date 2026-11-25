@@ -5,13 +5,14 @@ Email:  eyeclept@pm.me
 
 Description:
     Tests for single-file splitting across physical volumes. Covers
-    dedicated-bin packing, restore concatenation, shrink transition,
-    recovery-mode missing policy, checksum verify, and gated GB-scale
-    fixtures.
+    cap-sized packing of several chunks per bin, restore concatenation,
+    shrink transition, recovery-mode missing policy, checksum verify,
+    and gated GB-scale fixtures.
 """
 # Imports
 import hashlib
 import logging
+import math
 import os
 import shutil
 from pathlib import Path
@@ -23,6 +24,7 @@ from oddarchiver.cache import CacheManager
 from oddarchiver.catalog import build_archive_catalog
 from oddarchiver.cli import _volume_iso_path, build_parser, dispatch
 from oddarchiver.crypto import KeyfileCrypto, NullCrypto, blob_aad, generate_keyfile
+from oddarchiver.compress import decode_payload
 from oddarchiver.disc import DVD_DL_DISC_BYTES, DVD_SL_DISC_BYTES, ISOBackend
 from oddarchiver.filehash import hash_file
 from oddarchiver.manifest import load_session_manifests, read_manifest, write_manifest
@@ -41,7 +43,7 @@ from oddarchiver.volume import (
     VolumeMarker, build_volume_baseline, read_volume_marker,
     write_volume_marker,
 )
-from tests.helpers import _write_prior_baseline
+from tests.helpers import _write_prior_baseline, fill
 
 # Globals
 _DISC = 20_000
@@ -117,8 +119,9 @@ def test_volume_split_lengths_chunk0_uses_active_budget():
     Input:  none
     Output: None
     Details:
-        Chunk 0 takes min(remaining, first_budget). Middle chunks take
-        full_budget. The last chunk takes the remainder.
+        Chunk 0 takes min(remaining, first_budget, BLOB_SIZE_CAP).
+        Middle chunks take min(full_budget, BLOB_SIZE_CAP).
+        The last chunk takes the remainder.
     """
     lengths = _volume_split_lengths(50_000, 19_000, 19_000)
     assert lengths == [19_000, 19_000, 12_000]
@@ -126,28 +129,123 @@ def test_volume_split_lengths_chunk0_uses_active_budget():
     assert lengths == [19_000, 19_000, 12_000]
 
 
-def test_pack_blobs_gives_each_split_chunk_a_dedicated_bin():
+def test_volume_split_lengths_caps_each_chunk(monkeypatch):
+    """
+    Input:  monkeypatch
+    Output: None
+    Details:
+        Each length stays at or under BLOB_SIZE_CAP even when the disc
+        budget is larger.
+    """
+    monkeypatch.setattr("oddarchiver.session.BLOB_SIZE_CAP", 10_000)
+    lengths = _volume_split_lengths(50_000, 19_000, 19_000)
+    assert lengths == [10_000, 10_000, 10_000, 10_000, 10_000]
+
+
+def test_pack_blobs_packs_several_split_chunks_per_bin():
     """
     Input:  none
     Output: None
     Details:
-        Three volume-split chunks of one file each land in their own bin
-        in ascending volume_chunk order. A small ordinary blob packs
-        after them, not beside a split chunk.
+        Cap-sized volume-split chunks share a bin when they fit.
+        Chunk order stays ascending. A small ordinary blob fills leftover
+        space in that bin.
     """
     chunks_of_file = [
-        _blob("huge.bin", 19_000, 0, 3),
-        _blob("huge.bin", 19_000, 1, 3),
-        _blob("huge.bin", 12_000, 2, 3),
+        _blob("huge.bin", 5_000, 0, 3),
+        _blob("huge.bin", 5_000, 1, 3),
+        _blob("huge.bin", 5_000, 2, 3),
     ]
     small = _blob("tiny.txt", 100)
-    bins = _pack_blobs(chunks_of_file + [small], first_budget=19_000, full_budget=19_000)
-    assert len(bins) == 4
-    for i in range(3):
-        assert len(bins[i]) == 1
-        assert bins[i][0].rel_path == "huge.bin"
-        assert bins[i][0].volume_chunk == i
-    assert [b.rel_path for b in bins[3]] == ["tiny.txt"]
+    bins = _pack_blobs(chunks_of_file + [small], first_budget=20_000, full_budget=20_000)
+    assert len(bins) == 1
+    split = [b for b in bins[0] if b.rel_path == "huge.bin"]
+    assert [b.volume_chunk for b in split] == [0, 1, 2]
+    assert [b.rel_path for b in bins[0] if b.volume_chunk is None] == ["tiny.txt"]
+
+
+def test_pack_blobs_keeps_chunk_order_across_bins():
+    """
+    Input:  none
+    Output: None
+    Details:
+        Chunk N never lands in an earlier bin than chunk N-1 when a
+        later chunk needs a new bin.
+    """
+    chunks_of_file = [
+        _blob("huge.bin", 8_000, 0, 3),
+        _blob("huge.bin", 8_000, 1, 3),
+        _blob("huge.bin", 8_000, 2, 3),
+    ]
+    bins = _pack_blobs(chunks_of_file, first_budget=20_000, full_budget=20_000)
+    assert [b.volume_chunk for b in bins[0]] == [0, 1]
+    assert [b.volume_chunk for b in bins[1]] == [2]
+    seen: list[tuple[int, int]] = []
+    for i, bin_items in enumerate(bins):
+        for item in bin_items:
+            seen.append((item.volume_chunk or 0, i))
+    assert [chunk for chunk, _bin in seen] == sorted(chunk for chunk, _bin in seen)
+    bins_by_chunk = [bin_i for _chunk, bin_i in seen]
+    assert bins_by_chunk == sorted(bins_by_chunk)
+
+
+def test_pack_blobs_fills_split_tails_to_six_bins():
+    """
+    Input:  none
+    Output: None
+    Details:
+        Two split files (9486+667) plus 46 ordinary blobs pack into
+        six bins. Tails share leftover space. Chunk order holds.
+        first_budget <= 0 still emits an empty first bin.
+    """
+    budget = 9486
+    blobs = [
+        _blob("a.bin", 9486, 0, 2),
+        _blob("a.bin", 667, 1, 2),
+        _blob("b.bin", 9486, 0, 2),
+        _blob("b.bin", 667, 1, 2),
+    ]
+    for i in range(46):
+        size = 400 + i * 12
+        blobs.append(_blob(f"ord_{i:02d}.bin", size))
+    total = sum(b.encoded_size for b in blobs)
+    expected = math.ceil(total / budget)
+    assert expected == 6
+    bins = _pack_blobs(blobs, first_budget=budget, full_budget=budget)
+    assert len(bins) == expected
+    tail_bins = [
+        b for b in bins
+        if any(
+            x.volume_chunk is not None
+            and x.volume_chunk == (x.volume_chunk_count or 1) - 1
+            for x in b
+        )
+    ]
+    assert len(tail_bins) == 2
+    for tb in tail_bins:
+        assert any(x.volume_chunk is None for x in tb)
+    positions: dict[str, list[int]] = {}
+    for i, bin_items in enumerate(bins):
+        for item in bin_items:
+            if item.volume_chunk is None:
+                continue
+            positions.setdefault(item.rel_path, []).append(i)
+            split_mates = [
+                x for x in bin_items
+                if x.volume_chunk is not None and x.rel_path != item.rel_path
+            ]
+            assert split_mates == []
+            same = [x for x in bin_items if x.rel_path == item.rel_path]
+            assert len(same) == 1
+    for rel_path, idxs in positions.items():
+        assert idxs == sorted(idxs)
+        assert len(idxs) == 2
+        assert idxs[1] > idxs[0]
+
+    empty_first = _pack_blobs(blobs, first_budget=0, full_budget=budget)
+    assert empty_first[0] == []
+    assert len(empty_first) == expected + 1
+
 
 
 def _assert_tagged_chunks(chunks: list[tuple[Path, int, bool]], payload: bytes) -> None:
@@ -183,13 +281,14 @@ def test_oversized_file_splits_into_tagged_dedicated_bins(tmp_path):
     Input:  tmp_path
     Output: None
     Details:
-        A 50000-byte file on a 20000-byte disc splits into dedicated
-        bins with sequential volume_chunk fields and full_size_bytes
-        equal to the whole file on every entry.
+        A 50000-byte file on a 20000-byte disc is over the disc budget
+        and under BLOB_SIZE_CAP, so it still splits. Chunks carry
+        sequential volume_chunk fields and full_size_bytes equal to the
+        whole file on every entry.
     """
     source = tmp_path / "src"
     source.mkdir()
-    payload = bytes([(i * 7) % 256 for i in range(_SPLIT_BYTES)])
+    payload = fill(b"z", _SPLIT_BYTES)
     (source / "huge.bin").write_bytes(payload)
 
     chunks = build_staging(
@@ -208,6 +307,81 @@ def test_oversized_file_splits_into_tagged_dedicated_bins(tmp_path):
     finally:
         for staging, _session_n, _is_new in chunks:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+
+def test_capped_file_that_fits_disc_packs_several_chunks_per_bin(tmp_path, monkeypatch):
+    """
+    Input:  tmp_path, monkeypatch
+    Output: None
+    Details:
+        A 3 MiB file on a 50 MiB disc with BLOB_SIZE_CAP at 1 MiB splits
+        into chunks under the cap. The chunks share one bin. Concatenating
+        them in volume_chunk order reproduces the source bytes.
+    """
+    cap = 1 << 20
+    monkeypatch.setattr("oddarchiver.session.BLOB_SIZE_CAP", cap)
+    source = tmp_path / "src"
+    source.mkdir()
+    payload = bytes([(i * 7) % 256 for i in range(3 * cap)])
+    (source / "huge.bin").write_bytes(payload)
+    chunks = build_staging(
+        session_n=0,
+        source=source,
+        disc_state={},
+        disc_origin={},
+        backend=ISOBackend(tmp_path / "pack.iso", disc_size=50 * 2**20),
+        cache=_make_cache(),
+        crypto=_crypto,
+        _staging_root=tmp_path / "staging",
+    )
+    try:
+        assert len(chunks) == 1
+        staging, session_n, is_new = chunks[0]
+        assert session_n == 0
+        assert not is_new
+        manifest = read_manifest(
+            staging / f"session_{session_n:03d}" / "manifest.json"
+        )
+        split_entries = [e for e in manifest.entries if e.path == "huge.bin"]
+        assert len(split_entries) == 3
+        assert [e.volume_chunk for e in split_entries] == [0, 1, 2]
+        parts: list[bytes] = []
+        for entry in split_entries:
+            blob = (staging / entry.file).read_bytes()
+            assert len(blob) <= cap
+            parts.append(blob)
+        assert b"".join(parts) == payload
+    finally:
+        for staging, _session_n, _is_new in chunks:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def test_capped_multi_chunk_test_iso_restore_round_trip(tmp_path, monkeypatch):
+    """
+    Input:  tmp_path, monkeypatch
+    Output: None
+    Details:
+        init --test-iso of a capped multi-chunk file restores byte-exact
+        contents. Several chunks share the same disc.
+    """
+    cap = 1 << 20
+    monkeypatch.setattr("oddarchiver.session.BLOB_SIZE_CAP", cap)
+    source = tmp_path / "src"
+    source.mkdir()
+    payload = os.urandom(3 * cap)
+    (source / "huge.bin").write_bytes(payload)
+    iso = tmp_path / "cap.iso"
+    rc = _dispatch([
+        "init", str(source), "--test-iso", str(iso),
+        "--disc-size", str(50 * 2**20), "--encrypt", "none",
+    ])
+    assert rc == 0
+    dest = tmp_path / "dest"
+    rc = _dispatch(["restore", str(dest), "--test-iso", str(iso)])
+    assert rc == 0
+    assert (dest / "huge.bin").read_bytes() == payload
+    assert not list(tmp_path.glob("cap.vol*"))
 
 
 def _burn_split_archive(
@@ -361,7 +535,7 @@ def test_split_file_independent_chunk_decrypt(tmp_path):
     """
     source = tmp_path / "src"
     source.mkdir()
-    payload = b"Z" * _SPLIT_BYTES
+    payload = fill(b"Z", _SPLIT_BYTES)
     (source / "huge.bin").write_bytes(payload)
     keyfile = tmp_path / "archive.key"
     generate_keyfile(str(keyfile))
@@ -377,23 +551,21 @@ def test_split_file_independent_chunk_decrypt(tmp_path):
         _staging_root=tmp_path / "staging",
     )
     try:
+        entries = []
         plains: list[bytes] = []
-        offset = 0
-        for i, (staging, session_n, _is_new) in enumerate(chunks):
-            # build_staging writes the staged manifest encrypted.
+        for staging, session_n, _is_new in chunks:
             manifest = read_manifest(
                 staging / f"session_{session_n:03d}" / "manifest.json", crypto=crypto,
             )
-            blob = staging / manifest.entries[0].file
-            out = tmp_path / f"plain_{i}"
-            crypto.decrypt_file(blob, out, aad=blob_aad(manifest.entries[0]))
-            plain = out.read_bytes()
-            assert plain == payload[offset:offset + len(plain)]
-            assert blob.read_bytes() != plain
-            offset += len(plain)
-            plains.append(plain)
-        assert offset == len(payload)
-        assert b"".join(plains) == payload
+            entry = manifest.entries[0]
+            entries.append(entry)
+            stored = tmp_path / f"stored_{entry.volume_chunk}"
+            crypto.decrypt_file(
+                staging / entry.file, stored, aad=blob_aad(entry),
+            )
+            plains.append(stored.read_bytes())
+        assert all(plains)
+        assert decode_payload(b"".join(plains), entries[0].codec) == payload
     finally:
         for staging, _session_n, _is_new in chunks:
             shutil.rmtree(staging, ignore_errors=True)
@@ -460,7 +632,7 @@ def test_split_file_shrinks_to_single_blob(tmp_path, monkeypatch):
 
     source = tmp_path / "src"
     source.mkdir()
-    large = b"L" * _SPLIT_BYTES
+    large = fill(b"L", _SPLIT_BYTES)
     (source / "huge.bin").write_bytes(large)
 
     pack_backend = ISOBackend(tmp_path / "pack.iso", disc_size=_DISC)
@@ -486,7 +658,7 @@ def test_split_file_shrinks_to_single_blob(tmp_path, monkeypatch):
     backend = ISOBackend(iso, disc_size=2_000_000)
     backend.init(combined, label="SHRINK", expected_session_count=0)
 
-    shrunk = b"S" * 8_000
+    shrunk = fill(b"S", 8_000)
     (source / "huge.bin").write_bytes(shrunk)
     manifests = load_session_manifests(backend, crypto=_crypto)
     disc_state = build_disc_state(manifests)
@@ -518,9 +690,13 @@ def test_split_file_shrinks_to_single_blob(tmp_path, monkeypatch):
 
 
 def test_skip_volume_on_split_chunk_reports_missing(tmp_path):
-    """Missing a split chunk leaves no partial file, but restores other files."""
-    payload = b"H" * _SPLIT_BYTES
-    extra = {"other.txt": b"O" * _SMALL_BYTES}
+    """Missing a split chunk leaves no partial file, but restores other files.
+
+    Restore checks the manifests of every other volume once; the skipped
+    volume 1 is never requested.
+    """
+    payload = fill(b"H", _SPLIT_BYTES)
+    extra = {"other.txt": fill(b"O", _SMALL_BYTES)}
     _source, isos = _burn_split_archive(tmp_path, payload, extra=extra)
     assert len(isos) >= 3
     backend = ISOBackend(isos[-1], disc_size=_DISC)
@@ -529,10 +705,13 @@ def test_skip_volume_on_split_chunk_reports_missing(tmp_path):
         backend, _crypto, start_session=marker.first_session, marker=marker,
     )
     catalog = build_archive_catalog(backend, _crypto, manifests, marker)
+    checks = [index for index in range(len(isos) - 1) if index != 1]
+    acquire = _Acquire(isos, checks)
     result = restore_archive(
         tmp_path / "dest", backend, _crypto, catalog,
-        skip_volumes=[1], manifests=manifests, acquisition=_Acquire(isos, []),
+        skip_volumes=[1], manifests=manifests, acquisition=acquire,
     )
+    assert sorted(acquire.seen) == checks
     assert result.failures == 0
     assert result.stale == []
     assert result.missing == ["huge.bin"]
@@ -550,7 +729,7 @@ def test_verify_checksum_catches_tampered_split_chunk(tmp_path):
     """
     source = tmp_path / "src"
     source.mkdir()
-    payload = b"V" * _SPLIT_BYTES
+    payload = fill(b"V", _SPLIT_BYTES)
     (source / "huge.bin").write_bytes(payload)
     chunks = build_staging(
         session_n=0,

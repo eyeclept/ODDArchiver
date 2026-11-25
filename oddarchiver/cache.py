@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 # Globals
 logger = logging.getLogger(__name__)
 _log = logger
+_BLOB_COPY_CHUNK = 1024 * 1024
 
 
 # Functions
@@ -409,6 +410,38 @@ def _prefetch_session_blobs(
         manager.put(path, session, data)
 
 
+def _copy_source(handle, source: bytes | Path) -> int:
+    """Input: open dest and bytes or file. Output: copied byte count."""
+    if not isinstance(source, Path):
+        handle.write(source)
+        return len(source)
+    size = 0
+    with source.open("rb") as inf:
+        while True:
+            chunk = inf.read(_BLOB_COPY_CHUNK)
+            if not chunk:
+                break
+            handle.write(chunk)
+            size += len(chunk)
+    return size
+
+
+def _write_blob_file(bp: Path, source: bytes | Path) -> int:
+    """Input: dest blob path and source. Output: copied size after atomic replace."""
+    fd, tmp_name = tempfile.mkstemp(prefix="blob.", dir=str(bp.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            size = _copy_source(handle, source)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, bp)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    return size
+
+
 class CacheManager:
     """
     Input:  cache_dir - root directory for the cache (default ~/.cache/oddarchiver)
@@ -477,33 +510,31 @@ class CacheManager:
         """
         self.put_many([(path, session, blob)])
 
-    def put_many(self, entries: Iterable[tuple[str, int, bytes]]) -> None:
+    def put_file(self, path: str, session: int, src: Path) -> None:
         """
-        Input: entries - stream of (path, session, blob) tuples
+        Input:  path, session, src - relative key and encrypted blob file
+        Output: None
+        Details: Copy src in chunks. Commit the index once.
+        """
+        self.put_many([(path, session, src)])
+
+    def put_many(self, entries: Iterable[tuple[str, int, bytes | Path]]) -> None:
+        """
+        Input: entries - stream of (path, session, blob-or-file) tuples
         Output: None
         Details: Write one blob at a time. Commit the index once.
         """
         self._ensure_migrated()
         manifest = _load_manifest(self.cache_dir)
         changed = False
-        for path, session, blob in entries:
+        for path, session, source in entries:
             bp = _blob_path(self.cache_dir, path, session)
             if not self.cache_dir.exists() and not self.cache_dir.is_symlink():
                 self.cache_dir.mkdir(parents=True, mode=0o700)
             _secure_dir(self.cache_dir)
             _secure_dir(bp.parent)
-            fd, tmp_name = tempfile.mkstemp(prefix="blob.", dir=str(bp.parent))
-            tmp = Path(tmp_name)
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(blob)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(tmp, bp)
-            finally:
-                if tmp.exists():
-                    tmp.unlink()
-            manifest[f"{session}:{_key_path(path)}"] = {"size": len(blob), "blob": bp.name}
+            size = _write_blob_file(bp, source)
+            manifest[f"{session}:{_key_path(path)}"] = {"size": size, "blob": bp.name}
             changed = True
         if changed:
             _save_manifest(self.cache_dir, manifest)

@@ -47,6 +47,8 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "session": None,
         "force": False,
         "level": "fast",
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -147,8 +149,9 @@ def test_sync_dry_run_space_overage_no_exit1(tmp_path, capsys):
     Input:  tmp_path, capsys
     Output: None
     Details:
-        When staging size exceeds remaining capacity, _run_dry_run must print
-        OVERAGE and still return 0 (not exit 1).
+        When staging size exceeds remaining capacity, _run_dry_run must
+        plan a new volume instead of reporting that the files do not fit,
+        and still return 0 (not exit 1).
     """
     source = tmp_path / "src"
     source.mkdir()
@@ -166,7 +169,8 @@ def test_sync_dry_run_space_overage_no_exit1(tmp_path, capsys):
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "OVERAGE" in out
+    assert "new volume" in out
+    assert "would not fit" not in out
 
 
 class _PowLyingISO(ISOBackend):
@@ -218,8 +222,8 @@ def test_dry_run_next_session_ignores_mmc_session_count(
     )
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Would burn as: session_002" in out
-    assert "Would burn as: session_001" not in out
+    assert "session_002  inserted disc" in out
+    assert "session_001" not in out
 
 
 def test_dry_run_disc_state_line_ignores_mmc_session_count(

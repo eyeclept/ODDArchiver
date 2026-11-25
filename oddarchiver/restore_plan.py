@@ -23,8 +23,10 @@ from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
 from oddarchiver.catalog import (
-    ArchiveCatalog, disc_name, learn_disc, remembered_encryption_mode,
-    safe_display, volume_for_session,
+    ArchiveCatalog, catalog_latest_session, disc_name,
+    discs_with_unlearned_sessions, elsewhere_sessions_for_disc,
+    highest_seen_volume, learn_disc, remembered_discs,
+    remembered_encryption_mode, safe_display, volume_for_session,
 )
 from oddarchiver.diskread import READ_MODES, make_session_source
 from oddarchiver.filehash import hash_file
@@ -34,7 +36,7 @@ from oddarchiver.restore_state import (
     state_path, write_restore_state,
 )
 from oddarchiver.session import SPACE_SAFETY_MARGIN
-from oddarchiver.volume import PathVersion, read_volume_marker
+from oddarchiver.volume import PathVersion, read_volume_marker, session_ranges_of
 
 if TYPE_CHECKING:
     from oddarchiver.crypto import CryptoBackend
@@ -64,13 +66,18 @@ def _version_disc(catalog: ArchiveCatalog, version: PathVersion) -> int | None:
 
 def _disc_excludes_session(disc, session: int) -> bool:
     """Input: disc range and session. Output: whether the range excludes the session."""
-    if disc.first_session is not None and session < disc.first_session:
-        return True
-    if disc.last_session is not None and session > disc.last_session:
-        return True
-    if disc.first_session is not None and disc.last_session is None:
-        return True
-    return False
+    ranges = session_ranges_of(
+        disc.first_session, disc.last_session,
+        getattr(disc, "session_ranges", None),
+    )
+    if not ranges:
+        if disc.first_session is not None and session < disc.first_session:
+            return True
+        if disc.first_session is not None and disc.last_session is None:
+            return True
+        return False
+    return all(session < first or session > last for first, last in ranges)
+
 
 
 def _unknown_candidate(catalog: ArchiveCatalog, session: int,
@@ -104,7 +111,7 @@ def _needed_name(catalog: ArchiveCatalog, index: int,
     """Input: catalog and requested index. Output: a range-safe disc name."""
     for session in _unresolved_sessions(catalog):
         if _unknown_candidate(catalog, session, missing or set()) == index:
-            return disc_name(catalog, None, session)
+            return f"{disc_name(catalog, None, session)} (disc {index})"
     return disc_name(catalog, index)
 
 
@@ -157,12 +164,20 @@ def _chain_complete(chain: list[PathVersion]) -> bool:
     Output: True when the chain can restore the file
     Details: The chain starts at a full version or at chunk 0, and each
         version came from a disc manifest. A v1 placeholder only drives
-        discovery.
+        discovery. A volume-split chain is complete only when it also
+        ends at the final chunk. Chunks planned from one disc alone are
+        a prefix, not the whole file.
     """
     if chain[-1].volume_chunk is not None:
-        starts = chain[0].volume_chunk == 0
-    else:
-        starts = chain[0].kind == "full"
+        count = chain[-1].volume_chunk_count
+        chunks = [version.volume_chunk for version in chain]
+        complete_chunks = (
+            count is not None
+            and len(chunks) == count
+            and chunks == list(range(count))
+        )
+        return complete_chunks and all(version.verified for version in chain)
+    starts = chain[0].kind == "full"
     return starts and all(version.verified for version in chain)
 
 
@@ -412,9 +427,16 @@ def _replan_changed(catalog: ArchiveCatalog, paths: list[str] | None,
     )
 
 
-def _entry_key(path: str, session: int) -> str:
-    """Input: path and session. Output: stable state key. Details: Keep events distinct."""
-    return f"{session}:{path}"
+def _entry_key(path: str, session: int, chunk: int | None = None) -> str:
+    """
+    Input: path, session, and volume chunk index (None for one blob)
+    Output: stable state key
+    Details:
+        Keep events distinct. A volume-split file can hold several chunks
+        in one session, so the chunk index is part of the key. Older state
+        files used "session:path"; a miss only makes the disc read again.
+    """
+    return f"{session}:{chunk if chunk is not None else 0}:{path}"
 
 
 def _blob(entry: ManifestEntry) -> str:
@@ -559,7 +581,9 @@ def _collected_chain_entries(
     """Input: path, versions, state and blob roots. Output: complete collected entries or None."""
     entries = []
     for version in versions:
-        raw = state.collected_entries.get(_entry_key(path, version.session))
+        raw = state.collected_entries.get(
+            _entry_key(path, version.session, version.volume_chunk)
+        )
         if raw is None:
             return None
         entry = ManifestEntry(**raw)
@@ -683,6 +707,60 @@ def _restore_ready(dest: Path, crypto: CryptoBackend, chains: dict[str, list[Pat
     return restored, failed
 
 
+def _marker_holds_session(marker, session: int) -> bool:
+    """Input: volume marker and session. Output: whether this disc can hold it."""
+    ranges = getattr(marker, "session_ranges", None)
+    if ranges:
+        return any(first <= session <= last for first, last in ranges)
+    first = getattr(marker, "first_session", None)
+    return first is not None and first <= session
+
+
+
+def _note_current_suspects(
+    inserted: object, inserted_manifests: object,
+    marker: object, index: int | None, target_session: int,
+) -> tuple[int, bool]:
+    """Input: inserted disc state. Output: suspect failure count and whether counted."""
+    if inserted is not None and inserted_manifests is not None:
+        return _note_suspect_manifests(
+            inserted_manifests, marker, index, target_session,
+        ), True
+    return 0, False
+
+
+def _manual_disc_choice(
+    answer: str, needed: dict[int, int],
+) -> tuple[int | None, str | None]:
+    """Input: m N answer and needed indexes. Output: index or error message."""
+    number = answer[2:].strip()
+    if not number.isdecimal() or len(number) > 6:
+        return None, "Enter m and a disc number with at most six digits."
+    index = int(number)
+    if index not in needed:
+        return None, f"Disc {index} is not in this restore plan."
+    return index, None
+
+
+def _unneeded_disc_message(
+    marker: object, needed: dict[int, int], catalog: ArchiveCatalog,
+) -> str | None:
+    """Input: marker and restore plan. Output: refusal message or None."""
+    unresolved = [
+        session for session in _unresolved_sessions(catalog)
+        if _unknown_candidate(catalog, session, set()) in needed
+    ]
+    if (
+        marker.volume_index not in needed and not unresolved
+        and marker.volume_index != catalog.source_volume_index
+    ):
+        name = disc_name(catalog, marker.volume_index)
+        if marker.volume_index in getattr(catalog, "discs", {}):
+            return f"That is {name}, already read or not in this restore plan."
+        return f"That is {name}, not needed for this restore plan."
+    return None
+
+
 class DiscAcquisition:
     """Get a needed disc from a drive or sibling ISO. Tests can replace this object."""
 
@@ -763,7 +841,7 @@ class DiscAcquisition:
             holders = [
                 (sibling_marker.first_session, index)
                 for index, (_sibling, sibling_marker) in self._siblings.items()
-                if sibling_marker.first_session <= session
+                if _marker_holds_session(sibling_marker, session)
             ]
             if holders:
                 holder = max(holders)[1]
@@ -805,13 +883,9 @@ class DiscAcquisition:
         if answer.lower() == 'q':
             return None, None, True
         if answer.startswith('m '):
-            number = answer[2:].strip()
-            if not number.isdecimal() or len(number) > 6:
-                print("Enter m and a disc number with at most six digits.", file=sys.stderr)
-                return None, None, False
-            index = int(number)
-            if index not in needed:
-                print(f"Disc {index} is not in this restore plan.", file=sys.stderr)
+            index, error = _manual_disc_choice(answer, needed)
+            if error is not None:
+                print(error, file=sys.stderr)
                 return None, None, False
             return None, index, False
         if answer:
@@ -823,15 +897,22 @@ class DiscAcquisition:
             _log.warning("Cannot read volume.json of the inserted disc: %s", exc)
             print(f"Refuse this disc (unknown disc): {safe_display(str(exc))}", file=sys.stderr)
             return None, None, False
-        unresolved = [
-            session for session in _unresolved_sessions(catalog)
-            if _unknown_candidate(catalog, session, set()) in needed
-        ]
-        if marker is None or marker.archive_id != archive_id or (
-            marker.volume_index not in needed and not unresolved
-            and marker.volume_index != catalog.source_volume_index
-        ):
-            print("This disc is from another archive or is not needed. Insert a disc in the list.", file=sys.stderr)
+        if marker is None:
+            print(
+                "No readable disc in the drive: the inserted disc has no "
+                "archive volume marker. Insert a disc from the list.",
+                file=sys.stderr,
+            )
+            return None, None, False
+        if marker.archive_id != archive_id:
+            print(
+                "That disc is from another archive. Insert a disc in the list.",
+                file=sys.stderr,
+            )
+            return None, None, False
+        message = _unneeded_disc_message(marker, needed, catalog)
+        if message is not None:
+            print(message, file=sys.stderr)
             return None, None, False
         return self.initial, None, False
 
@@ -863,8 +944,10 @@ class DiscAcquisition:
         else:
             print("Insert one of these discs, then press Enter:")
         for index, count in sorted(needed.items()):
-            print(f"  {_needed_name(catalog, index)}: {count} file(s)")
+            print(f"  {_needed_name(catalog, index)}: {_disc_request_reason(count)}")
         print("Type m N if disc N is missing. Type q to stop and save progress.")
+        from oddarchiver.drive import open_tray
+        open_tray(getattr(self.initial, "device", None))
         try:
             answer = self.ask('> ').strip()
         except EOFError:
@@ -890,8 +973,9 @@ def _disc_authenticated(catalog: ArchiveCatalog, crypto: CryptoBackend,
                      marker.volume_index)
         return False
     if encrypted and not any(
-        not manifest.suspect and manifest.session == slot
-        for slot, manifest in enumerate(manifests, marker.first_session)
+        not manifest.suspect and type(manifest.session) is int
+        and manifest.session >= 0
+        for manifest in manifests
     ):
         _log.warning("Refusing disc %s: no authenticated session manifest",
                      marker.volume_index)
@@ -926,8 +1010,9 @@ def _note_suspect_manifests(disc_manifests, marker, index, target_session) -> in
     extra = _count_suspects_in_range(disc_manifests, first, index, target_session)
     if disc_manifests and all(m.suspect for m in disc_manifests):
         print(
-            "Every manifest on this disc is unreadable. Check the key. "
-            "The disc may be damaged.",
+            "Every manifest on this disc is unreadable. The passphrase or "
+            "key is wrong, or the disc is from another archive. The disc "
+            "may also be damaged.",
             file=sys.stderr,
         )
         if extra == 0:
@@ -1005,13 +1090,24 @@ def _initial_manifests(backend: BurnBackend, crypto: CryptoBackend,
     if inserted_manifests is None:
         inserted_manifests = load_session_manifests(
             backend, crypto, start_session=marker.first_session, marker=marker,
+            elsewhere_sessions=elsewhere_sessions_for_disc(
+                catalog, marker.volume_index if marker is not None else None,
+            ),
         )
     if not _disc_authenticated(catalog, crypto, marker, inserted_manifests):
+        first = marker.first_session if marker is not None else 0
+        _note_suspect_manifests(
+            inserted_manifests, marker,
+            marker.volume_index if marker is not None else None,
+            max(catalog.last_session, first),
+        )
+
         raise RuntimeError(
             "The inserted disc has no authenticated manifest. "
             "Use the correct key for this archive."
         )
     return marker, inserted_manifests
+
 
 
 def _pending_chains(dest: Path, chains: dict[str, list[PathVersion]],
@@ -1060,9 +1156,12 @@ def _needed_for_pending(catalog: ArchiveCatalog, pending: dict[str, list[PathVer
         for index in indices:
             if any(
                 (_version_disc(catalog, v) is None
-                 or _entry_key(path, v.session) not in state.collected_entries
+                 or _entry_key(path, v.session, v.volume_chunk)
+                 not in state.collected_entries
                  or not _spool_blob(spool, _blob(ManifestEntry(
-                     **state.collected_entries[_entry_key(path, v.session)]
+                     **state.collected_entries[
+                         _entry_key(path, v.session, v.volume_chunk)
+                     ]
                  ))).is_file())
                 for v in chain
                 if (_version_disc(catalog, v) == index
@@ -1154,10 +1253,18 @@ def _read_acquired_manifests(
     disc_manifests = inserted_manifests
     refusal = None
     if disc_manifests is None:
+        # The backend caches the root listing. A disc swap reuses the same
+        # backend object, so a stale listing would report the previous
+        # medium's sessions and fail the gap check.
+        if hasattr(inserted, "invalidate_session_list"):
+            inserted.invalidate_session_list()
         try:
             disc_manifests = load_session_manifests(
                 inserted, crypto,
                 start_session=marker.first_session, marker=marker,
+                elsewhere_sessions=elsewhere_sessions_for_disc(
+                    catalog, getattr(marker, "volume_index", None),
+                ),
             )
         except (ValueError, RuntimeError, OSError) as exc:
             _log.warning("Cannot load manifests of acquired disc %s: %s", index, exc)
@@ -1173,14 +1280,17 @@ def _requested_for_disc(
     disc_manifests: list, index: int,
 ) -> tuple[list[tuple[str, int, ManifestEntry]], set[str]]:
     """Input: catalog, pending chains and disc manifests. Output: requested entries and bad paths."""
-    by_event = {(m.session, e.path): e for m in disc_manifests if not m.suspect for e in m.entries}
+    by_event = {
+        (m.session, e.path, e.volume_chunk): e
+        for m in disc_manifests if not m.suspect for e in m.entries
+    }
     requested = []
     bad_paths = set()
     for path, chain in pending.items():
         for version in chain:
             if _version_disc(catalog, version) != index:
                 continue
-            entry = by_event.get((version.session, path))
+            entry = by_event.get((version.session, path, version.volume_chunk))
             if entry is None:
                 print(
                     f"Disc {index} has no manifest entry for "
@@ -1286,9 +1396,162 @@ def _record_requested_entries(
         if not (_spool_blob(spool, _blob(entry)) if across_discs
                 else storage / _blob(entry)).is_file():
             raise RuntimeError(f"Disc {index} has no encrypted blob for {path} at session {session_n}.")
-        state.collected_entries[_entry_key(path, session_n)] = dataclasses.asdict(entry)
+        state.collected_entries[
+            _entry_key(path, session_n, entry.volume_chunk)
+        ] = dataclasses.asdict(entry)
     if index not in state.read_discs:
         state.read_discs.append(index)
+
+
+def _disc_request_reason(count: int) -> str:
+    """Input: pending file count. Output: prompt text for that disc."""
+    if count:
+        return f"{count} file(s)"
+    return "manifest check (no blobs needed)"
+
+
+def _volume_indexes_from_marker(marker: object) -> set[int]:
+    """Input: volume marker. Output: this disc and earlier discs it names."""
+    if marker is None:
+        return set()
+    index = getattr(marker, "volume_index", None)
+    # scbc ignore[type-equality] Reject bool as a volume index
+    if type(index) is not int or index < 0:
+        return set()
+    known = {index}
+    known.update(range(index))
+    if getattr(marker, "previous_volume_label", "") and index > 0:
+        known.add(index - 1)
+    return known
+
+
+def _volume_indexes_from_records(archive_id: str | None) -> set[int]:
+    """Input: archive id. Output: discs from local records and highest index."""
+    if not archive_id:
+        return set()
+    known = set(remembered_discs(archive_id))
+    highest = highest_seen_volume(archive_id)
+    if highest is not None:
+        known.update(range(highest + 1))
+    return known
+
+
+def _known_restore_volumes(catalog: ArchiveCatalog, marker: object) -> set[int]:
+    """
+    Input: catalog and a volume marker
+    Output: volume indexes known from catalog, records, labels, and ranges
+    """
+    known = set(catalog.discs)
+    source = catalog.source_volume_index
+    if source is not None and source >= 0:
+        known.add(source)
+        known.update(range(source))
+    known |= _volume_indexes_from_marker(marker)
+    known |= _volume_indexes_from_records(catalog.archive_id)
+    return known
+
+
+def _queue_manifest_checks(
+    needed: dict[int, int], catalog: ArchiveCatalog, marker: object,
+    missing: set[int], checked: set[int],
+) -> None:
+    """Input: empty needed map and known discs. Output: unread volumes queued."""
+    if needed:
+        return
+    for index in sorted(_known_restore_volumes(catalog, marker)):
+        if index not in missing and index not in checked:
+            needed[index] = 0
+
+
+def _report_unchecked_volumes(
+    catalog: ArchiveCatalog, marker: object, checked: set[int], missing: set[int],
+) -> None:
+    """Input: known and checked discs. Output: stderr list of unread volumes."""
+    unchecked = sorted(
+        index for index in _known_restore_volumes(catalog, marker)
+        if index not in checked
+    )
+    if not unchecked:
+        return
+    names = ", ".join(
+        _needed_name(catalog, index, missing) for index in unchecked
+    )
+    print(
+        f"Unchecked volumes: {names}. The restore result may be incomplete.",
+        file=sys.stderr,
+    )
+
+def _latest_plan_session(
+    session: int | None, catalog: ArchiveCatalog, state: RestoreState,
+    current: int,
+) -> int:
+    """Input: requested session and catalog. Output: plan session when unbounded."""
+    if session is None:
+        current = catalog_latest_session(catalog)
+        state.plan_session = current
+    return current
+
+
+def _record_learned_disc(
+    index: int, learned: set[int], checked: set[int], state: RestoreState,
+) -> bool:
+    """Input: disc index and restore tracking sets. Output: whether this is the first learn."""
+    first_learn = index not in learned
+    learned.add(index)
+    checked.add(index)
+    if index not in state.read_discs:
+        state.read_discs.append(index)
+    return first_learn
+
+
+def _queue_unlearned_sessions(
+    needed: dict[int, int], catalog: ArchiveCatalog,
+    learned: set[int], missing: set[int], read_this_run: set[int],
+) -> None:
+    """Input: needed map and learn state. Output: unread unlearned discs queued."""
+    for extra in discs_with_unlearned_sessions(catalog, learned, missing):
+        if extra not in read_this_run:
+            needed[extra] = needed.get(extra, 0) + 1
+
+
+def _disc_already_served(
+    index: int | None, needed: dict[int, int], read_this_run: set[int],
+) -> bool:
+    """Input: current disc and needed map. Output: whether this disc was already used."""
+    return index not in needed or index in read_this_run
+
+
+def _current_restore_disc(
+    inserted: object, catalog: ArchiveCatalog,
+) -> tuple[object | None, int | None]:
+    """Input: inserted backend and catalog. Output: marker and archive volume index."""
+    marker = read_volume_marker(inserted) if inserted is not None else None
+    index = (
+        marker.volume_index
+        if marker and marker.archive_id == catalog.archive_id
+        else None
+    )
+    return marker, index
+
+
+def _complete_when_blobs_ready(
+    needed: dict[int, int], catalog: ArchiveCatalog, marker: object,
+    missing: set[int], checked: set[int], dest: Path, crypto: CryptoBackend,
+    pending: dict[str, list[PathVersion]], state: RestoreState, spool: Path,
+    temporary: Path, force: bool, dest_digests: dict[str, str | None],
+    stale: list[tuple[str, int]], absent: list[str],
+) -> tuple[int, int, list[tuple[str, int]], list[str]] | None:
+    """Input: needed discs after blob plan. Output: finish counts or None to keep reading."""
+    if needed:
+        return None
+    _queue_manifest_checks(needed, catalog, marker, missing, checked)
+    if needed:
+        return None
+    return _finish_without_needed(
+        dest, crypto, pending, state, spool, temporary, force,
+        dest_digests, stale, absent,
+    )
+
 
 
 def restore_archive(dest: Path, backend: BurnBackend, crypto: CryptoBackend,
@@ -1306,14 +1569,15 @@ def restore_archive(dest: Path, backend: BurnBackend, crypto: CryptoBackend,
     Details: Collect one batch per needed disc and reconstruct completed chains.
         Honor --read-mode. Count real blob bytes during extract. A load
         error on the starting disc stops the restore. A load error on an
-        acquired disc refuses only that disc.
+        acquired disc refuses only that disc. After blob collection, read
+        manifests of every known volume that is not missing.
     """
     from oddarchiver.restore import RestoreResult, _mkdir_private
     if catalog.archive_id is None:
         raise ValueError("--all-disks needs a disc with volume.json.")
     dest = Path(dest)
     _mkdir_private(dest)
-    target_session = catalog.last_session if session is None else session
+    target_session = session if session is not None else catalog_latest_session(catalog)
     unmatched = [
         path for path in (paths or [])
         if not any(
@@ -1352,14 +1616,21 @@ def restore_archive(dest: Path, backend: BurnBackend, crypto: CryptoBackend,
     }
     learn_disc(catalog, marker, backend.mediainfo().label, inserted_manifests)
     learned: set[int] = {marker.volume_index}
+    checked_manifests: set[int] = {marker.volume_index, *state.read_discs}
+    start_marker = marker
     paused = False
     failed_paths: set[str] = set()
     dest_digests: dict[str, str | None] = {}
 
     def replan() -> tuple[dict[str, list[PathVersion]], list[tuple[str, int]], list[str]]:
         """Input: None. Output: a full plan for the current catalog and missing discs."""
+        nonlocal target_session
+        target_session = _latest_plan_session(
+            session, catalog, state, target_session,
+        )
         return _plan(catalog, paths, target_session, missing, previous_checksums,
                      learned=learned)
+
 
     def refuse(disc: int | None, reason: str) -> None:
         """
@@ -1432,13 +1703,17 @@ def restore_archive(dest: Path, backend: BurnBackend, crypto: CryptoBackend,
     def learn_current_disc(index: int, marker: object, inserted: BurnBackend,
                            disc_manifests: list) -> bool:
         """Input: current disc and manifests. Output: whether its catalog change needs replanning."""
-        nonlocal chains, stale, absent
+        nonlocal chains, stale, absent, target_session
         previous_disc = catalog.discs.get(index)
         changed_paths = learn_disc(
             catalog, marker, inserted.mediainfo().label, disc_manifests,
         )
-        first_learn = index not in learned
-        learned.add(index)
+        first_learn = _record_learned_disc(
+            index, learned, checked_manifests, state,
+        )
+        target_session = _latest_plan_session(
+            session, catalog, state, target_session,
+        )
         if changed_paths or previous_disc != catalog.discs.get(index) or first_learn:
             changed_paths |= {
                 path for path, chain in chains.items() if not _chain_complete(chain)
@@ -1503,26 +1778,28 @@ def restore_archive(dest: Path, backend: BurnBackend, crypto: CryptoBackend,
         # Replan after learning an acquired disc or marking a disc missing.
         pending = _pending_chains(dest, chains, failed_paths, state, dest_digests)
         needed = _needed_for_pending(catalog, pending, missing, learned, state, spool)
+        _queue_unlearned_sessions(
+            needed, catalog, learned, missing, read_this_run,
+        )
         discovery_paths = _add_discovery_discs(
             catalog, pending, previous_checksums, missing, state, read_this_run, needed,
         )
-        counted_suspects = False
-        marker = read_volume_marker(inserted) if inserted is not None else None
-        index = marker.volume_index if marker and marker.archive_id == catalog.archive_id else None
-        if inserted is not None and inserted_manifests is not None:
-            failures += _note_suspect_manifests(
-                inserted_manifests, marker, index, target_session,
-            )
-            counted_suspects = True
-        if not needed:
-            count, errors, stale, absent = _finish_without_needed(
-                dest, crypto, pending, state, spool, temporary, force,
-                dest_digests, stale, absent,
-            )
+        marker, index = _current_restore_disc(inserted, catalog)
+        suspect_failures, counted_suspects = _note_current_suspects(
+            inserted, inserted_manifests, marker, index, target_session,
+        )
+        failures += suspect_failures
+        finished = _complete_when_blobs_ready(
+            needed, catalog, marker or start_marker, missing, checked_manifests,
+            dest, crypto, pending, state, spool, temporary, force, dest_digests,
+            stale, absent,
+        )
+        if finished is not None:
+            count, errors, stale, absent = finished
             restored += count
             failures += errors
             return "finished"
-        if index not in needed or index in read_this_run:
+        if _disc_already_served(index, needed, read_this_run):
             outcome, inserted, marker, index = acquire_next(needed, pending)
             if outcome == "paused":
                 return "paused"
@@ -1564,4 +1841,7 @@ def restore_archive(dest: Path, backend: BurnBackend, crypto: CryptoBackend,
                 continue
             paused = outcome == "paused"
             break
+    _report_unchecked_volumes(
+        catalog, start_marker, checked_manifests, missing,
+    )
     return RestoreResult(restored, failures, stale=stale, missing=absent, paused=paused)

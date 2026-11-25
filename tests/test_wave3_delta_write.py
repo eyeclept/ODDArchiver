@@ -96,6 +96,49 @@ def test_three_consecutive_deltas_restore_and_cache_full_contents(archive, tmp_p
     _restore_matches(iso, tmp_path / "restored", path.read_bytes())
 
 
+def test_two_changed_files_same_content_share_one_sidecar(archive, tmp_path):
+    """
+    Input: two files that change to the same new bytes
+    Output: both encode as deltas; cache holds that content
+    Details: Duplicate content must not share one scratch sidecar path.
+    """
+    source, iso, cache, path = archive
+    other = source / "other.bin"
+    other_data = bytearray(b"A" * 34000)
+    other_data[-1] = ord("Z")
+    other.write_bytes(other_data)
+    assert dispatch(_args("sync", source, iso)) == 0
+    shared = bytearray(b"A" * 34000)
+    shared[17] = ord("C")
+    path.write_bytes(shared)
+    other.write_bytes(shared)
+    assert dispatch(_args("sync", source, iso)) == 0
+    backend = ISOBackend(iso, disc_size=DISC_BYTES)
+    session_n = backend.mediainfo().session_count - 1
+    manifest = read_manifest(
+        backend._sessions_root / f"session_{session_n:03d}" / "manifest.json"
+    )
+    by_path = {
+        e.path: e for e in manifest.entries
+        if e.path in ("data.bin", "other.bin")
+    }
+    assert by_path["data.bin"].type == "delta"
+    assert by_path["other.bin"].type == "delta"
+    assert by_path["data.bin"].result_checksum == by_path["other.bin"].result_checksum
+    assert 0 < by_path["data.bin"].delta_size_bytes < 1000
+    assert 0 < by_path["other.bin"].delta_size_bytes < 1000
+    assert cache.get("data.bin", session_n) == bytes(shared)
+    assert cache.get("other.bin", session_n) == bytes(shared)
+    sidecar = (
+        tmp_path / "xdg_runtime" / "oddarchiver"
+        / f"oddarchiver_staging_{session_n:03d}.cache_full"
+    )
+    if sidecar.is_dir():
+        files = list(sidecar.iterdir())
+        assert len(files) == 1
+        assert files[0].name == by_path["data.bin"].result_checksum
+
+
 def _assert_prior_mismatch_warnings(records) -> None:
     """
     Input: captured log records

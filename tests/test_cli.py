@@ -267,3 +267,46 @@ def test_slow_flag_on_init_and_sync_only():
     with pytest.raises(SystemExit):
         parser.parse_args(["restore", "/dest", "--slow"])
 
+
+def test_fill_and_no_fill_flags_parse():
+    """
+    Input:  None
+    Output: None
+    Details:
+        sync accepts --fill and --no-fill. The two flags cannot combine.
+    """
+    from oddarchiver.cli import _fill_enabled
+
+    parser = build_parser()
+    filled = parser.parse_args(["sync", "/src", "--fill"])
+    assert filled.fill is True  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+    assert filled.no_fill is False  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+    assert _fill_enabled(filled) is True  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+    skipped = parser.parse_args(["sync", "/src", "--no-fill"])
+    assert skipped.no_fill is True  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+    assert _fill_enabled(skipped) is False  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+    with pytest.raises(SystemExit):
+        parser.parse_args(["sync", "/src", "--fill", "--no-fill"])
+
+
+def test_fill_default_off_even_with_tty(monkeypatch):
+    """
+    Input:  monkeypatch
+    Output: None
+    Details:
+        Fill is off without --fill, even when stdin is a TTY.
+        Reason: owner decision 1. Fill is no longer the TTY default.
+    """
+    from oddarchiver.cli import _fill_enabled
+
+    parser = build_parser()
+    args = parser.parse_args(["sync", "/src"])
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    assert _fill_enabled(args) is False  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    assert _fill_enabled(args) is False  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+    filled = parser.parse_args(["sync", "/src", "--fill"])
+    assert _fill_enabled(filled) is True  # scbc ignore[is-true-false-strict] asserts an exact bool, not truthiness
+
+
+

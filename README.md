@@ -1,6 +1,7 @@
 # ODDArchiver
 
 Incremental backups use delta compression. They go to write-once optical media (DVD, BD-R, M-DISC) or ISO files.
+Each blob is also compressed with LZMA unless it does not shrink; see [docs/compression.md](docs/compression.md).
 
 ## What it does
 
@@ -79,8 +80,8 @@ oddarchiver init <source> [--device DEV] [--label LABEL]
                           [--yubikey] [--yubikey-slot {1,2}]
                           [--test-iso PATH] [--disc-size SIZE] [--prefill SIZE]
                           [--mirror DEV_OR_PATH] [--dry-run] [--slow] [--skip-large]
+                          [--split-large]
 ```
-
 `--encrypt` and `--key` apply only to `init`.
 `init` stores the chosen mode in the disc manifest.
 Every later command uses this mode automatically.
@@ -95,17 +96,65 @@ Running `init` on a disc that already has session 0 exits 0 with a warning. ODDA
 oddarchiver sync <source> [--device DEV] [--test-iso PATH]
                           [--disc-size SIZE] [--prefill SIZE]
                           [--no-cache] [--mirror DEV_OR_PATH] [--dry-run] [--slow]
-                          [--skip-large]
+                          [--skip-large] [--split-large] [--fill | --no-fill]
 ```
 
 Exits 0 with no output when nothing changed.
-`--no-cache` reads every prior blob from the disc, not from the local cache (also with `--dry-run`). Use it when the local cache is missing, damaged, or from another host. Blobs read from the disc do not enter the cache. After a verified burn, the cache still records the new session. If the prior version of a changed file is a delta on the disc, `sync` stores a full copy. The disc holds only the delta for that version.
+
+`--no-cache` reads every prior blob from the disc, not from the local cache.
+This also applies with `--dry-run`.
+Use it when the local cache does not exist, is damaged, or came from another host.
+Blobs read from the disc do not enter the cache.
+After a verified burn, the cache still records the new session.
+If the prior version of a changed file is a delta on the disc, `sync` stores a full copy.
+The disc holds only the delta for that version.
+
 `--slow` on `init` and `sync` checksums every blob after the burn.
+
 `--skip-large` on `init` and `sync` leaves out and lists two kinds of new or changed file.
-The first kind does not fit on one disc. The second kind is larger than the local staging space.
-Without the flag, a file larger than one disc splits across volumes. A file larger than the staging space stops the run with an error.
-A skipped changed file keeps its previous version on the archive, and the next run tries it again.
+The first kind does not fit on one disc.
+The second kind is larger than the local staging space.
+Without the flag, a file larger than one disc splits across volumes.
+A file larger than the staging space stops the run with an error.
+A skipped changed file keeps its previous version on the archive.
+The next run tries it again.
+
+`--split-large` on `init` and `sync` restores greedy splitting.
+That fills leftover space on the current disc.
+Without `--split-large`, a file that fits one disc stays whole.
+A file still splits when it is larger than one disc.
+It also splits when it is larger than the 3 GiB blob cap (`BLOB_SIZE_CAP`).
 The default post-burn verify is `fast` and does not read blob bytes.
+
+`--fill` on `sync` appends the new session to the oldest appendable volume that has room.
+Fill is off by default.
+Only `--fill` turns it on.
+`--no-fill` stays accepted and appends only to the inserted disc.
+Do not pass `--fill` and `--no-fill` in the same command.
+
+If the inserted catalog disc has room for the planned files, `sync --fill` burns them there.
+It does not ask for other volumes for those files.
+
+If the plan needs an older volume, it writes an intent stub on the newest disc first.
+A stub session uses about 15.9 MiB (8144 blocks) on a real DVD-R.
+Then it asks for the target disc and burns the fill session.
+Then it writes an outcome stub on the newest disc.
+It then offers an outcome stub on every other known appendable volume that has room, oldest first.
+
+Press Enter after you insert the disc.
+Type `s` to skip that disc for this `sync`.
+Type `q` to abort.
+If you type `s` or `q` after the tray opened, close the tray.
+Then press Enter.
+Data already burned stays on disc.
+A skip applies to this `sync` only.
+
+`--test-iso` does not prompt.
+It measures each sibling `archive.volN.iso` that exists.
+It skips a missing sibling.
+
+A DVD-R whose next session would start or end past 4 GiB is full for appends.
+See [docs/media.md](docs/media.md).
 
 ### `restore`
 
@@ -129,6 +178,7 @@ ODDArchiver logs the error and continues to process the remaining files.
 oddarchiver history [--device DEV] [--test-iso PATH]
 oddarchiver verify  [--device DEV] [--test-iso PATH] [--level fast|checksum|full]
 oddarchiver status  [--device DEV] [--test-iso PATH]
+                    [--stats | --stats-exact] [--json]
 ```
 
 `verify` levels:
@@ -141,19 +191,35 @@ oddarchiver status  [--device DEV] [--test-iso PATH]
 
 A failed session does not invalidate the others. `verify` reports pass or fail for each session and exits 1 if any session failed.
 
+`--stats` prints a usage table after the normal status lines. It estimates blob sizes from manifests and from control files already in memory. It does not read blob files.
+`--stats-exact` reads each on-disc file size once.
+`--stats` and `--stats-exact` cannot be used together.
+`--json` prints only the stats JSON object. It requires `--stats` or `--stats-exact`. Without a stats flag, `--json` exits with status 2.
+
 ### Exit codes
 
-`0` means success or a no-change run. `1` means an error: burn failure, verify failure, a full disc, or bad arguments. `3` means you paused a multi-disc `restore --all-disks` with `q` or end of input. Run the same command again to continue.
+`0` means success or a no-change run.
+`1` means an error: burn failure, verify failure, a full disc, or bad arguments.
+`2` means `--json` without `--stats` or `--stats-exact`.
+`3` means you paused a multi-disc `restore --all-disks` with `q` or end of input.
+Run the same command again to continue.
 
 A `restore --all-disks` with missing discs exits 0. It reports the affected files as `stale` or `missing`. A corrupt blob on an available disc counts as a failure and gives exit 1.
 
 ## Dry run and test ISO mode
 
-`--dry-run` (on `init` and `sync`) runs the full pipeline except the actual burn. It scans, diffs, computes deltas, checks disc space, and prints a report. It does not touch the disc, the ISO, or the cache. Combine `--dry-run` with `--test-iso` to preview a sync against an ISO without changing it.
+`--dry-run` on `init` and `sync` scans the source and diffs it.
+It then runs the same packing plan as a real burn.
+It prints one line per planned volume.
+It does not write the disc, the ISO, the cache, or a staging directory.
+Combine `--dry-run` with `--test-iso` to preview a sync against an ISO without changing it.
+With `--fill`, the plan covers the inserted disc and new volumes only.
+Fill of older discs is not in this dry run.
 
 `--test-iso PATH` builds a real Universal Disk Format (UDF) ISO on the local filesystem with `genisoimage`, instead of writing to a drive. It supports the full command set, including `restore` and `verify`. It is the basis for the automated test suite.
 
 `--disc-size` sets the simulated capacity (default `25gb`). Pass a raw byte count, a unit-suffixed size (`25gb`, `93GiB`), or a named media preset. Preset names match case-insensitively.
+
 
 | Preset | Nominal | Usable bytes | Write engine |
 |---|---|---|---|
@@ -278,9 +344,23 @@ Or split a very large source directory into smaller batches, and sync one batch 
 
 **Cache looks wrong after an interrupted burn**. The cache stays at the last confirmed state. Nothing is lost. To force a rebuild from disc reads, delete the cache directory (see SETUP.md).
 
+**A burn killed mid-write**. The drive can stay locked until you unplug its power and USB cable.
+Wait 10 seconds, then reconnect it.
+That write also costs a DVD-R.
+`init` then refuses the disc.
+The disc holds a burned session with no readable archive.
+Use a new blank disc.
+
+**`The drive did not answer ... within 180 s`**. `status` and `restore` stop after 180 seconds.
+They stop when the drive does not answer a listing or mediainfo command.
+Unplug power and USB.
+Wait 10 seconds.
+Reconnect, then retry.
+
 ## More
 
 - [SETUP.md](SETUP.md): install, system dependencies, configuration file, environment variables
 - [docs/media.md](docs/media.md): media presets, write engines, M-DISC, hardware vs ISO tests
+- [docs/stats.md](docs/stats.md): status --stats categories, estimate versus exact, JSON output
 - [docs/verify.md](docs/verify.md): verify levels and post-burn `--slow`
 - [STATE_OF_THE_PROGRAM.md](STATE_OF_THE_PROGRAM.md): what is complete, what is left, known issues

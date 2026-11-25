@@ -34,7 +34,7 @@ from oddarchiver.volume import (
     build_volume_baseline, read_volume_baseline, read_volume_marker,
     write_volume_baseline,
 )
-from tests.helpers import _make_entry, _make_manifest
+from tests.helpers import _make_entry, _make_manifest, fill
 
 # Globals
 SMALL_DISC = 10 * 2**20
@@ -80,6 +80,8 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "path": None,
         "rescue_key": None,
         "skip_volumes": None,
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -146,8 +148,8 @@ def _two_volume_archive(
     _isolate(tmp_path, monkeypatch)
     source = tmp_path / "src"
     source.mkdir()
-    (source / "a.bin").write_bytes(a_bytes if a_bytes is not None else b"A" * _FILE_BYTES)
-    (source / "b.bin").write_bytes(b_bytes if b_bytes is not None else b"B" * _FILE_BYTES)
+    (source / "a.bin").write_bytes(a_bytes if a_bytes is not None else fill(b"A", _FILE_BYTES))
+    (source / "b.bin").write_bytes(b_bytes if b_bytes is not None else fill(b"B", _FILE_BYTES))
     keyfile = None
     kwargs = {
         "command": "init",
@@ -402,7 +404,7 @@ def _assert_volume2_browse_restore(
         label="VBASE2",
     ))
     assert rc == 0
-    assert (dest / "b.bin").read_bytes() == b"B" * _FILE_BYTES
+    assert (dest / "b.bin").read_bytes() == fill(b"B", _FILE_BYTES)
 
 
 def test_encrypted_volume2_only_ls_browse_history_status(
@@ -562,9 +564,9 @@ def test_three_volume_baseline_chains_through_intermediate(
     _isolate(tmp_path, monkeypatch)
     source = tmp_path / "src"
     source.mkdir()
-    a = b"A" * _FILE_BYTES
-    b = b"B" * _FILE_BYTES
-    c = b"C" * _FILE_BYTES
+    a = fill(b"A", _FILE_BYTES)
+    b = fill(b"B", _FILE_BYTES)
+    c = fill(b"C", _FILE_BYTES)
     (source / "a.bin").write_bytes(a)
     (source / "b.bin").write_bytes(b)
     (source / "c.bin").write_bytes(c)
@@ -792,7 +794,9 @@ def test_new_chunks_materialize_delta_and_dedup_refs(tmp_path):
     Output: None
     Details:
         Packing a delta and a dedup reference into new volumes writes full
-        blobs locally after a second packing pass.
+        blobs locally after a second packing pass. Nothing fits the loaded
+        medium, so its empty session is skipped and each remaining bin is
+        a new volume: two bins, not an empty bin plus two.
     """
     old = (_REPEAT * 2000)[:_FILE_BYTES]
     changed = old.replace(b"lazy", b"LAZY", 1)
@@ -821,12 +825,12 @@ def test_new_chunks_materialize_delta_and_dedup_refs(tmp_path):
         backend=backend, cache=cache, crypto=NullCrypto(),
         manifests=[original], _staging_root=tmp_path / "staging-root",
     )
-    assert len(chunks) >= 3
+    assert len(chunks) == 2
     from oddarchiver.manifest import read_manifest
     for staging, session, new_disc in chunks:
+        assert new_disc
         manifest = read_manifest(staging / f"session_{session:03d}" / "manifest.json")
         for entry in manifest.entries:
-            assert new_disc
             assert entry.type == "full"
             assert entry.file.startswith(f"session_{session:03d}/")
             assert (staging / entry.file).exists()
@@ -978,7 +982,7 @@ def test_three_disc_writes_history_and_disc_local_blobs(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     source = tmp_path / "source"
     source.mkdir()
-    first = b"A" * 40_000
+    first = fill(b"A", 40_000)
     (source / "a.bin").write_bytes(first)
     (source / "removed.txt").write_bytes(b"delete me")
     iso = tmp_path / "archive.iso"
@@ -987,13 +991,13 @@ def test_three_disc_writes_history_and_disc_local_blobs(tmp_path, monkeypatch):
         disc_size=str(_DISC_THAT_SPLITS), label="THREEDISC",
     )
     assert dispatch(args) == 0
-    (source / "a.bin").write_bytes(b"B" * len(first))
+    (source / "a.bin").write_bytes(fill(b"B", len(first)))
     (source / "removed.txt").unlink()
     args.command = "sync"
     assert dispatch(args) == 0
     vol1 = tmp_path / "archive.vol1.iso"
     assert vol1.exists()
-    (source / "a.bin").write_bytes(b"C" * len(first))
+    (source / "a.bin").write_bytes(fill(b"C", len(first)))
     (source / "copy.bin").write_bytes(first)
     args.test_iso = str(vol1)
     assert dispatch(args) == 0
@@ -1044,8 +1048,9 @@ def _assert_catalog_deleted_and_past(args: argparse.Namespace, capsys) -> None:
     out = capsys.readouterr().out
     removed = next(line for line in out.splitlines() if "removed.txt" in line)
     assert "DELETED at session" in removed
-    # Sync records deletions in its first chunk: session 001 on disc 0.
-    assert "disc 0" in removed
+    # Sync skips the full current medium, so its first burned chunk is
+    # session 001 on disc 1 and the tombstone lives there.
+    assert "disc 1" in removed
 
     _assert_catalog_session_zero(args, capsys)
 
@@ -1072,7 +1077,7 @@ def test_three_disc_catalog_lists_history_and_tombstones(tmp_path, monkeypatch, 
     _isolate(tmp_path, monkeypatch)
     source = tmp_path / "source"
     source.mkdir()
-    (source / "a.bin").write_bytes(b"A" * 40_000)
+    (source / "a.bin").write_bytes(fill(b"A", 40_000))
     (source / "removed.txt").write_bytes(b"remove")
     (source / "old.bin").write_bytes(b"old")
     iso = tmp_path / "archive.iso"
@@ -1081,14 +1086,14 @@ def test_three_disc_catalog_lists_history_and_tombstones(tmp_path, monkeypatch, 
         disc_size=str(_DISC_THAT_SPLITS), label="THREEDISC",
     )
     assert dispatch(args) == 0
-    (source / "a.bin").write_bytes(b"B" * 40_000)
+    (source / "a.bin").write_bytes(fill(b"B", 40_000))
     (source / "removed.txt").unlink()
     args.command = "sync"
     assert dispatch(args) == 0
     vol1 = tmp_path / "archive.vol1.iso"
     assert vol1.exists()
-    (source / "a.bin").write_bytes(b"C" * 40_000)
-    (source / "copy.bin").write_bytes(b"A" * 40_000)
+    (source / "a.bin").write_bytes(fill(b"C", 40_000))
+    (source / "copy.bin").write_bytes(fill(b"A", 40_000))
     args.test_iso = str(vol1)
     assert dispatch(args) == 0
     vol2 = tmp_path / "archive.vol2.iso"

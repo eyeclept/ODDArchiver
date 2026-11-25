@@ -489,3 +489,63 @@ def test_read_manifest_wrong_key_stays_suspect(tmp_path):
     loaded = read_manifest(tmp_path / "manifest.enc", KeyfileCrypto(str(wrong)))
     assert loaded.suspect
     assert loaded.session == -1
+
+
+def _control_raw_for_sessions(tmp_path: Path, sessions: list[int]) -> dict[str, bytes]:
+    """Input: temp dir and session numbers. Output: control-file bytes by path."""
+    raw: dict[str, bytes] = {}
+    for session in sessions:
+        write_manifest(tmp_path, _make_manifest(session=session))
+        raw[f"session_{session:03d}/manifest.json"] = (
+            tmp_path / "manifest.json"
+        ).read_bytes()
+    return raw
+
+
+
+def test_gapped_iso_raises_unless_session_lives_elsewhere(tmp_path):
+    """
+    Input:  tmp_path with session_000 and session_002
+    Output: raise without catalog membership; load both when session 1 is elsewhere
+    """
+    from oddarchiver.manifest import load_session_manifests
+
+    raw = _control_raw_for_sessions(tmp_path, [0, 2])
+    backend = MagicMock()
+    backend.list_session_numbers.return_value = [0, 2]
+    with pytest.raises(ValueError, match="Session 1 is missing"):
+        load_session_manifests(backend, raw=raw)
+    loaded = load_session_manifests(backend, raw=raw, elsewhere_sessions={1})
+    assert [item.session for item in loaded] == [0, 2]
+
+
+def test_gapped_iso_loads_when_marker_ranges_explain_hole(tmp_path):
+    """
+    Input: session_000 and session_002 plus volume.json session_ranges
+    Output: both manifests load without an elsewhere set
+    """
+    from oddarchiver.manifest import load_session_manifests
+    from oddarchiver.volume import VolumeMarker
+
+    raw = _control_raw_for_sessions(tmp_path, [0, 2])
+    backend = MagicMock()
+    backend.list_session_numbers.return_value = [0, 2]
+    marker = VolumeMarker("arch", 0, 0, "now", "", session_ranges=[[0, 0], [2, 2]])
+    loaded = load_session_manifests(backend, raw=raw, marker=marker)
+    assert [item.session for item in loaded] == [0, 2]
+
+
+
+def test_contiguous_sessions_still_load(tmp_path):
+    """
+    Input:  tmp_path with sessions 0 and 1
+    Output: both manifests load in order
+    """
+    from oddarchiver.manifest import load_session_manifests
+
+    raw = _control_raw_for_sessions(tmp_path, [0, 1])
+    backend = MagicMock()
+    backend.list_session_numbers.return_value = [0, 1]
+    loaded = load_session_manifests(backend, raw=raw)
+    assert [item.session for item in loaded] == [0, 1]
+

@@ -18,6 +18,14 @@ Preset names match case-insensitively.
 | `bdxl` | 100 GB | 99,857,989,632 | growisofs plus genisoimage |
 
 All DVD and BD writes use growisofs plus genisoimage.
+
+ISO9660 cannot store a file of 4 GiB or more.
+The reader uses the ISO9660 size.
+A larger blob then restores as a truncated file.
+Every archive blob stays below 4 GiB.
+A larger source file uses several volume chunks.
+One disc can hold several of those chunks.
+
 `dvd+rw-mediainfo` reports capacity and session information. `xorriso -indev` reads data. It does not report capacity or session counts here.
 Commit `f403a6d` reverted capacity reporting from xorriso because `xorriso -toc` misreads POW-formatted BD-R as blank and unsuitable.
 
@@ -81,7 +89,7 @@ Real-hardware status on a USB Buffalo drive:
 | Medium | Status |
 |---|---|
 | CD-R | Burned successfully, twice. Append impossible, so the program refuses CD |
-| DVD, all types | No hardware burn. `ISOBackend` simulation only |
+| DVD-R SL | Burned, appended, split across up to 4 discs, verified, and restored on real hardware. Case log: `Assist/REAL_DISC_TESTS.md` |
 | BD-R SL, M-DISC BD-R SL | Burned, appended, checksum-verified, and disconnect-tested on real hardware, all on the same disc |
 | BD-R DL and BDXL | No hardware burn. `ISOBackend` simulation only. Not a code gap: those capacity blanks are not on hand |
 | M-DISC DVD | No hardware burn. Single-layer M-DISC on hand is BD-R |
@@ -89,3 +97,40 @@ Real-hardware status on a USB Buffalo drive:
 Hardware tests confirm batched reads. A CD-R written by ODDArchiver
 accepted 3000 `-extract` pairs in one `xorriso` argv. Three 8 MiB blobs
 pulled in a single batched call all matched their recorded checksums.
+
+## growisofs 4 GiB append boundary
+
+`DiscBackend.append` runs `growisofs -M`.
+growisofs refuses a session that would start or end past 4 GiB (`4 * 2**30` bytes).
+The program measures that limit from the last `Next Writable Address` in `dvd+rw-mediainfo`.
+That address is where growisofs places the next session.
+
+On DVD-R, `READ CAPACITY` is the recorded area, not the whole medium.
+A disc whose next session would start or end past 4 GiB is full for appends.
+Leftover MMC space stays unused.
+`sync` then needs a blank disc for a new volume.
+
+Blank discs use `growisofs -Z` and keep their full capacity.
+The 4 GiB cap does not apply to them.
+This is not the archive blob cap.
+`BLOB_SIZE_CAP` is 3 GiB so a stored file stays under the ISO9660 file-size wrap.
+A disc can already hold many blobs whose sum exceeds 4 GiB.
+`--test-iso` rebuilds the image and does not hit this merge limit.
+
+## Interrupted burn
+
+A burn killed mid-write can lock the drive.
+The drive then answers writes with `LONG WRITE IN PROGRESS`.
+Unplug the drive power and USB cable.
+Wait 10 seconds.
+Reconnect it.
+The disc is still spent.
+
+`init` refuses a disc that holds a burned session with no readable archive.
+Use a new blank disc.
+
+`status` and `restore` stop after 180 seconds when the drive does not answer.
+That timeout covers listing and mediainfo commands.
+Extraction has no timeout.
+A multi-GB read can take minutes.
+

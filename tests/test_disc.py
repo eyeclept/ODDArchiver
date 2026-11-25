@@ -28,11 +28,13 @@ from oddarchiver.disc import (
     CD_DISC_BYTES,
     DVD_DL_DISC_BYTES,
     DVD_SL_DISC_BYTES,
+    GROWISOFS_MERGE_LIMIT_BYTES,
     BurnInterrupted,
     DiscBackend,
     DiscInfo,
     ISOBackend,
     _parse_mediainfo,
+    _parse_report_lba,
     _is_disconnect,
     parse_disc_size,
 )
@@ -61,6 +63,20 @@ _MEDIAINFO_BLANK_BD = (
 _MEDIAINFO_CD_REFUSAL_STDERR = ":-( non-DVD media mounted, exiting..."
 
 _FAKE_SR = "/dev/oddarchiver-test-no-drive"
+
+_REPORT_LBA_FIXTURE = """\
+Report layout: xt , Startlba ,   Blocks , Filesize , ISO image path
+File data lba:  0 ,    29561 ,        1 ,        7 , '/.lock'
+File data lba:  0 ,    29560 ,        1 ,     1109 , '/TRANS.TBL'
+File data lba:  0 ,      571 ,        1 ,      883 , '/session_000/TRANS.TBL'
+File data lba:  0 ,      512 ,        1 ,      339 , '/session_000/enc_mode.json'
+File data lba:  0 ,      513 ,       58 ,   117452 , '/session_000/manifest.enc'
+File data lba:  0 ,    28692 ,        3 ,     4724 , '/session_001/manifest.enc'
+File data lba:  0 ,      510 ,        1 ,      195 , '/volume.json'
+File data lba:  0 ,      100 ,        2 ,     5000 , '/big.bin'
+File data lba:  1 ,      200 ,        1 ,     5000 , '/big.bin'
+File data lba:  0 ,        1 ,        1 ,        4 , '/dir/it'"'"'s.txt'
+"""
 
 
 
@@ -311,6 +327,39 @@ def test_read_path_returns_file_bytes(tmp_path):
     assert data == b"hello world"
 
 
+def test_iso_list_file_sizes_after_init(tmp_path):
+    """
+    Input:  tmp_path
+    Output: None
+    Details:
+        ISOBackend.list_file_sizes after init returns session control
+        files and blobs with sizes equal to the files' byte lengths.
+        Publish temp items and symbolic links are omitted.
+    """
+    iso = tmp_path / "test.iso"
+    backend = ISOBackend(iso, disc_size=SMALL_DISC)
+    staging = _make_staging(tmp_path)
+    manifest = b"enc-bytes"
+    (staging / "session_000" / "manifest.enc").write_bytes(manifest)
+    backend.init(staging, label="TEST")
+    blob_path = f"session_000/full/{_HELLO_BLOB}"
+    sizes = backend.list_file_sizes()
+    assert sizes[blob_path] == len(b"hello world")
+    assert sizes["session_000/manifest.enc"] == len(manifest)
+    stale = backend._sessions_root / ".session_001.partial-k1ll3d_x"
+    (stale / "full").mkdir(parents=True)
+    (stale / "full" / "junk").write_bytes(b"nope")
+    (backend._sessions_root / "link.dat").symlink_to(
+        backend._sessions_root / blob_path,
+    )
+    sizes = backend.list_file_sizes()
+    assert blob_path in sizes
+    assert "link.dat" not in sizes
+    assert all(".partial-" not in path for path in sizes)
+    for rel, size in sizes.items():
+        assert (backend._sessions_root / rel).stat().st_size == size
+
+
 def test_read_path_missing_raises(tmp_path):
     """
     Input:  tmp_path
@@ -463,6 +512,29 @@ def test_parse_mediainfo_parses_fields():
     assert info.label == ""
 
 
+def test_parse_report_lba_fixture():
+    """
+    Input:  None
+    Output: None
+    Details:
+        _parse_report_lba maps ISO paths without a leading slash to the
+        Filesize column. A multi-extent file is counted once. An
+        apostrophe in a name is decoded from xorriso shell quotes.
+    """
+    sizes = _parse_report_lba(_REPORT_LBA_FIXTURE)
+    assert sizes[".lock"] == 7
+    assert sizes["TRANS.TBL"] == 1109
+    assert sizes["session_000/TRANS.TBL"] == 883
+    assert sizes["session_000/enc_mode.json"] == 339
+    assert sizes["session_000/manifest.enc"] == 117452
+    assert sizes["session_001/manifest.enc"] == 4724
+    assert sizes["volume.json"] == 195
+    assert sizes["big.bin"] == 5000
+    assert sizes["dir/it's.txt"] == 4
+    assert all(not path.startswith("/") for path in sizes)
+    assert len(sizes) == 9
+
+
 def _pvd_bytes(label: str = "KILLTEST") -> bytes:
     """
     Input:  label - volume identifier
@@ -607,6 +679,59 @@ def test_read_path_extracts_via_xorriso(monkeypatch):
     assert result == blob
 
 
+def test_disc_list_file_sizes_uses_report_lba(monkeypatch):
+    """
+    Input:  monkeypatch
+    Output: None
+    Details:
+        DiscBackend.list_file_sizes runs xorriso report_lba and parses
+        the captured layout lines.
+    """
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_REPORT_LBA_FIXTURE.encode(), stderr=b"",
+        )
+
+    monkeypatch.setattr("oddarchiver.disc.subprocess.run", fake_run)
+    sizes = DiscBackend("/dev/sr0").list_file_sizes()
+    assert calls == [[
+        "xorriso", "-indev", "/dev/sr0",
+        "-find", "/", "-type", "f", "-exec", "report_lba",
+    ]]
+    assert sizes[".lock"] == 7
+    assert sizes["dir/it's.txt"] == 4
+
+
+def test_disc_list_file_sizes_retries_busy_then_raises(monkeypatch):
+    """
+    Input:  monkeypatch
+    Output: None
+    Details:
+        A failed listing retries once. A busy drive is unmounted. Two
+        failures raise RuntimeError that names the device.
+    """
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "udisksctl":
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout=b"", stderr=b"busy device\n",
+        )
+
+    monkeypatch.setattr("oddarchiver.disc.subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match=r"/dev/sr0") as exc:
+        DiscBackend("/dev/sr0").list_file_sizes()
+    assert "busy device" in str(exc.value)
+    xorriso_calls = [cmd for cmd in calls if cmd[0] == "xorriso"]
+    assert len(xorriso_calls) == 2
+    assert any(cmd[0] == "udisksctl" and cmd[1] == "unmount" for cmd in calls)
+
+
 def test_read_path_retries_on_drive_not_ready(monkeypatch):
     """
     Input:  monkeypatch
@@ -735,6 +860,99 @@ def test_read_path_raises_file_not_found_for_missing_path(monkeypatch):
 
     with pytest.raises(FileNotFoundError):
         backend.read_path("session_999/manifest.enc")
+
+
+
+_SG_ERR_DID_ERROR = (
+    "libburn : FAILURE : SCSI command 28h yielded host problem: "
+    "0x7 SG_ERR_DID_ERROR (Internal error detected in the host adapter)"
+)
+
+
+def test_extract_path_disconnect_raises_and_drops_partial(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        A USB unplug mid-restore prints SG_ERR_DID_ERROR. extract_path_to_file
+        must raise a resume error after at most one retry and drop dest.
+    """
+    backend = DiscBackend("/dev/sr0")
+    dest = tmp_path / "out.bin"
+    blob_path = f"session_000/full/{'a' * 64}"
+    attempts = []
+
+    def fake_run(cmd, **kwargs):
+        attempts.append(cmd)
+        dest.write_bytes(b"partial")
+        return _xorriso_result(1, stderr=_SG_ERR_DID_ERROR)
+
+    monkeypatch.setattr("oddarchiver.disc.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "oddarchiver.disc.DiscBackend.list_file_extents",
+        lambda self: {blob_path: (0, 1000)},
+    )
+    monkeypatch.setattr("oddarchiver.disc.time.sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="disconnected during the read"):
+        backend.extract_path_to_file(blob_path, dest, retries=6, retry_delay=5.0)
+
+    assert not dest.exists()
+    xorriso_calls = [cmd for cmd in attempts if cmd[0] == "xorriso"]
+    assert len(xorriso_calls) <= 2
+
+
+def test_read_paths_disconnect_raises_after_at_most_one_retry(monkeypatch):
+    """
+    Input:  monkeypatch
+    Output: None
+    Details:
+        read_paths must raise the same resume error and not spend the
+        full retry count on SG_ERR_DID_ERROR.
+    """
+    backend = DiscBackend("/dev/sr0")
+    blob_path = f"session_000/full/{'a' * 64}"
+    attempts = []
+
+    def fake_run(cmd, **kwargs):
+        attempts.append(cmd)
+        return _xorriso_result(1, stderr=_SG_ERR_DID_ERROR)
+
+    monkeypatch.setattr("oddarchiver.disc.subprocess.run", fake_run)
+    monkeypatch.setattr("oddarchiver.disc.time.sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="disconnected during the read"):
+        backend.read_paths([blob_path], retries=6, retry_delay=5.0)
+
+    assert len(attempts) <= 2
+
+
+def test_extract_paths_disconnect_raises_after_at_most_one_retry(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        _xorriso_extract_all must raise the resume error after at most
+        one retry when xorriso prints SG_ERR_DID_ERROR.
+    """
+    backend = DiscBackend("/dev/sr0")
+    blob_path = f"session_000/full/{'a' * 64}"
+    dest_root = tmp_path / "out"
+    attempts = []
+
+    def fake_run(cmd, **kwargs):
+        attempts.append(cmd)
+        return _xorriso_result(1, stderr=_SG_ERR_DID_ERROR)
+
+    monkeypatch.setattr("oddarchiver.disc.subprocess.run", fake_run)
+    monkeypatch.setattr("oddarchiver.disc.time.sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="disconnected during the read"):
+        backend.extract_paths([blob_path], dest_root, retries=6, retry_delay=5.0)
+
+    xorriso_calls = [cmd for cmd in attempts if cmd[0] == "xorriso"]
+    assert len(xorriso_calls) <= 2
+
 
 
 class _FakePopen:
@@ -1048,12 +1266,19 @@ def _script_append_retry(monkeypatch, responses, *, reauth=True, node_ready=True
 
     monkeypatch.setattr("oddarchiver.disc._run_growisofs", fake_run)
     monkeypatch.setattr(DiscBackend, "_guard", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(
+        DiscBackend, "mediainfo",
+        lambda self, retries=6, retry_delay=5.0: DiscInfo(
+            session_count=1, remaining_bytes=10**9, used_bytes=0, label="TEST",
+        ),
+    )
     monkeypatch.setattr(DiscBackend, "_attempt_usb_reauth", lambda self: reauth)
     monkeypatch.setattr(DiscBackend, "_wait_for_device_node", lambda self: node_ready)
     monkeypatch.setattr(
         DiscBackend, "_reverify_prior_sessions",
         lambda self, attempted: reverify_calls.append(attempted) or True,
     )
+
     return DiscBackend("/dev/oddarchiver-test-no-drive"), attempts, reverify_calls
 
 
@@ -1865,6 +2090,7 @@ def test_bd_profile_keeps_growisofs_argv(monkeypatch, tmp_path):
         "-udf", "-allow-limited-size", "-R", "-T",
         "-V", "TEST",
         "-use-the-force-luke=notray",
+        "-m", "\\.lock",
         str(staging),
     ]
 
@@ -1889,6 +2115,7 @@ def test_bd_append_keeps_growisofs_argv(monkeypatch, tmp_path):
         "-udf", "-allow-limited-size", "-R", "-T",
         "-V", "TEST",
         "-use-the-force-luke=notray",
+        "-m", "\\.lock",
         str(staging),
     ]
 
@@ -2066,3 +2293,417 @@ def test_disconnect_never_claims_prior_sessions_verified(monkeypatch, tmp_path):
 
     assert called == [], "must not read the medium when the drive is gone"
     assert "re-verified readable" not in str(exc.value)
+
+
+def test_append_refuses_merge_at_4_gib_used(monkeypatch, tmp_path):
+    """
+    Input:  fake used_bytes of 4 GiB
+    Output: append refuses -M and does not call growisofs
+    """
+    calls = []
+    monkeypatch.setattr(
+        "oddarchiver.disc._run_growisofs",
+        lambda cmd: calls.append(cmd) or (0, ["ok"]),
+    )
+    monkeypatch.setattr(DiscBackend, "_guard", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(
+        DiscBackend, "mediainfo",
+        lambda self, retries=6, retry_delay=5.0: DiscInfo(
+            session_count=1, remaining_bytes=2 * 2**30,
+            used_bytes=GROWISOFS_MERGE_LIMIT_BYTES, label="TEST",
+            appendable=False,
+        ),
+    )
+    backend = DiscBackend("/dev/oddarchiver-test-no-drive")
+    with pytest.raises(RuntimeError, match="not appendable"):
+        backend.append(tmp_path, "TEST", 1)
+    assert calls == []
+
+
+def test_too_large_writer_error_marks_volume_non_appendable(monkeypatch, tmp_path):
+    """
+    Input:  growisofs -M too-large merge error
+    Output: volume is marked non-appendable and -M is not retried
+    """
+    backend, attempts, _reverify = _script_append_retry(
+        monkeypatch,
+        [(1, ["Value too large for defined data type"])],
+    )
+    with pytest.raises(RuntimeError, match="not appendable"):
+        backend.append(tmp_path, "TEST", 1)
+    assert len(attempts) == 1
+    assert backend._merge_appendable is False
+
+
+def test_stale_pread64_still_uses_usb_retry(monkeypatch, tmp_path):
+    """
+    Input:  stale pread64 writer lines then success
+    Output: USB retry path still runs growisofs -M a second time
+    """
+    backend, attempts, reverify = _script_append_retry(
+        monkeypatch, [(1, _STALE_PVD_LINES), (0, ["Burn complete."])],
+    )
+    backend.append(tmp_path, "TEST", 1)
+    assert len(attempts) == 2
+    assert reverify == []
+
+
+
+def test_init_names_pending_long_write_after_killed_burn(monkeypatch, tmp_path):
+    """
+    Real-disc regression (T12): after SIGKILL mid-burn the drive answers
+    MODE SELECT with LONG WRITE IN PROGRESS and growisofs exits 139. init
+    must name the drive state and the power-cycle remedy, not the exit code.
+    """
+    captured = [
+        ":-[ MODE SELECT failed with SK=2h/LOGICAL UNIT NOT READY, "
+        "LONG WRITE IN PROGRESS]: Resource temporarily unavailable",
+    ]
+    monkeypatch.setattr("oddarchiver.disc._run_growisofs", lambda cmd: (139, captured))
+    monkeypatch.setattr(DiscBackend, "_raise_if_interrupted", lambda self, *a: None)
+    monkeypatch.setattr(DiscBackend, "_raise_if_disc_full", lambda self, *a, **k: None)
+    # The double-burn guard queries the real drive; this test must not.
+    monkeypatch.setattr(DiscBackend, "_guard", lambda self, *a, **k: None)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    with pytest.raises(RuntimeError) as excinfo:
+        DiscBackend("/dev/sr0").init(staging, label="T12", expected_session_count=0)
+    message = str(excinfo.value)
+    assert "LONG WRITE IN PROGRESS" in message
+    assert "Unplug" in message
+    assert "exit code 139" not in message
+
+
+def test_status_on_locked_drive_fails_fast_without_unbounded_reads(
+    monkeypatch, tmp_path, capsys,
+):
+    """
+    Real-disc regression (T12): after a killed burn, status hung for 15
+    minutes. Each bounded listing timed out, then a fallback handler moved
+    on to the next drive command, ending in an extraction with no timeout.
+    A drive that does not answer must stop the command with the remedy, and
+    no drive command may run without a timeout.
+    """
+    import subprocess as subprocess_mod
+
+    from oddarchiver.cli import build_parser, dispatch
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    unbounded = []
+
+    def hang(cmd, **kwargs):
+        if not kwargs.get("timeout"):
+            unbounded.append(cmd)
+            return subprocess_mod.CompletedProcess(cmd, 1, b"", b"stub")
+        raise subprocess_mod.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr("oddarchiver.disc.subprocess.run", hang)
+    args = build_parser().parse_args(["status", "--device", "/dev/sr0"])
+    assert dispatch(args) == 1
+    assert "did not answer" in capsys.readouterr().err
+    assert unbounded == []
+
+
+_REAL_T15_DVDR_MEDIAINFO = """READ DISC INFORMATION:
+ Disc status:           appendable
+ Number of Sessions:    2
+ State of Last Session: empty
+READ TRACK INFORMATION[#1]:
+ Track State:           complete incremental
+ Track Start Address:   0*2KB
+ Free Blocks:           0*2KB
+ Track Size:            2100064*2KB
+READ TRACK INFORMATION[#2]:
+ Track State:           invisible incremental
+ Track Start Address:   2147184*2KB
+ Next Writable Address: 2147184*2KB
+ Free Blocks:           150704*2KB
+ Track Size:            150704*2KB
+READ CAPACITY:          2100064*2048=4300931072
+"""
+
+
+def test_parse_mediainfo_dvdr_used_bytes_from_next_writable_address():
+    """
+    Real-disc regression (T15): on DVD-R, READ CAPACITY is the recorded
+    area, not the medium. "Capacity minus remaining" reported 3.99 GB used
+    for a disc whose next session starts at 4.40 GB, so the 4 GiB check
+    passed and growisofs then refused the append.
+    """
+    info = _parse_mediainfo(_REAL_T15_DVDR_MEDIAINFO)
+    assert info.used_bytes == 2147184 * 2048
+    assert info.appendable is False
+
+
+def test_append_budget_stops_at_4gib_boundary():
+    """A session may start below 4 GiB but must not end past it."""
+    from oddarchiver.disc import DiscInfo, GROWISOFS_MERGE_LIMIT_BYTES
+    from oddarchiver.session import _appendable_remaining
+
+    used = GROWISOFS_MERGE_LIMIT_BYTES - 100 * 2**20
+    info = DiscInfo(
+        session_count=1, remaining_bytes=600 * 2**20, used_bytes=used,
+        label="", appendable=True,
+    )
+    assert _appendable_remaining(info) == 100 * 2**20
+    blank = DiscInfo(
+        session_count=0, remaining_bytes=4_400_000_000, used_bytes=0,
+        label="", appendable=True,
+    )
+    assert _appendable_remaining(blank) == 4_400_000_000
+
+
+def test_append_names_4gb_boundary_refusal(monkeypatch, tmp_path):
+    """
+    Real-disc regression (T15): growisofs printed "next session would cross
+    4GB boundary, aborting" (exit 156) and sync showed only the exit code.
+    """
+    backend = DiscBackend("/dev/sr0")
+    lines = [":-( next session would cross 4GB boundary, aborting..."]
+    with pytest.raises(RuntimeError) as excinfo:
+        backend._raise_append_failure(156, lines, False, tmp_path, 1)
+    assert "4 GiB boundary" in str(excinfo.value)
+    assert backend._merge_appendable is False
+
+
+_CLOSE_SESSION_OUTPUT = [
+    "/dev/sr0: flushing cache",
+    "/dev/sr0: updating RMA",
+    "/dev/sr0: closing session",
+]
+
+
+def _plant_readable_disc(monkeypatch, sessions: list[int], volume_json: bytes | None):
+    """
+    Input: monkeypatch, session numbers, optional volume.json bytes
+    Output: list of path lists that confirm passed to read_paths
+    """
+    reads: list[list[str]] = []
+
+    def fake_list(self):
+        return list(sessions)
+
+    def fake_read(self, paths, **kwargs):
+        reads.append(list(paths))
+        found = {}
+        if volume_json is not None and "volume.json" in paths:
+            found["volume.json"] = volume_json
+        return found
+
+    monkeypatch.setattr(DiscBackend, "list_session_numbers", fake_list)
+    monkeypatch.setattr(DiscBackend, "read_paths", fake_read)
+    return reads
+
+
+
+def _stub_close_exit_growisofs(monkeypatch) -> None:
+    """Point growisofs at exit 123 after closing session."""
+    monkeypatch.setattr(
+        "oddarchiver.disc._run_growisofs",
+        lambda cmd, **kwargs: (123, list(_CLOSE_SESSION_OUTPUT)),
+    )
+    monkeypatch.setattr("oddarchiver.disc.time.sleep", lambda seconds: None)
+
+
+def test_init_close_exit_succeeds_when_session_readable(
+    monkeypatch, tmp_path, caplog,
+):
+    """
+    Input:  monkeypatch, tmp_path, caplog
+    Output: None
+    Details:
+        Real-disc regression (T18A): growisofs -Z printed closing
+        session then exited 123. The planted disc tree holds
+        session_000 and volume.json. init must warn and succeed.
+        Confirm must read volume.json from that tree.
+    """
+    _stub_disc_mediainfo(monkeypatch, session_count=0)
+    _stub_close_exit_growisofs(monkeypatch)
+    reads = _plant_readable_disc(monkeypatch, [0], b"{}")
+    backend = DiscBackend(_FAKE_SR)
+    with caplog.at_level(logging.WARNING, logger="oddarchiver.disc"):
+        backend.init(_make_staging(tmp_path), "TEST", 0)
+    assert "123" in caplog.text
+    assert "Continuing as success" in caplog.text
+    assert reads == [["volume.json"]]
+
+
+def test_init_close_exit_fails_when_burn_wrote_nothing(
+    monkeypatch, tmp_path,
+):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        growisofs -Z exit 123 after closing session, with no session
+        tree and no volume.json. init must fail. Confirm still
+        reads volume.json.
+    """
+    _stub_disc_mediainfo(monkeypatch, session_count=0)
+    _stub_close_exit_growisofs(monkeypatch)
+    reads = _plant_readable_disc(monkeypatch, [], None)
+    backend = DiscBackend(_FAKE_SR)
+    with pytest.raises(
+        RuntimeError, match=r"growisofs -Z failed with exit code 123",
+    ):
+        backend.init(_make_staging(tmp_path), "TEST", 0)
+    assert reads == [["volume.json"]]
+
+
+def test_append_close_exit_succeeds_when_session_readable(
+    monkeypatch, tmp_path, caplog,
+):
+    """
+    Input:  monkeypatch, tmp_path, caplog
+    Output: None
+    Details:
+        growisofs -M exit 123 after closing session must succeed when
+        the planted tree holds session_001 and volume.json.
+    """
+    _stub_disc_mediainfo(monkeypatch, session_count=1)
+    _stub_close_exit_growisofs(monkeypatch)
+    reads = _plant_readable_disc(monkeypatch, [0, 1], b"{}")
+    backend = DiscBackend(_FAKE_SR)
+    with caplog.at_level(logging.WARNING, logger="oddarchiver.disc"):
+        backend.append(_make_staging(tmp_path, "session_001"), "TEST", 1)
+    assert "123" in caplog.text
+    assert "Continuing as success" in caplog.text
+    assert reads == [["volume.json"]]
+
+
+def test_append_close_exit_fails_when_burn_wrote_nothing(
+    monkeypatch, tmp_path,
+):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        growisofs -M exit 123 after closing session, with only the
+        prior session and no volume.json. append must fail.
+    """
+    _stub_disc_mediainfo(monkeypatch, session_count=1)
+    _stub_close_exit_growisofs(monkeypatch)
+    reads = _plant_readable_disc(monkeypatch, [0], None)
+    backend = DiscBackend(_FAKE_SR)
+    with pytest.raises(
+        RuntimeError, match=r"growisofs -M failed with exit code 123",
+    ):
+        backend.append(_make_staging(tmp_path, "session_001"), "TEST", 1)
+    assert reads == [["volume.json"]]
+
+
+
+
+def test_init_close_exit_unreadable_names_drive_not_exit_code(
+    monkeypatch, tmp_path,
+):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        After closing session, a drive that stays unreadable must raise
+        the confirm error, not growisofs -Z failed with exit code 123.
+    """
+    calls = {"n": 0}
+
+    def fake_mediainfo(self, retries=6, retry_delay=5.0):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return DiscInfo(
+                session_count=0, remaining_bytes=10**9, used_bytes=0,
+                label="TEST",
+            )
+        raise RuntimeError("dvd+rw-mediainfo failed: no media mounted")
+
+    monkeypatch.setattr(DiscBackend, "mediainfo", fake_mediainfo)
+    _stub_close_exit_growisofs(monkeypatch)
+    backend = DiscBackend(_FAKE_SR)
+    with pytest.raises(RuntimeError) as exc:
+        backend.init(_make_staging(tmp_path), "TEST", 0)
+    msg = str(exc.value)
+    assert "did not confirm" in msg
+    assert "oddarchiver-usb-reauth" in msg
+    assert "sync" in msg
+    assert "exit code 123" not in msg
+
+
+def test_init_nonzero_exit_without_close_keeps_exit_code(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        Exit 123 without closing session or extents-written output must
+        keep the existing growisofs -Z exit-code error.
+    """
+    _stub_disc_mediainfo(monkeypatch, session_count=0)
+    monkeypatch.setattr(
+        "oddarchiver.disc._run_growisofs",
+        lambda cmd, **kwargs: (123, ["FATAL: unable to open device."]),
+    )
+    backend = DiscBackend(_FAKE_SR)
+    with pytest.raises(
+        RuntimeError, match=r"growisofs -Z failed with exit code 123",
+    ):
+        backend.init(_make_staging(tmp_path), "TEST", 0)
+
+
+_T19A_WRITE_ERROR = [
+    "Using SESSI001 for  /session_002 (session_003)",
+    '/dev/sr0: "Current Write Speed" is 8.2x1352KBps.',
+    ":-( unable to WRITE@LBA=1954d0h: Input/output error",
+    ":-( write failed: Input/output error",
+    "/dev/sr0: flushing cache",
+    "/dev/sr0: updating RMA",
+    "/dev/sr0: closing session",
+]
+
+
+def test_append_media_write_error_names_the_write_error(monkeypatch, tmp_path):
+    """
+    Input:  monkeypatch, tmp_path
+    Output: None
+    Details:
+        Real DVD-R T19A output: a write I/O error, then closing session
+        and exit 5, with no new session on the disc. The error must name
+        the write error and block, and must not be the bare exit code.
+    """
+    _stub_disc_mediainfo(monkeypatch, session_count=2)
+    monkeypatch.setattr(
+        "oddarchiver.disc._run_growisofs",
+        lambda cmd, **kwargs: (5, list(_T19A_WRITE_ERROR)),
+    )
+    monkeypatch.setattr(DiscBackend, "list_session_numbers", lambda self: [0, 2])
+    monkeypatch.setattr(
+        DiscBackend, "read_paths", lambda self, paths, **kwargs: {"volume.json": b"{}"},
+    )
+    monkeypatch.setattr("oddarchiver.disc.time.sleep", lambda _s: None)
+    # The drive stayed present on the real run; a missing node means disconnect.
+    real_exists = os.path.exists
+    monkeypatch.setattr(
+        "oddarchiver.disc.os.path.exists",
+        lambda path: path == _FAKE_SR or real_exists(path),
+    )
+    backend = DiscBackend(_FAKE_SR)
+    monkeypatch.setattr(backend, "_guard", lambda *a, **k: None)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir(exist_ok=True)
+    with pytest.raises(RuntimeError) as raised:
+        backend.append(
+            _make_staging(tmp_path, "session_003"), "TEST", 2,
+            expected_archive_id="t19a", expected_volume_index=0,
+        )
+    message = str(raised.value)
+    assert "write error at block 1660112" in message
+    assert "exit code" not in message
+    assert "another disc" in message
+    assert "earlier sessions" in message
+    assert backend._merge_appendable is False
+    from oddarchiver.catalog import remembered_discs
+    discs = remembered_discs("t19a")
+    assert discs[0].appendable is False
+    assert discs[0].appendable_reason == "write error at block 1660112"
+    with pytest.raises(RuntimeError, match="not appendable"):
+        backend.append(tmp_path, "TEST", 2)
+

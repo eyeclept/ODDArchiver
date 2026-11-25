@@ -26,6 +26,7 @@ from oddarchiver.crypto import NullCrypto
 from oddarchiver.disc import BurnInterrupted, DiscBackend, DiscInfo, ISOBackend
 from oddarchiver.ledger import check_session_coverage, ledger_path, load_ledger, record_confirmed
 from oddarchiver.verify import _read_all_manifests, detect_incomplete_session, verify
+from oddarchiver.volume import read_volume_marker
 
 # Globals
 logger = logging.getLogger(__name__)
@@ -70,6 +71,8 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "level": "fast",
         "recover_scan": False,
         "mirror": None,
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -129,9 +132,14 @@ def test_torn_read_below_known_good_raises(tmp_path, monkeypatch):
     """
     _, iso = _init_and_sync_two_sessions(tmp_path)
     backend = ISOBackend(iso, disc_size=SMALL_DISC)
+    marker = read_volume_marker(backend)
+    assert marker is not None
     monkeypatch.setattr(ISOBackend, "read_paths", _torn_session_000(backend))
 
-    ledger = load_ledger("TEST", str(iso))
+    ledger = load_ledger(
+        "TEST", str(iso), volume_index=marker.volume_index,
+        archive_id=marker.archive_id,
+    )
     assert ledger is not None
     assert ledger.confirmed_sessions == 2
 
@@ -143,6 +151,8 @@ def test_torn_read_below_known_good_raises(tmp_path, monkeypatch):
             backend_id=str(iso),
             disc_session_count=backend.mediainfo().session_count,
             backend=backend,
+            archive_id=marker.archive_id,
+            volume_index=marker.volume_index,
         )
 
     with pytest.raises(RuntimeError, match="Read failure"):
@@ -324,12 +334,12 @@ def test_ledger_round_trip_missing_is_cautious(tmp_path):
         disc with zero readable manifests is a loud failure, not a
         permissive empty-archive state.
     """
-    record_confirmed("TEST", "TEST", 2)
-    loaded = load_ledger("TEST", "TEST")
+    record_confirmed("TEST", "TEST", 2, archive_id="arch-test")
+    loaded = load_ledger("TEST", "TEST", archive_id="arch-test")
     assert loaded is not None
     assert loaded.confirmed_sessions == 2
     assert loaded.last_verified
-    path = ledger_path("TEST", "TEST")
+    path = ledger_path("TEST", "TEST", archive_id="arch-test")
     assert path.is_file()
     assert path.parent == tmp_path / "xdg_state" / "oddarchiver"
     raw = json.loads(path.read_text())
@@ -418,6 +428,61 @@ def test_ledger_present_shortfall_names_sessions_3_and_4(tmp_path):
     assert "5 session(s) (000-004) should exist" in message
     assert "Last readable session: 002" in message
     assert "Read failure for session 000" not in message
+
+
+
+class _Session:
+    """Minimal manifest stand-in with a session number and label."""
+
+    def __init__(self, session: int, label: str = "FS"):
+        self.session = session
+        self.label = label
+
+
+def test_gapped_ranges_ignore_inflated_ledger_count(tmp_path, monkeypatch):
+    """
+    Input: ledger confirmed_sessions=3 and volume ranges [[0,0],[2,2]]
+    Output: coverage returns without requiring session 1
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    ranges = [[0, 0], [2, 2]]
+    record_confirmed(
+        "FS", "iso", 3, volume_index=0, session_ranges=ranges,
+        archive_id="arch-gapped",
+    )
+    assert load_ledger("FS", "iso", volume_index=0, archive_id="arch-gapped") is not None
+    result = check_session_coverage(
+        [_Session(0), _Session(2)],
+        label="FS",
+        backend_id="iso",
+        volume_index=0,
+        session_ranges=ranges,
+        archive_id="arch-gapped",
+    )
+    assert result is None
+
+
+
+def test_gapped_ranges_torn_session_still_raises(tmp_path, monkeypatch):
+    """
+    Input: volume ranges [[0,0],[2,2]] and only session 0 readable
+    Output: coverage raises for missing session 2
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    ranges = [[0, 0], [2, 2]]
+    record_confirmed(
+        "FS", "iso", 2, volume_index=0, session_ranges=ranges,
+        archive_id="arch-gapped",
+    )
+    with pytest.raises(RuntimeError, match="session 002"):
+        check_session_coverage(
+            [_Session(0)],
+            label="FS",
+            backend_id="iso",
+            volume_index=0,
+            session_ranges=ranges,
+            archive_id="arch-gapped",
+        )
 
 
 def test_recover_scan_proceeds_and_warns(tmp_path, monkeypatch, caplog):
@@ -549,6 +614,64 @@ def test_status_surfaces_incomplete_trailing_session(tmp_path, capsys):
     sess2 = backend._sessions_root / "session_002"
     sess2.mkdir()
     (sess2 / "manifest.json").write_text("{not json", encoding="utf-8")
+    rc = dispatch(_make_args(command="status", test_iso=str(iso), label="TEST"))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "INCOMPLETE" in out
+    assert "Do not eject" in out
+    assert "verify --level checksum" in out
+
+
+def _init_one_session(tmp_path: Path) -> Path:
+    """Input: tmp_path. Output: ISO after one init burn."""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"version 1")
+    iso = tmp_path / "test.iso"
+    rc = dispatch(_make_args(command="init", source=str(source), test_iso=str(iso)))
+    assert rc == 0
+    return iso
+
+
+def _plant_truncated_session(iso: Path, session: int) -> ISOBackend:
+    """Input: ISO and trailing session number. Output: backend with a truncated manifest."""
+    backend = ISOBackend(iso, disc_size=SMALL_DISC)
+    slot = backend._sessions_root / f"session_{session:03d}"
+    slot.mkdir()
+    (slot / "manifest.json").write_text("{not json", encoding="utf-8")
+    return backend
+
+
+def test_verify_fast_reports_truncated_trailing_slot(tmp_path, capsys):
+    """
+    Input: one burned session plus a truncated later slot
+    Output: verify --level fast names INCOMPLETE, not FAIL
+    """
+    iso = _init_one_session(tmp_path)
+    backend = _plant_truncated_session(iso, 1)
+    with pytest.raises(SystemExit) as exc:
+        verify(backend, _crypto, level="fast")
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "Session 000" in out and "OK" in out
+    assert "INCOMPLETE (interrupted burn, not corruption)" in out
+    for line in out.splitlines():
+        if line.startswith("Session 001"):
+            assert "FAIL" not in line
+            assert "INCOMPLETE" in line
+    loaded = _read_all_manifests(backend, tmp_path / "vm", crypto=_crypto)
+    assert detect_incomplete_session(backend, loaded) == 1
+    assert loaded[1].suspect
+    assert loaded[1].session < 0
+
+
+def test_status_names_truncated_trailing_slot(tmp_path, capsys):
+    """
+    Input: one burned session plus a truncated later slot
+    Output: status names INCOMPLETE and tells the user not to eject
+    """
+    iso = _init_one_session(tmp_path)
+    _plant_truncated_session(iso, 1)
     rc = dispatch(_make_args(command="status", test_iso=str(iso), label="TEST"))
     out = capsys.readouterr().out
     assert rc == 0

@@ -8,6 +8,7 @@ Description:
     Implements: init, sync, restore, history, ls, browse, verify, status.
 """
 # Imports
+from __future__ import annotations
 import argparse
 import base64
 import contextlib
@@ -27,21 +28,27 @@ from typing import TYPE_CHECKING
 from oddarchiver.cache import CacheManager
 from oddarchiver.config import resolve_config
 from oddarchiver.crypto import make_crypto, NullCrypto, blob_aad, is_bound_ciphertext
+from oddarchiver.compress import CODEC_NONE, decode_payload
 from oddarchiver.disc import (
     ISOBackend, DiscBackend, parse_disc_size, BurnInterrupted,
-    check_volume_identity,
+    DriveUnresponsive, archive_session_count, check_volume_identity,
+    is_media_write_error, media_write_reason,
 )
 from oddarchiver.log import _fmt_bytes, check_capacity, setup_logging, suspect
 from oddarchiver.diskread import DEFAULT_READ_MODE, READ_MODES
 from oddarchiver.manifest import (
     Manifest, TreeEntry, read_manifest, write_manifest, build_disc_state,
-    build_disc_origin, build_disc_tree, load_session_manifests,
-    session_control_paths,
+    build_disc_origin, build_disc_tree, build_split_prefixes,
+    load_session_manifests, session_control_paths,
 )
 from oddarchiver.catalog import (
     archive_memory_path, build_archive_catalog, catalog_tree, disc_name,
-    highest_seen_volume, remember_discs, remember_encryption_mode,
-    remember_inserted_disc, remembered_encryption_mode, safe_display,
+    disc_holding_highest_session, highest_seen_volume, later_sessions_by_disc,
+    merge_snapshot_space, next_archive_session, other_volume_sessions,
+    remember_discs, remember_encryption_mode, remember_inserted_disc,
+    remember_volume_measure, remember_volume_not_appendable, remembered_discs,
+    remembered_encryption_mode, remembered_volume_sessions, safe_display,
+    volume_record_from_disc,
 )
 from oddarchiver.volume import BaselineReadError
 
@@ -147,6 +154,7 @@ def _add_init(sub: argparse._SubParsersAction) -> None:
     _add_recover_scan(p)
     _add_slow(p)
     _add_skip_large(p)
+    _add_split_large(p)
     _add_embed_software(p)
     _add_dry_iso_mutex(p)
 
@@ -177,7 +185,9 @@ def _add_sync(sub: argparse._SubParsersAction) -> None:
     _add_recover_scan(p)
     _add_slow(p)
     _add_skip_large(p)
+    _add_split_large(p)
     _add_embed_software(p)
+    _add_fill_flags(p)
     _add_dry_iso_mutex(p)
 
 
@@ -215,6 +225,55 @@ def _add_skip_large(p: argparse.ArgumentParser) -> None:
             "previous version on the archive; the next run tries it again."
         ),
     )
+
+
+def _add_split_large(p: argparse.ArgumentParser) -> None:
+    """
+    Input:  p - argparse parser for a burn command
+    Output: None
+    Details:
+        Adds --split-large. Staging then splits a file that fits one
+        medium so leftover space on the current disc is filled.
+    """
+    p.add_argument(
+        "--split-large",
+        action="store_true",
+        dest="split_large",
+        help=(
+            "Split a file to fill leftover space on the current disc. "
+            "Without this flag a file that fits one disc stays whole."
+        ),
+    )
+
+
+def _add_fill_flags(p: argparse.ArgumentParser) -> None:
+    """
+    Input:  p - argparse parser for sync
+    Output: None
+    Details:
+        Adds --fill and --no-fill. Fill is off unless --fill is set.
+    """
+    group = p.add_mutually_exclusive_group()
+    group.add_argument(
+        "--fill",
+        action="store_true",
+        dest="fill",
+        help=(
+            "Append the new session to the oldest appendable volume with room. "
+            "Off by default."
+        ),
+    )
+    group.add_argument(
+        "--no-fill",
+        action="store_true",
+        dest="no_fill",
+        help=(
+            "Append only to the inserted disc. This is the default. "
+            "The flag stays accepted."
+        ),
+    )
+
+
 
 
 def _add_embed_software(p: argparse.ArgumentParser) -> None:
@@ -459,6 +518,7 @@ def _add_restore(sub: argparse._SubParsersAction) -> None:
         help="Clear a saved missing-disc mark. Repeatable.",
     )
     _add_read_mode(p)
+    _add_recover_scan(p)
 
 
 def _add_history(sub: argparse._SubParsersAction) -> None:
@@ -555,6 +615,8 @@ def _add_verify(sub: argparse._SubParsersAction) -> None:
     )
     _add_key(p)
     _add_read_mode(p)
+    _add_recover_scan(p)
+
 
 
 def _add_status(sub: argparse._SubParsersAction) -> None:
@@ -563,12 +625,30 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
     Output: None
     Details:
         status - print disc/ISO state and any SUSPECT entries.
+        --stats and --stats-exact add a usage breakdown. --json prints
+        only that breakdown and needs one of those flags.
     """
     p = sub.add_parser("status", help="Show disc/ISO state and warnings.")
     _add_device(p)
     _add_test_iso(p)
     _add_key(p)
     _add_recover_scan(p)
+    stats = p.add_mutually_exclusive_group()
+    stats.add_argument(
+        "--stats", action="store_true",
+        help=(
+            "Print a usage breakdown from manifests and control files. "
+            "Does not read blob files."
+        ),
+    )
+    stats.add_argument(
+        "--stats-exact", action="store_true", dest="stats_exact",
+        help="Print a usage breakdown from on-disc file sizes.",
+    )
+    p.add_argument(
+        "--json", action="store_true",
+        help="Print only the stats JSON object. Requires --stats or --stats-exact.",
+    )
 
 
 def _add_dry_iso_mutex(_parser: argparse.ArgumentParser) -> None:
@@ -620,6 +700,10 @@ def dispatch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         _log.warning("Command interrupted by user.")
         print("\nInterrupted.", file=sys.stderr)
+        return 1
+    except DriveUnresponsive as exc:
+        _log.error("%s: %s", args.command, exc)
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     except ValueError as exc:
         # Expected refusals (wrong key, unsafe keyfile, refused disc) use
@@ -697,10 +781,14 @@ def _read_disc_manifests(
     from oddarchiver.volume import read_volume_marker
     if marker is _MARKER_UNSET:
         marker = read_volume_marker(backend)
+    elsewhere = None
+    if marker is not None:
+        elsewhere = other_volume_sessions(marker.archive_id, marker.volume_index)
     return load_session_manifests(
         backend, crypto,
         start_session=marker.first_session if marker else 0,
         marker=marker,
+        elsewhere_sessions=elsewhere,
     )
 
 
@@ -711,6 +799,7 @@ def _check_loaded_manifests(
     args: argparse.Namespace,
     disc_session_count: int,
     command: str,
+    marker: object = None,
 ) -> None:
     """
     Input:  manifests          - already-loaded session list
@@ -718,14 +807,30 @@ def _check_loaded_manifests(
             args               - parsed CLI namespace (recover_scan, label)
             disc_session_count - mediainfo session_count
             command            - caller name for log context
+            marker             - VolumeMarker already read with the manifests
     Output: None
     Details:
         Runs the 22a/22c ledger coverage check against the loaded list.
         Does not rescan manifests. Raises RuntimeError on a shortfall
         unless the user passes --recover-scan.
+
+        When the caller does not pass the VolumeMarker, read it here.
+        A missing archive_id at read time would look up no ledger row
+        and silently disable the torn-read guard; the ledger write uses
+        the disc marker's archive_id, so the read must use it too.
     """
     from oddarchiver.ledger import check_session_coverage
 
+    if marker is None:
+        from oddarchiver.volume import read_volume_marker
+        try:
+            marker = read_volume_marker(backend)
+        except (RuntimeError, OSError, ValueError) as exc:
+            _log.warning(
+                "%s: cannot read volume.json for the ledger check: %s",
+                command, exc,
+            )
+            marker = None
     label = ""
     if manifests:
         label = manifests[0].label
@@ -739,6 +844,9 @@ def _check_loaded_manifests(
             recover_scan=getattr(args, "recover_scan", False),
             disc_session_count=disc_session_count,
             backend=backend,
+            archive_id=getattr(marker, "archive_id", None),
+            volume_index=getattr(marker, "volume_index", None),
+            session_ranges=getattr(marker, "session_ranges", None),
         )
     except RuntimeError:
         _log.exception("%s: manifest coverage short of last-known-good", command)
@@ -926,6 +1034,8 @@ def _ordinary_disc_crypto(mode: str, key_path: str | None) -> "CryptoBackend":
         if not key_path:
             print("error: --key is required for keyfile-encrypted disc.", file=sys.stderr)
             raise SystemExit(1)
+        if not os.path.isfile(key_path):
+            raise ValueError(f"Keyfile not found: {key_path}")
         return make_crypto("keyfile", keyfile_path=key_path)
     raise ValueError(f"Unknown encryption mode on disc: {mode!r}")
 
@@ -1337,28 +1447,34 @@ def _verified_delta_payload(
     return entry.path, session_n, encrypted_full
 
 
-def _full_cache_payload(entry: object, staging: Path, session_n: int) -> tuple[str, int, bytes] | None:
+def _full_cache_payload(entry: object, staging: Path, session_n: int) -> tuple[str, int, Path] | None:
     """
     Input:  entry, staging, session_n - staged full blob source
-    Output: encrypted cache payload, or None when no blob is available
+    Output: blob file path for streaming cache write, or None
     """
     blob_rel = entry.file
     if not blob_rel:
         return None
     blob_path = staging / blob_rel
     if blob_path.exists():
-        return entry.path, session_n, blob_path.read_bytes()
+        return entry.path, session_n, blob_path
     return None
 
 
 def _cache_payloads(
     entries: list, sidecar: Path, staging: Path, session_n: int, crypto: "CryptoBackend",
-) -> Iterator[tuple[str, int, bytes]]:
+) -> Iterator[tuple[str, int, bytes | Path]]:
     """
     Input:  entries, sidecar, staging, session_n, crypto - staged cache sources
     Output: verified encrypted cache entries one at a time
     """
     for entry in entries:
+        if getattr(entry, "volume_chunk", None) is not None:
+            _log.info(
+                "skip cache for volume-split %s chunk %s",
+                entry.path, entry.volume_chunk,
+            )
+            continue
         if entry.type == "delta":
             payload = _verified_delta_payload(entry, sidecar, session_n, crypto)
             if payload is not None:
@@ -1383,6 +1499,7 @@ def _update_cache(
         Cache full entries from their burned blobs. Cache delta entries
         from the encrypted full-content copy made during staging.
         Skip a delta when its copied content fails the result checksum.
+        Skip volume-split chunks. They never enter the cache.
     """
     sidecar = staging.with_name(staging.name + ".cache_full")
     cache.put_many(_cache_payloads(entries, sidecar, staging, session_n, crypto))
@@ -1542,6 +1659,126 @@ def _apply_skip_large(
     return paths - skipped.keys()
 
 
+def _dry_run_init_state(
+    args: argparse.Namespace, disc_info: object,
+) -> tuple[dict[str, str], dict[str, int], list[Manifest] | None, str, int, "CryptoBackend"] | None:
+    """Input: init args and disc info. Output: fresh disc state or None."""
+    if disc_info.session_count > 0:
+        print("warning: disc already initialized; skipping init.", file=sys.stderr)
+        return None
+    disc_state: dict[str, str] = {}
+    disc_origin: dict[str, int] = {}
+    manifests = None
+    label = getattr(args, "label", "ARCHIVE")
+    session_n = 0
+    crypto = _make_init_crypto(args)
+    return disc_state, disc_origin, manifests, label, session_n, crypto
+
+
+def _archive_label(manifests: list[Manifest] | None) -> str:
+    """Input: loaded manifests. Output: first label, or ARCHIVE."""
+    if manifests:
+        return manifests[0].label
+    return "ARCHIVE"
+
+
+def _sync_next_session(marker: object, history: list[Manifest]) -> int:
+    """Input: volume marker and history. Output: next archive session number."""
+    return next_archive_session(
+        marker.archive_id if marker else None,
+        history,
+        marker.first_session if marker else 0,
+    )
+
+
+def _sync_seed_state(
+    snapshot: object, baseline: object, history: list[Manifest],
+) -> tuple[object, dict[str, str], dict[str, int]]:
+    """Input: snapshot, baseline, history. Output: seed, disc state, and disc origin."""
+    seed = snapshot if snapshot is not None else baseline
+    disc_state = build_disc_state(
+        history, seed=seed.state if seed else None,
+    )
+    disc_origin = build_disc_origin(
+        history, seed=seed.origin if seed else None,
+    )
+    return seed, disc_state, disc_origin
+
+
+def _dry_run_decrypt_state(
+    args: argparse.Namespace, backend: "BurnBackend", disc_info: object,
+) -> tuple["CryptoBackend", list[Manifest], object, object] | None:
+    """Input: sync args and disc. Output: crypto, manifests, marker, baseline, or None."""
+    from oddarchiver.volume import read_volume_baseline
+
+    if disc_info.session_count == 0:
+        print("error: disc not initialized; run 'init' first.", file=sys.stderr)
+        return None
+    crypto, manifests, raw = _crypto_and_manifests(
+        backend, key_path=getattr(args, "key", None),
+    )
+    if manifests and all(m.suspect for m in manifests):
+        print(
+            "error: Cannot decrypt the session manifest. Check --key.",
+            file=sys.stderr,
+        )
+        return None
+    baseline = read_volume_baseline(
+        backend, crypto, marker=raw.marker, manifests=manifests,
+    )
+    return crypto, manifests, raw.marker, baseline
+
+
+def _dry_run_apply_pending(
+    backend: "BurnBackend", crypto: "CryptoBackend", marker: object,
+    manifests: list[Manifest], baseline: object,
+) -> tuple[object, list[Manifest], object] | None:
+    """Input: loaded disc. Output: refreshed state, or None after a pending fill error."""
+    from oddarchiver.volume import unmatched_fill_intent
+
+    pending = unmatched_fill_intent(backend, crypto, marker)
+    if pending is None:
+        return marker, manifests, baseline
+    if _complete_pending_fill(backend, crypto, marker, _archive_label(manifests)):
+        return None
+    return _refresh_sync_volume(backend, crypto)
+
+
+def _dry_run_sync_state(
+    args: argparse.Namespace, backend: "BurnBackend", disc_info: object,
+) -> tuple[dict[str, str], dict[str, int], list[Manifest] | None, str, int, "CryptoBackend"] | None:
+    """Input: sync args and disc state. Output: loaded disc state or None."""
+    loaded = _dry_run_decrypt_state(args, backend, disc_info)
+    if loaded is None:
+        return None
+    crypto, manifests, marker, baseline = loaded
+    refreshed = _dry_run_apply_pending(
+        backend, crypto, marker, manifests, baseline,
+    )
+    if refreshed is None:
+        return None
+    marker, manifests, baseline = refreshed
+    fill_on = _fill_enabled(args)
+    prepared = _prepare_sync_baseline(
+        backend, crypto, marker, manifests, fill_on, baseline,
+    )
+    if prepared is None:
+        return None
+    manifests, extra, snapshot = prepared
+    if _refuse_sync_catalog(marker, fill_on, backend, extra) is not None:
+        return None
+    history = manifests + extra
+    _seed, disc_state, disc_origin = _sync_seed_state(
+        snapshot, baseline, history,
+    )
+    return (
+        disc_state, disc_origin, history, _archive_label(manifests),
+        _sync_next_session(marker, history), crypto,
+    )
+
+
+
+
 def _dry_run_disc_state(
     args: argparse.Namespace,
     backend: "BurnBackend",
@@ -1555,40 +1792,8 @@ def _dry_run_disc_state(
             None when the disc cannot be used for this operation
     """
     if is_init:
-        if disc_info.session_count > 0:
-            print("warning: disc already initialized; skipping init.", file=sys.stderr)
-            return None
-        disc_state: dict[str, str] = {}
-        disc_origin: dict[str, int] = {}
-        manifests = None
-        label = getattr(args, "label", "ARCHIVE")
-        session_n = 0
-        crypto = _make_init_crypto(args)
-    else:
-        if disc_info.session_count == 0:
-            print("error: disc not initialized; run 'init' first.", file=sys.stderr)
-            return None
-        crypto, manifests, raw = _crypto_and_manifests(
-            backend, key_path=getattr(args, "key", None),
-        )
-        marker = raw.marker
-        if manifests and all(m.suspect for m in manifests):
-            print(
-                "error: Cannot decrypt the session manifest. Check --key.",
-                file=sys.stderr,
-            )
-            return None
-        disc_state = build_disc_state(manifests)
-        disc_origin = build_disc_origin(manifests)
-        label = manifests[0].label if manifests else "ARCHIVE"
-        # Match _run_sync: marker.first_session plus manifest count, not
-        # dvd+rw-mediainfo session count. BD-R SRM+POW reports
-        # session_count=1 no matter how many appends happened, because
-        # growisofs adds tracks inside one MMC session. Reading the disc
-        # count here made dry-run announce a session number that was
-        # already used. A missing marker treats first_session as 0.
-        session_n = (marker.first_session if marker else 0) + len(manifests)
-    return disc_state, disc_origin, manifests, label, session_n, crypto
+        return _dry_run_init_state(args, disc_info)
+    return _dry_run_sync_state(args, backend, disc_info)
 
 
 def _scan_dry_source(source: Path) -> tuple[dict[str, str], int]:
@@ -1668,9 +1873,12 @@ def _dry_prior_jobs(
                 )
                 if is_bound_ciphertext(encrypted_old) and prior_entry is None:
                     raise ValueError(f"Cannot resolve authenticated blob for {rel_path!r}.")
-                old_bytes = crypto.decrypt(
-                    encrypted_old,
-                    aad=blob_aad(prior_entry) if is_bound_ciphertext(encrypted_old) else None,
+                old_bytes = decode_payload(
+                    crypto.decrypt(
+                        encrypted_old,
+                        aad=blob_aad(prior_entry) if is_bound_ciphertext(encrypted_old) else None,
+                    ),
+                    prior_entry.codec if prior_entry is not None else CODEC_NONE,
                 )
                 if hashlib.sha256(old_bytes).hexdigest() != disc_state[rel_path]:
                     _log.warning(
@@ -1749,6 +1957,114 @@ def _print_dry_space(total_session_bytes: int, remaining_bytes: int) -> None:
         )
     else:
         print("Space check:                OVERAGE (disc full)")
+
+
+def _dry_encoded_sizes(
+    changed: set[str],
+    new_files: set[str],
+    source: Path,
+    delta_results: dict[str, tuple[str, bytes]],
+) -> dict[str, int]:
+    """Input: changed and new paths. Output: encoded size per path."""
+    sizes: dict[str, int] = {}
+    for rel_path in changed:
+        if rel_path in delta_results:
+            sizes[rel_path] = len(delta_results[rel_path][1])
+        else:
+            sizes[rel_path] = (source / rel_path).stat().st_size
+    for rel_path in new_files:
+        sizes[rel_path] = (source / rel_path).stat().st_size
+    return sizes
+
+
+def _print_dry_volume_line(vol: object, label: str) -> None:
+    """Input: one planned volume. Output: one plan line on stdout."""
+    where = "new volume" if vol.is_new_volume else "inserted disc"
+    split = ""
+    notes = getattr(vol, "split_notes", ())
+    if notes:
+        parts = [
+            f"{path} split {count} chunks" for path, count in notes
+        ]
+        split = "  (" + ", ".join(parts) + ")"
+    print(
+        f"  session_{vol.session_n:03d}  {where}  "
+        f"{vol.file_count} file(s)  {_fmt_bytes(vol.planned_bytes)}"
+        f" on {safe_display(label)}{split}"
+    )
+
+
+def _print_dry_volume_plan(
+    volumes: list,
+    session_n: int,
+    label: str,
+    total_session_bytes: int,
+    remaining_bytes: int,
+) -> None:
+    """Input: planned volumes and space totals. Output: plan and space lines."""
+    print()
+    print("Volume plan:")
+    if not volumes:
+        print(f"  session_{session_n:03d}  inserted disc  0 file(s)")
+        return
+    for vol in volumes:
+        _print_dry_volume_line(vol, label)
+    if len(volumes) == 1 and not volumes[0].is_new_volume:
+        _print_dry_space(total_session_bytes, remaining_bytes)
+
+
+def _print_dry_pack_plan(
+    args: argparse.Namespace,
+    is_init: bool,
+    source: Path,
+    changed: set[str],
+    new_files: set[str],
+    encoded_sizes: dict[str, int],
+    disc_state: dict[str, str],
+    current_state: dict[str, str],
+    disc_info: object,
+    backend: "BurnBackend",
+    crypto: "CryptoBackend",
+    session_n: int,
+    label: str,
+    manifests: list[Manifest] | None,
+    total_session_bytes: int,
+) -> None:
+    """Input: dry-run pack context. Output: volume plan or OVERAGE on stdout."""
+    from oddarchiver.session import plan_session_volumes
+
+    if not is_init and _fill_enabled(args):
+        print(
+            "The plan covers the inserted disc and new volumes only. "
+            "Fill of older discs is not in this dry run."
+        )
+    try:
+        volumes = plan_session_volumes(
+            source=source,
+            new_files=new_files,
+            changed=changed,
+            encoded_sizes=encoded_sizes,
+            disc_state=disc_state,
+            current_state=current_state,
+            disc_info=disc_info,
+            backend=backend,
+            crypto=crypto,
+            session_n=session_n,
+            split_large=getattr(args, "split_large", False),
+            manifests=manifests,
+            volume_label=label,
+        )
+    except RuntimeError as exc:
+        _log.warning("dry-run: a file cannot be placed: %s", exc)
+        _print_dry_space(total_session_bytes, disc_info.remaining_bytes)
+        print()
+        print(f"Would burn as: session_{session_n:03d} on {safe_display(label)}")
+        return
+    _print_dry_volume_plan(
+        volumes, session_n, label, total_session_bytes,
+        disc_info.remaining_bytes,
+    )
+
 
 
 def _dry_run_changes(
@@ -1866,10 +2182,13 @@ def _run_dry_run(args: argparse.Namespace, is_init: bool = False) -> int:
     print(f"Session size (unencrypted): {_fmt_bytes(total_session_bytes)}")
     print(f"Disc remaining:             {_fmt_bytes(disc_info.remaining_bytes)}")
 
-    _print_dry_space(total_session_bytes, disc_info.remaining_bytes)
+    _print_dry_pack_plan(
+        args, is_init, source, changed, new_files,
+        _dry_encoded_sizes(changed, new_files, source, delta_results),
+        disc_state, current_state, disc_info, backend, crypto, session_n,
+        label, dry_manifests, total_session_bytes,
+    )
 
-    print()
-    print(f"Would burn as: session_{session_n:03d} on {safe_display(label)}")
     print("No disc written (dry run).")
 
     return 0
@@ -1921,21 +2240,23 @@ def _swap_after_full_volume(
     if iso_origin is not None:
         next_path = _volume_iso_path(iso_origin, next_volume_index)
         _log.info(
-            "Volume %d is full (%s/%s); auto-continuing on %s for volume %d",
+            "Volume %d has no room for the rest (%s/%s used); auto-continuing on %s for volume %d",
             next_volume_index - 1, used, total, next_path, next_volume_index,
         )
         print(
-            f"Disc {safe_display(label)} is full ({used}/{total}). "
+            f"Disc {safe_display(label)} has no room for the rest of this sync ({used}/{total} used). "
             f"Continuing on {next_path} for volume {next_volume_index}.",
             flush=True,
         )
         next_backend: "BurnBackend" = ISOBackend(next_path, disc_size=iso_disc_size)
     else:
         prompt = (
-            f"Disc {safe_display(label)} is full ({used}/{total}). "
+            f"Disc {safe_display(label)} has no room for the rest of this sync ({used}/{total} used). "
             f"Insert a new disc for volume {next_volume_index} and press Enter "
             f"(or 'q' to abort; already-burned data is durable and this sync is resumable)."
         )
+        from oddarchiver.drive import open_tray
+        open_tray(getattr(backend, "device", None))
         try:
             reply = input(prompt)
         except EOFError:
@@ -2021,6 +2342,95 @@ def _burn_mirror(
     return True
 
 
+def _verify_messages(slow: bool) -> tuple[str, str, str, str]:
+    """Input: slow flag. Output: verify level and three progress messages."""
+    if slow:
+        return (
+            "checksum",
+            "Verifying disc (checksum) after interrupted burn...",
+            "Verifying burn (checksum)...",
+            "  Verify OK (checksum).",
+        )
+    return (
+        "fast",
+        "Verifying disc (fast, manifest only) after interrupted burn...",
+        "Verifying burn (fast, manifest only)...",
+        "  Verify OK (manifest only).",
+    )
+
+
+def _verify_after_burn(
+    backend: "BurnBackend",
+    crypto: "CryptoBackend",
+    level: str,
+    manifest: Manifest,
+    verify_mod: object,
+    command: str,
+    start_msg: str,
+    ok_msg: str,
+) -> bool:
+    """Input: burn context. Output: True when post-burn verify passes."""
+    try:
+        print(start_msg, flush=True)
+        verify_mod.verify(backend, crypto, level=level, manifests=[manifest])
+        _log.info("%s: post-burn verify OK", command)
+        print(ok_msg, flush=True)
+    except SystemExit:
+        _log.exception("%s: post-burn verify FAILED; cache not updated", command)
+        print("error: post-burn verify failed; cache not updated.", file=sys.stderr)
+        return False
+    return True
+
+
+def _record_burn_success(
+    backend: "BurnBackend",
+    staging: Path,
+    session_n: int,
+    label: str,
+    manifest: Manifest,
+    crypto: "CryptoBackend",
+    cache: CacheManager,
+    expected_archive_id: str | None,
+    expected_volume_index: int | None,
+    command: str,
+) -> None:
+    """Input: successful burn context. Output: ledger, space, and cache updated."""
+    from oddarchiver.ledger import record_confirmed
+    from oddarchiver.volume import compact_session_ranges
+
+    listed = set(_backend_session_numbers(backend) or [])
+    listed.add(session_n)
+    staging_marker = _staging_volume_marker(staging)
+    archive_id = expected_archive_id or (
+        staging_marker.archive_id if staging_marker is not None else None
+    )
+    volume_index = expected_volume_index
+    if volume_index is None and staging_marker is not None:
+        volume_index = staging_marker.volume_index
+    record_confirmed(
+        label, _backend_id(backend), len(listed),
+        archive_id=archive_id,
+        volume_index=volume_index,
+        session_ranges=compact_session_ranges(listed),
+    )
+    _record_volume_space_after_burn(
+        backend, session_n, label, archive_id, volume_index,
+        staging_marker.first_session if staging_marker is not None else None,
+    )
+    print("Updating cache...", flush=True)
+    try:
+        _update_cache(cache, staging, session_n, manifest.entries, crypto)
+    except OSError:
+        _log.exception(
+            "cache update failed after successful burn and verify for session %d",
+            session_n,
+        )
+    _log.info(
+        "%s: session %03d complete - %d file(s) archived",
+        command, session_n, len(manifest.entries),
+    )
+
+
 def _burn_verify_commit(
     command: str,
     staging: Path,
@@ -2075,17 +2485,7 @@ def _burn_verify_commit(
         Unless verify passes, this function does not update the cache
         and ledger.
     """
-    from oddarchiver.ledger import record_confirmed
-
-    level = "checksum" if slow else "fast"
-    if slow:
-        interrupt_msg = "Verifying disc (checksum) after interrupted burn..."
-        start_msg = "Verifying burn (checksum)..."
-        ok_msg = "  Verify OK (checksum)."
-    else:
-        interrupt_msg = "Verifying disc (fast, manifest only) after interrupted burn..."
-        start_msg = "Verifying burn (fast, manifest only)..."
-        ok_msg = "  Verify OK (manifest only)."
+    level, interrupt_msg, start_msg, ok_msg = _verify_messages(slow)
 
     manifest = _patch_manifest(
         staging, session_n, label, enc_block, drives=drives, crypto=crypto,
@@ -2108,30 +2508,591 @@ def _burn_verify_commit(
         expected_session_count,
     ):
         return 1
-    try:
-        print(start_msg, flush=True)
-        verify_mod.verify(backend, crypto, level=level, manifests=[manifest])
-        _log.info("%s: post-burn verify OK", command)
-        print(ok_msg, flush=True)
-    except SystemExit:
-        _log.exception("%s: post-burn verify FAILED; cache not updated", command)
-        print("error: post-burn verify failed; cache not updated.", file=sys.stderr)
+    if not _verify_after_burn(
+        backend, crypto, level, manifest, verify_mod, command, start_msg, ok_msg,
+    ):
         return 1
-    local_count = (session_n - marker_first_session) + 1
-    record_confirmed(label, _backend_id(backend), local_count)
-    print("Updating cache...", flush=True)
-    try:
-        _update_cache(cache, staging, session_n, manifest.entries, crypto)
-    except OSError:
-        _log.exception(
-            "cache update failed after successful burn and verify for session %d",
-            session_n,
-        )
-    _log.info(
-        "%s: session %03d complete - %d file(s) archived",
-        command, session_n, len(manifest.entries),
+    _record_burn_success(
+        backend, staging, session_n, label, manifest, crypto, cache,
+        expected_archive_id, expected_volume_index, command,
     )
     return 0
+
+
+
+def _staging_volume_marker(staging: Path):
+    """Input: staging root. Output: VolumeMarker from staging, or None."""
+    from oddarchiver.volume import parse_volume_marker_bytes
+
+    path = staging / "volume.json"
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        _log.warning("Cannot read staging volume.json at %s", path)
+        return None
+
+    return parse_volume_marker_bytes(data)
+
+
+def _backend_session_numbers(backend: "BurnBackend") -> list[int] | None:
+    """Input: burn backend. Output: listed sessions, or None when unknown."""
+    lister = getattr(backend, "list_session_numbers", None)
+    if not callable(lister):
+        return None
+    try:
+        listed = lister()
+    except (RuntimeError, OSError, TypeError, AttributeError) as exc:
+        _log.warning("Cannot list sessions after burn: %s", exc)
+        return None
+    if isinstance(listed, list):
+        return listed
+    return None
+
+
+def _backend_file_count(backend: "BurnBackend") -> int | None:
+    """Input: burn backend. Output: file count, or None when unknown."""
+    sizer = getattr(backend, "list_file_sizes", None)
+    if not callable(sizer):
+        return None
+    try:
+        return len(sizer())
+    except (NotImplementedError, RuntimeError, OSError, TypeError, AttributeError) as exc:
+        _log.warning("Cannot count files after burn: %s", exc)
+        return None
+
+
+def _record_volume_space_after_burn(
+    backend: "BurnBackend", session_n: int, label: str,
+    archive_id: str | None, volume_index: int | None,
+    first_session: int | None,
+) -> None:
+    """
+    Input:  backend, session_n, label - disc after a verified burn
+            archive_id, volume_index - identity the caller resolved
+            first_session - from staging volume.json, or None
+    Output: None
+    Details:
+        Write used_bytes and remaining_bytes into the local archive record.
+        Only the first session on a volume stages volume.json, so the caller
+        passes the identity it checked. A None first_session keeps the
+        recorded value. Do not call read_paths. A measure failure does not
+        fail the burn.
+    """
+    from oddarchiver.volume import compact_session_ranges
+
+    if archive_id is None or volume_index is None:
+        _log.warning("No volume identity to record space after session %d", session_n)
+        return
+    try:
+        info = backend.mediainfo()
+        sessions = set(_backend_session_numbers(backend) or [])
+        sessions.add(session_n)
+        remember_volume_measure(
+            archive_id,
+            volume_index,
+            getattr(info, "label", "") or label,
+            used_bytes=info.used_bytes,
+            remaining_bytes=info.remaining_bytes,
+            appendable=getattr(info, "appendable", True),
+            first_session=first_session,
+            last_session=max(sessions),
+            session_ranges=compact_session_ranges(sessions),
+            file_count=_backend_file_count(backend),
+        )
+    except (RuntimeError, OSError, ValueError, TypeError, AttributeError):
+        _log.exception("Cannot measure volume space after session %d", session_n)
+
+
+
+
+def _archive_sync_lock(marker: object):
+    """Input: volume marker. Output: lock context, or a no-op when unmarked."""
+    if marker is None:
+        return contextlib.nullcontext()
+    from oddarchiver.session import archive_sync_lock
+    return archive_sync_lock(marker.archive_id)
+
+
+
+class _MeasuredFillVolume:
+    """Capacity snapshot of one measured fill candidate."""
+
+    def __init__(
+        self, volume_index: int, backend: "BurnBackend", disc_info: object,
+        prior_file_count: int, sessions: list[int], marker: object,
+    ) -> None:
+        self.volume_index = volume_index
+        self.backend = backend
+        self.disc_info = disc_info
+        self.prior_file_count = prior_file_count
+        self.sessions = sessions
+        self.marker = marker
+
+
+def _fill_enabled(args: argparse.Namespace) -> bool:
+    """Input: parsed sync args. Output: True only when --fill is set."""
+    if getattr(args, "no_fill", False):
+        return False
+    return bool(getattr(args, "fill", False))
+
+
+
+
+def _fill_iso_path(iso_origin: Path, volume_index: int) -> Path:
+    """Input: volume-0 ISO path and index. Output: sibling ISO path."""
+    if volume_index <= 0:
+        return iso_origin
+    return _volume_iso_path(iso_origin, volume_index)
+
+
+def _prompt_fields_from_record(
+    discs: dict, volume_index: int, label: str,
+) -> tuple[str, int | None]:
+    """Input: remembered discs, volume, fallback label. Output: label and remaining bytes."""
+    record = discs.get(volume_index)
+    remaining = record.remaining_bytes if record is not None else None
+    disc_label = (record.label if record is not None else "") or label
+    return disc_label, remaining
+
+
+def _fill_candidate_indices(archive_id: str, inserted_index: int) -> list[int]:
+    """Input: archive id and inserted index. Output: volume indices to consider."""
+    discs = remembered_discs(archive_id)
+    highest = highest_seen_volume(archive_id)
+    indices = set(discs)
+    if highest is not None:
+        indices.update(range(highest + 1))
+    indices.add(inserted_index)
+    return sorted(index for index in indices if index >= 0)
+
+
+def _memory_marks_closed(archive_id: str, volume_index: int) -> bool:
+    """Input: archive and volume. Output: True when local memory forbids -M."""
+    disc = remembered_discs(archive_id).get(volume_index)
+    # scbc ignore[is-true-false-strict] None means unknown; only False is closed
+    return disc is not None and disc.appendable is False
+
+
+def _snapshot_fill_volume(
+    backend: "BurnBackend", marker: object, label: str,
+) -> _MeasuredFillVolume | None:
+    """
+    Input: backend and identity of a disc that passed the identity check
+    Output: measured snapshot, or None when measure fails
+    """
+    from oddarchiver.volume import compact_session_ranges
+
+    try:
+        info = backend.mediainfo()
+        listed = _backend_session_numbers(backend) or []
+        file_count = _backend_file_count(backend)
+        if file_count is None:
+            file_count = 0
+        remember_volume_measure(
+            marker.archive_id,
+            marker.volume_index,
+            getattr(info, "label", "") or label or marker.archive_id,
+            used_bytes=info.used_bytes,
+            remaining_bytes=info.remaining_bytes,
+            appendable=getattr(info, "appendable", True),
+            first_session=marker.first_session,
+            last_session=max(listed) if listed else marker.first_session,
+            session_ranges=compact_session_ranges(set(listed)),
+            file_count=file_count,
+        )
+        return _MeasuredFillVolume(
+            marker.volume_index, backend, info, file_count, listed, marker,
+        )
+    except (RuntimeError, OSError, ValueError, TypeError, AttributeError):
+        _log.exception(
+            "Cannot measure fill volume %s", getattr(marker, "volume_index", "?"),
+        )
+        return None
+
+
+def _print_found_fill_identity(backend: "BurnBackend") -> None:
+    """Input: backend of a mismatched fill insert. Output: identity on stdout."""
+    from oddarchiver.volume import read_volume_marker
+
+    try:
+        found = read_volume_marker(backend)
+    except Exception:
+        _log.exception("Cannot read volume.json after a fill identity mismatch")
+        found = None
+    if found is None:
+        print("Found no volume marker.", flush=True)
+        return
+    print(
+        f"Found archive_id {found.archive_id} volume_index {found.volume_index}.",
+        flush=True,
+    )
+
+
+def _fill_prompt_text(volume_index: int, label: str, remaining: int | None) -> str:
+    """Input: volume identity and last remaining bytes. Output: prompt text."""
+    from oddarchiver.volume import FILL_STUB_BLOCKS
+
+    if remaining is None:
+        measured = "free space unknown"
+    else:
+        measured = f"last measured {_fmt_bytes(remaining)} free"
+    name = safe_display(label) if label else "ARCHIVE"
+    return (
+        f"Fill: insert volume {volume_index} ({name}, {measured}) "
+        "and press Enter.\n"
+        "Type s to skip this disc for this sync.\n"
+        "Type q to abort. Data already burned stays on disc.\n"
+        f"A stub session uses about 15.9 MiB ({FILL_STUB_BLOCKS} blocks)."
+    )
+
+
+def _read_fill_reply(volume_index: int, label: str, remaining: int | None) -> str | None:
+    """Input: prompt fields. Output: stripped reply, or None on EOF."""
+    prompt = _fill_prompt_text(volume_index, label, remaining)
+    try:
+        return input(prompt).strip().lower()
+    except EOFError:
+        _log.warning("fill: EOF on input; aborting")
+        return None
+
+
+def _wait_closed_tray() -> None:
+    """Input: None. Output: None. Details: Wait after a tray-open skip or abort."""
+    print("Close the tray. Then press Enter.", flush=True)
+    try:
+        input()
+    except EOFError:
+        _log.warning("fill: EOF while waiting for a closed tray")
+
+
+def _prompt_fill_disc(
+    backend: "BurnBackend",
+    archive_id: str,
+    volume_index: int,
+    label: str,
+    remaining: int | None,
+) -> str:
+    """
+    Input: drive backend and expected identity
+    Output: ok, skip, or abort
+    """
+    from oddarchiver.drive import open_tray
+    from oddarchiver.volume import read_volume_marker
+
+    while True:
+        open_tray(getattr(backend, "device", None))
+        reply = _read_fill_reply(volume_index, label, remaining)
+        if reply is None or reply == "q":
+            _wait_closed_tray()
+            return "abort"
+        if reply == "s":
+            _log.info("fill: skipped volume %s for this sync", volume_index)
+            _wait_closed_tray()
+            return "skip"
+        # The user may have swapped discs; drop listings cached from the old one.
+        backend.invalidate_session_list()
+        try:
+            check_volume_identity(backend, archive_id, volume_index)
+        except RuntimeError as exc:
+            _log.warning("fill: wrong disc for volume %s: %s", volume_index, exc)
+            _print_found_fill_identity(backend)
+            continue
+        marker = read_volume_marker(backend)
+        if marker is None:
+            _log.warning("fill: no volume marker after identity check")
+            print("Found no volume marker.", flush=True)
+            continue
+        return "ok"
+
+
+def _measure_inserted_fill(
+    backend: "BurnBackend", marker: object, label: str,
+) -> _MeasuredFillVolume | None:
+    """Input: already loaded disc. Output: snapshot after identity check."""
+    try:
+        check_volume_identity(backend, marker.archive_id, marker.volume_index)
+    except RuntimeError:
+        _log.exception("Inserted disc failed fill identity check")
+        return None
+    return _snapshot_fill_volume(backend, marker, label)
+
+
+def _open_iso_fill_backend(
+    iso_origin: Path, volume_index: int, disc_size: int | None,
+    current: "BurnBackend",
+) -> "BurnBackend | None":
+    """Input: sibling ISO identity. Output: backend, or None if the file is missing."""
+    path = _fill_iso_path(iso_origin, volume_index)
+    if isinstance(current, ISOBackend) and Path(current.iso_path) == path:
+        return current
+    if not path.is_file():
+        _log.warning("fill: missing ISO sibling %s; skipping volume %s", path, volume_index)
+        print(
+            f"Warning: missing ISO sibling {path}. Skipping volume {volume_index}.",
+            file=sys.stderr,
+        )
+        return None
+    return ISOBackend(path, disc_size=disc_size)
+
+
+def _measure_iso_fill_volume(
+    current: "BurnBackend",
+    iso_origin: Path,
+    disc_size: int | None,
+    archive_id: str,
+    volume_index: int,
+    label: str,
+) -> _MeasuredFillVolume | None:
+    """Input: ISO sibling identity. Output: snapshot, or None to skip."""
+    from oddarchiver.volume import read_volume_marker
+
+    backend = _open_iso_fill_backend(iso_origin, volume_index, disc_size, current)
+    if backend is None:
+        return None
+    try:
+        check_volume_identity(backend, archive_id, volume_index)
+    except RuntimeError as exc:
+        _log.warning("fill: wrong ISO for volume %s: %s", volume_index, exc)
+        _print_found_fill_identity(backend)
+        return None
+    marker = read_volume_marker(backend)
+    if marker is None:
+        _log.warning("fill: ISO volume %s has no marker; skipping", volume_index)
+        return None
+    return _snapshot_fill_volume(backend, marker, label)
+
+
+def _skip_fill_volume_for_space(
+    volume_index: int, space: dict, min_blob: int, label: str,
+) -> bool:
+    """Input: volume, space map, min blob. Output: True when fill must skip it."""
+    record = space.get(volume_index)
+    if record is None:
+        return False
+    if record.appendable is False:
+        _log.info("fill: skipping non-appendable volume %s", volume_index)
+        return True
+    remaining = record.remaining_bytes
+    if remaining is None:
+        return False
+    if remaining >= min_blob:
+        return False
+    name = safe_display(record.label or label)
+    print(
+        f"Fill: skipping volume {volume_index} ({name}, last measured "
+        f"{_fmt_bytes(remaining)} free). It cannot hold any planned blob.",
+        flush=True,
+    )
+    _log.info(
+        "fill: skipping volume %s; remaining %s cannot hold blob of %s",
+        volume_index, remaining, min_blob,
+    )
+    return True
+
+
+def _collect_iso_fill_volumes(
+    backend: "BurnBackend",
+    marker: object,
+    label: str,
+    min_blob: int,
+    space: dict,
+) -> list[_MeasuredFillVolume] | None:
+    """Input: inserted ISO backend. Output: measured volumes, or None on abort."""
+    iso_origin, disc_size = _volume_iso_origin(backend, marker.volume_index)
+    if iso_origin is None:
+        iso_origin = Path(backend.iso_path)
+        disc_size = getattr(backend, "disc_size", None)
+    measured: list[_MeasuredFillVolume] = []
+    for volume_index in _fill_candidate_indices(marker.archive_id, marker.volume_index):
+        if _memory_marks_closed(marker.archive_id, volume_index):
+            _log.info("fill: skipping non-appendable volume %s", volume_index)
+            continue
+        if _skip_fill_volume_for_space(volume_index, space, min_blob, label):
+            continue
+        snap = _measure_iso_fill_volume(
+            backend, iso_origin, disc_size, marker.archive_id, volume_index, label,
+        )
+        if snap is None:
+            continue
+        if getattr(snap.disc_info, "appendable", True) is False:
+            _log.warning(
+                "fill: volume %s is not appendable; skipping", volume_index,
+            )
+            continue
+        measured.append(snap)
+    return measured
+
+
+def _fill_volume_snapshot(
+    backend: "BurnBackend",
+    marker: object,
+    volume_index: int,
+    discs: dict,
+    label: str,
+) -> tuple[str, _MeasuredFillVolume | None]:
+    """Input: candidate volume context. Output: action and optional snapshot."""
+    disc_label, remaining = _prompt_fields_from_record(
+        discs, volume_index, label,
+    )
+    action = _prompt_fill_disc(
+        backend, marker.archive_id, volume_index, disc_label, remaining,
+    )
+    if action == "abort":
+        return "abort", None
+    if action == "skip":
+        return "skip", None
+    from oddarchiver.volume import read_volume_marker
+    found = read_volume_marker(backend)
+    snap = _snapshot_fill_volume(backend, found, disc_label)
+    if snap is None:
+        return "skip", None
+    if getattr(snap.disc_info, "appendable", True) is False:
+        _log.warning(
+            "fill: volume %s is not appendable; skipping", volume_index,
+        )
+        return "skip", None
+    return "ok", snap
+
+
+
+
+
+def _fill_targets_from_measured(
+    measured: list[_MeasuredFillVolume],
+) -> list:
+    """Input: measured volumes. Output: FillTarget list oldest first."""
+    from oddarchiver.session import FillTarget
+
+    targets = []
+    for snap in sorted(measured, key=lambda item: item.volume_index):
+        if getattr(snap.disc_info, "appendable", True) is False:
+            continue
+        targets.append(FillTarget(
+            volume_index=snap.volume_index,
+            disc_info=snap.disc_info,
+            prior_file_count=snap.prior_file_count,
+        ))
+    return targets
+
+
+def _restage_fill_marker(
+    staging: Path, marker: object, session_n: int, listed: list[int],
+) -> object:
+    """Input: staging root and fill target identity. Output: restaged VolumeMarker."""
+    from oddarchiver.volume import VolumeMarker, compact_session_ranges, write_volume_marker
+
+    sessions = set(listed or [])
+    sessions.add(session_n)
+    updated = VolumeMarker(
+        archive_id=marker.archive_id,
+        volume_index=marker.volume_index,
+        first_session=marker.first_session,
+        created_at=marker.created_at,
+        previous_volume_label=marker.previous_volume_label,
+        format=getattr(marker, "format", 2),
+        session_ranges=compact_session_ranges(sessions),
+    )
+    write_volume_marker(staging, updated)
+    return updated
+
+
+
+def _layout_ranges_from_space(space: dict, fill_index: int, session_n: int) -> dict[str, list[list[int]]]:
+    """Input: space map, fill volume, new session. Output: layout session_ranges."""
+    from oddarchiver.volume import compact_session_ranges
+
+    ranges: dict[str, list[list[int]]] = {}
+    for index, disc in space.items():
+        sessions = set()
+        if disc.session_ranges:
+            for first, last in disc.session_ranges:
+                sessions.update(range(first, last + 1))
+        elif disc.first_session is not None and disc.last_session is not None:
+            sessions.update(range(disc.first_session, disc.last_session + 1))
+        if index == fill_index:
+            sessions.add(session_n)
+        if sessions:
+            ranges[str(index)] = compact_session_ranges(sessions)
+    if str(fill_index) not in ranges:
+        ranges[str(fill_index)] = compact_session_ranges({session_n})
+    return ranges
+
+
+def _manifests_by_volume(
+    history: list[Manifest], archive_id: str, fill_index: int,
+) -> dict[int, list[Manifest]]:
+    """Input: all known manifests and fill target. Output: manifests grouped by volume."""
+    session_to_vol: dict[int, int] = {}
+    for index, sessions in remembered_volume_sessions(archive_id).items():
+        for session in sessions:
+            session_to_vol[session] = index
+    grouped: dict[int, list[Manifest]] = {}
+    for manifest in history:
+        volume_index = session_to_vol.get(manifest.session, fill_index)
+        grouped.setdefault(volume_index, []).append(manifest)
+    return grouped
+
+
+def _staged_fill_manifest(
+    staging: Path, session_n: int, crypto: "CryptoBackend",
+) -> Manifest | None:
+    """Input: fill staging and session. Output: staged manifest, or None."""
+    from oddarchiver.crypto import NullCrypto
+
+    session_dir = staging / f"session_{session_n:03d}"
+    encrypted = crypto is not None and not isinstance(crypto, NullCrypto)
+    name = "manifest.enc" if encrypted else "manifest.json"
+    path = session_dir / name
+    if not path.is_file():
+        return None
+    try:
+        return read_manifest(path, crypto=crypto, slot=session_n)
+    except (OSError, ValueError, TypeError):
+        _log.exception("Cannot read staged fill manifest for session %s", session_n)
+        return None
+
+
+def _restage_fill_catalog(
+    staging: Path, marker: object, session_n: int, listed: list[int],
+    history: list[Manifest], baseline: object, crypto: "CryptoBackend",
+    space: dict, not_stubbed: list[int],
+) -> object:
+    """Input: fill staging and catalog context. Output: catalog snapshot."""
+    from oddarchiver.volume import ArchiveLayout, build_catalog_snapshot
+    from oddarchiver.volume import write_layout_stub, write_volume_baseline
+
+    updated = _restage_fill_marker(staging, marker, session_n, listed)
+    fill_index = marker.volume_index
+    layout = ArchiveLayout(
+        highest_session=session_n,
+        highest_session_volume=fill_index,
+        session_ranges=_layout_ranges_from_space(space, fill_index, session_n),
+        not_stubbed=sorted(not_stubbed),
+    )
+    records = [volume_record_from_disc(space[i]) for i in sorted(space)]
+    grouped = _manifests_by_volume(history, marker.archive_id, fill_index)
+    staged = _staged_fill_manifest(staging, session_n, crypto)
+    if staged is not None:
+        grouped.setdefault(fill_index, []).append(staged)
+    snapshot = build_catalog_snapshot(baseline, grouped, records, layout)
+    write_volume_baseline(staging, snapshot, crypto, marker)
+    write_layout_stub(staging, snapshot, crypto, updated)
+    return snapshot
+
+
+
+
+def _lookup_measured(
+    measured: list[_MeasuredFillVolume], volume_index: int,
+) -> _MeasuredFillVolume | None:
+    """Input: snapshots and index. Output: matching snapshot, or None."""
+    for snap in measured:
+        if snap.volume_index == volume_index:
+            return snap
+    return None
+
 
 
 def _print_rescue_code_once(crypto: "CryptoBackend") -> None:
@@ -2322,6 +3283,136 @@ def _volume_iso_origin(
     return iso_origin, backend.disc_size
 
 
+def _swap_loaded_if_empty_first_chunk(
+    i: int,
+    is_new_volume: bool,
+    backend: "BurnBackend",
+    crypto: "CryptoBackend",
+    label: str,
+    base_volume_index: int,
+    new_volumes_swapped: int,
+    iso_origin: Path | None,
+    iso_disc_size: int | None,
+    pending_baseline: object,
+    previous_volume_label: str,
+) -> tuple["BurnBackend", object, str, int, bool]:
+    """Swap off the loaded disc when the first chunk needs a new volume."""
+    if i != 0 or not is_new_volume:
+        return (
+            backend, pending_baseline, previous_volume_label,
+            new_volumes_swapped, True,
+        )
+    # Staging placed nothing on the loaded medium. Swap before
+    # the first burn so no empty session is appended to it.
+    swapped, pending_baseline, previous_volume_label, swap_ok = (
+        _prepare_next_volume(
+            backend, crypto, label, base_volume_index,
+            new_volumes_swapped, iso_origin, iso_disc_size,
+        )
+    )
+    if not swap_ok:
+        return (
+            backend, pending_baseline, previous_volume_label,
+            new_volumes_swapped, False,
+        )
+    return (
+        swapped, pending_baseline, previous_volume_label,
+        new_volumes_swapped + 1, True,
+    )
+
+
+def _burn_one_volume_chunk(
+    i: int,
+    staging: Path,
+    session_n: int,
+    is_new_volume: bool,
+    chunks_len: int,
+    backend: "BurnBackend",
+    previous_volume_label: str,
+    new_volumes_swapped: int,
+    pending_baseline: object,
+    iso_origin: Path | None,
+    iso_disc_size: int | None,
+    *,
+    command: str,
+    label: str,
+    enc_block: dict,
+    crypto: "CryptoBackend",
+    cache: CacheManager,
+    verify_mod: object,
+    mirror_backend: "BurnBackend | None",
+    archive_id: str,
+    base_volume_index: int,
+    chunk0_first_session: int,
+    write_chunk0_marker: bool,
+    chunk0_use_init: bool,
+    chunk0_expected_session_count: int,
+    expected_archive_id: str | None,
+    expected_volume_index: int | None,
+    slow: bool,
+) -> tuple[int, "BurnBackend", str, int, object]:
+    """Burn one staged chunk. Output: rc, backend, previous label, swap count, baseline."""
+    backend, pending_baseline, previous_volume_label, new_volumes_swapped, swap_ok = (
+        _swap_loaded_if_empty_first_chunk(
+            i, is_new_volume, backend, crypto, label, base_volume_index,
+            new_volumes_swapped, iso_origin, iso_disc_size,
+            pending_baseline, previous_volume_label,
+        )
+    )
+    if not swap_ok:
+        return 1, backend, previous_volume_label, new_volumes_swapped, pending_baseline
+    _write_chunk_marker(
+        staging, session_n, i, is_new_volume, write_chunk0_marker,
+        archive_id, base_volume_index, new_volumes_swapped,
+        chunk0_first_session, previous_volume_label, pending_baseline,
+        crypto,
+    )
+    (
+        marker_first_session, use_init, expected, chunk_mirror,
+        burn_archive_id, burn_volume_index,
+    ) = _chunk_burn_options(
+        is_new_volume, session_n, chunk0_first_session, chunk0_use_init,
+        chunk0_expected_session_count, mirror_backend,
+        expected_archive_id, expected_volume_index,
+    )
+    drives = [_backend_id(backend)]
+    if chunk_mirror is not None:
+        drives.append(_backend_id(chunk_mirror))
+    rc = _burn_verify_commit(
+        command,
+        staging,
+        session_n,
+        backend,
+        label,
+        enc_block,
+        drives,
+        crypto,
+        cache,
+        verify_mod,
+        use_init,
+        expected,
+        chunk_mirror,
+        marker_first_session,
+        expected_archive_id=burn_archive_id,
+        expected_volume_index=burn_volume_index,
+        slow=slow,
+    )
+    if rc != 0:
+        return rc, backend, previous_volume_label, new_volumes_swapped, pending_baseline
+    if command == "init":
+        _print_rescue_code_once(crypto)
+    if i < chunks_len - 1:
+        swapped, pending_baseline, previous_volume_label, swap_ok = _prepare_next_volume(
+            backend, crypto, label, base_volume_index, new_volumes_swapped,
+            iso_origin, iso_disc_size,
+        )
+        if not swap_ok:
+            return 1, backend, previous_volume_label, new_volumes_swapped, pending_baseline
+        backend = swapped
+        new_volumes_swapped += 1
+    return 0, backend, previous_volume_label, new_volumes_swapped, pending_baseline
+
+
 def _burn_volume_chunks(
     chunks: list[tuple[Path, int, bool]],
     backend: "BurnBackend",
@@ -2373,6 +3464,9 @@ def _burn_volume_chunks(
         the next .vol{k}.iso. DiscBackend prompts. 'q' stops the loop with
         already-committed chunks left intact. This function removes every
         staging dir in finally. Multi-volume plus --mirror raises RuntimeError.
+        A first chunk marked is_new_volume means staging placed nothing
+        on the loaded medium, so the code swaps before that burn and
+        never appends an empty session to the loaded disc.
 
         Append of an existing volume passes expected identity into
         _burn_verify_commit. Blank-disc init (use_init) does not.
@@ -2391,60 +3485,31 @@ def _burn_volume_chunks(
                 "multi-volume disc-swap combined with --mirror is not yet supported"
             )
         for i, (staging, session_n, is_new_volume) in enumerate(chunks):
-            _write_chunk_marker(
-                staging, session_n, i, is_new_volume, write_chunk0_marker,
-                archive_id, base_volume_index, new_volumes_swapped,
-                chunk0_first_session, previous_volume_label, pending_baseline,
-                crypto,
-            )
-
-            (
-                marker_first_session, use_init, expected, chunk_mirror,
-                burn_archive_id, burn_volume_index,
-            ) = _chunk_burn_options(
-                is_new_volume, session_n, chunk0_first_session, chunk0_use_init,
-                chunk0_expected_session_count, mirror_backend,
-                expected_archive_id, expected_volume_index,
-            )
-
-            drives = [_backend_id(backend)]
-            if chunk_mirror is not None:
-                drives.append(_backend_id(chunk_mirror))
-
-            rc = _burn_verify_commit(
-                command,
-                staging,
-                session_n,
-                backend,
-                label,
-                enc_block,
-                drives,
-                crypto,
-                cache,
-                verify_mod,
-                use_init,
-                expected,
-                chunk_mirror,
-                marker_first_session,
-                expected_archive_id=burn_archive_id,
-                expected_volume_index=burn_volume_index,
-                slow=slow,
+            rc, backend, previous_volume_label, new_volumes_swapped, pending_baseline = (
+                _burn_one_volume_chunk(
+                    i, staging, session_n, is_new_volume, len(chunks),
+                    backend, previous_volume_label, new_volumes_swapped,
+                    pending_baseline, iso_origin, iso_disc_size,
+                    command=command,
+                    label=label,
+                    enc_block=enc_block,
+                    crypto=crypto,
+                    cache=cache,
+                    verify_mod=verify_mod,
+                    mirror_backend=mirror_backend,
+                    archive_id=archive_id,
+                    base_volume_index=base_volume_index,
+                    chunk0_first_session=chunk0_first_session,
+                    write_chunk0_marker=write_chunk0_marker,
+                    chunk0_use_init=chunk0_use_init,
+                    chunk0_expected_session_count=chunk0_expected_session_count,
+                    expected_archive_id=expected_archive_id,
+                    expected_volume_index=expected_volume_index,
+                    slow=slow,
+                )
             )
             if rc != 0:
                 return rc, backend
-            if command == "init":
-                _print_rescue_code_once(crypto)
-
-
-            if i < len(chunks) - 1:
-                swapped, pending_baseline, previous_volume_label, swap_ok = _prepare_next_volume(
-                    backend, crypto, label, base_volume_index, new_volumes_swapped,
-                    iso_origin, iso_disc_size,
-                )
-                if not swap_ok:
-                    return 1, backend
-                backend = swapped
-                new_volumes_swapped += 1
         return 0, backend
     finally:
         for staging, _session_n, _is_new in chunks:
@@ -2509,6 +3574,49 @@ def _mask_diff_to_group(
     return masked
 
 
+def _scan_skip_path(path: Path, root: Path) -> str | None:
+    """Input: candidate path and source root. Output: skipped relative path or None."""
+    import stat as stat_mod
+
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        _log.warning("Scan cannot inspect %s: %s", path, exc)
+        return str(path.relative_to(root))
+    if stat_mod.S_ISLNK(info.st_mode) and not path.is_file():
+        _log.warning("Scan skips dangling symlink %s", path)
+        return str(path.relative_to(root))
+    mode = info.st_mode
+    if stat_mod.S_ISLNK(mode):
+        return None
+    if not (stat_mod.S_ISREG(mode) or stat_mod.S_ISDIR(mode)):
+        _log.warning("Scan skips non-regular file %s", path)
+        return str(path.relative_to(root))
+    if stat_mod.S_ISREG(mode) and not os.access(path, os.R_OK):
+        _log.warning("Scan skips unreadable file %s", path)
+        return str(path.relative_to(root))
+    return None
+
+
+def _scan_skips(root: Path, staging: Path | None, candidates: list[Path]) -> list[str]:
+    """
+    Input:  source root, optional staging tree, and candidate paths from rglob
+    Output: sorted source-relative paths the scan cannot archive
+    Details:
+        A dangling symlink, FIFO, socket, or unreadable file silently
+        dropped the path before. Report each one. Paths inside staging
+        are bookkeeping, not skips.
+    """
+    skipped: list[str] = []
+    for path in candidates:
+        if staging is not None and path.is_relative_to(staging):
+            continue
+        reason = _scan_skip_path(path, root)
+        if reason is not None:
+            skipped.append(reason)
+    return sorted(set(skipped))
+
+
 def _scan_source_with_progress(source: Path) -> dict[str, str]:
     """
     Input:  source - source directory to scan
@@ -2516,21 +3624,46 @@ def _scan_source_with_progress(source: Path) -> dict[str, str]:
     Details:
         Walks the source in sorted order, hashes every file, and prints
         a per-file progress bar. Prints a final newline when any file exists.
+        Warns per skipped path (dangling symlink, FIFO, socket, unreadable
+        file) and prints a skipped count.
     """
     import hashlib
     from oddarchiver.session import _print_bar
 
     print(f"Scanning {source} ...", flush=True)
     source_files = sorted(f for f in source.rglob("*") if f.is_file())
+    skipped = _scan_skips(source, None, sorted(source.rglob("*")))
+    for rel in skipped:
+        print(f"  warning: skipped {rel}", flush=True)
+    if skipped:
+        print(f"  skipped {len(skipped)} path(s) that cannot be archived.", flush=True)
     total_files = len(source_files)
+    skipped_set = set(skipped)
     print(f"  {total_files} file(s) found. Hashing...", flush=True)
     current_state: dict[str, str] = {}
-    for i, sf in enumerate(source_files, 1):
+    done = 0
+    for sf in source_files:
         rel = str(sf.relative_to(source))
-        current_state[rel] = hashlib.sha256(sf.read_bytes()).hexdigest()
-        _print_bar(i, total_files, suffix=rel)
+        if rel in skipped_set:
+            continue
+        try:
+            data = sf.read_bytes()
+        except OSError as exc:
+            _log.warning("Scan skips unreadable file %s: %s", sf, exc)
+            skipped_set.add(rel)
+            print(f"  warning: skipped {rel} (unreadable: {exc})", flush=True)
+            continue
+        done += 1
+        current_state[rel] = hashlib.sha256(data).hexdigest()
+        _print_bar(done, total_files, suffix=rel)
     if total_files:
         print()
+    if len(skipped_set) > len(skipped):
+        print(
+            f"  skipped {len(skipped_set) - len(skipped)} more unreadable "
+            "path(s).",
+            flush=True,
+        )
     return current_state
 
 
@@ -2538,26 +3671,40 @@ def _check_init_ledger(args: argparse.Namespace, backend: "BurnBackend", init_la
     """
     Input:  args - parsed init namespace; backend - target disc; init_label - disc label
     Output: None
+    Details:
+        A legacy label-keyed ledger row can belong to any archive that
+        used this label. Refuse only when a local archive record binds
+        init_label to a known archive; a blank disc with a recycled
+        label starts a new archive without --recover-scan.
     """
+    from oddarchiver.catalog import archive_ids_with_label
     from oddarchiver.ledger import load_ledger
 
     ledger = load_ledger(init_label, _backend_id(backend))
-    if ledger is not None and ledger.confirmed_sessions > 0:
-        if not getattr(args, "recover_scan", False):
-            msg = (
-                f"init: ledger records {ledger.confirmed_sessions} confirmed "
-                f"session(s) for {init_label!r} but the disc looks empty. "
-                "This is a read failure, not a new archive. Retry after "
-                "eject/reinsert, or pass --recover-scan if you have confirmed "
-                "the disc is genuinely blank."
-            )
-            _log.error("%s", msg)
-            raise RuntimeError(msg)
-        _log.warning(
-            "recover-scan: proceeding with init despite ledger "
-            "confirmed_sessions=%d for %r",
-            ledger.confirmed_sessions, init_label,
+    if ledger is None or ledger.confirmed_sessions <= 0:
+        return
+    if not archive_ids_with_label(init_label):
+        _log.info(
+            "init: label %r appears in the ledger but no local archive "
+            "record binds it; treating the blank disc as a new archive",
+            init_label,
         )
+        return
+    if not getattr(args, "recover_scan", False):
+        msg = (
+            f"init: ledger records {ledger.confirmed_sessions} confirmed "
+            f"session(s) for {init_label!r} but the disc looks empty. "
+            "This is a read failure, not a new archive. Retry after "
+            "eject/reinsert, or pass --recover-scan if you have confirmed "
+            "the disc is genuinely blank."
+        )
+        _log.error("%s", msg)
+        raise RuntimeError(msg)
+    _log.warning(
+        "recover-scan: proceeding with init despite ledger "
+        "confirmed_sessions=%d for %r",
+        ledger.confirmed_sessions, init_label,
+    )
 
 
 def _stage_init_group(
@@ -2603,6 +3750,7 @@ def _stage_init_group(
         volume_baseline=group_baseline,
         volume_marker=group_marker,
         volume_label=init_label,
+        split_large=getattr(args, "split_large", False),
     )
 
 
@@ -2668,6 +3816,29 @@ def _announce_init_groups(groups: list, stage_paths: set[str], source: Path, ses
         )
 
 
+def _require_readable_archive(backend: "BurnBackend") -> None:
+    """
+    Input:  backend - a medium whose MMC session count is above zero
+    Output: None; raises ValueError when no archive session can be read
+    Details:
+        A burn killed before it closed leaves an MMC session with no
+        readable ISO tree. init used to call that "already initialized"
+        and exit 0, so the user believed an archive existed.
+    """
+    try:
+        listed = backend.list_session_numbers()
+    except RuntimeError as exc:
+        _log.warning("init: cannot list sessions on a used disc: %s", exc)
+        listed = None
+    if not listed:
+        raise ValueError(
+            f"{_backend_id(backend)} holds a burned session but no readable "
+            "archive. The last burn was probably interrupted before it "
+            "closed. This disc cannot be initialized again; use a new "
+            "blank disc."
+        )
+
+
 def _run_init(args: argparse.Namespace) -> int:
     """
     Input:  args - parsed init namespace
@@ -2700,6 +3871,7 @@ def _run_init(args: argparse.Namespace) -> int:
     disc_info = backend.mediainfo()
 
     if disc_info.session_count > 0:
+        _require_readable_archive(backend)
         _log.warning("init: disc already initialized (%s); skipping.", _backend_id(backend))
         print("warning: disc already initialized; skipping init.", file=sys.stderr)
         return 0
@@ -2812,6 +3984,7 @@ def _load_sync_disc(
         args=args,
         disc_session_count=disc_info.session_count,
         command="sync",
+        marker=marker,
     )
     baseline = read_volume_baseline(
         backend, crypto, marker=marker, manifests=manifests,
@@ -2940,6 +4113,10 @@ def _stage_sync_group(
     chunk0_first_session: int,
     session_n: int,
     label: str,
+    fill_targets: list | None = None,
+    fill_chosen: list[int] | None = None,
+    inserted_volume_index: int | None = None,
+    split_prefixes: dict | None = None,
 ) -> list[tuple[Path, int, bool]]:
     """
     Input:  args, session_mod, group_paths, group_index and the sync run state
@@ -2967,6 +4144,11 @@ def _stage_sync_group(
             volume_baseline=baseline,
             volume_marker=marker,
             volume_label=label,
+            split_large=getattr(args, "split_large", False),
+            fill_targets=fill_targets,
+            fill_chosen=fill_chosen,
+            inserted_volume_index=inserted_volume_index,
+            split_prefixes=split_prefixes,
         )
 
 
@@ -2986,15 +4168,18 @@ def _burn_sync_group(
     session_n: int,
     expected_archive_id: str | None,
     expected_volume_index: int | None,
+    chunk0_expected_session_count: int | None = None,
 ) -> "tuple[int, BurnBackend]":
     """
     Input:  chunks and the sync run state for one group
     Output: (exit code, active backend after any media swap)
     """
-    # session_n is first_session + len(manifests), the same quantity
-    # _guard re-reads. MMC session_count is not: BD-R SRM+POW
-    # reports 1 after every append.
-    chunk0_expected_session_count = session_n
+    # session_n is first_session + len(manifests) on an unfilled newest
+    # disc. MMC session_count is not: BD-R SRM+POW reports 1 after every
+    # append. A fill append onto an older disc passes the listing count
+    # of that disc instead.
+    if chunk0_expected_session_count is None:
+        chunk0_expected_session_count = session_n
     return _burn_volume_chunks(
         chunks,
         backend,
@@ -3015,6 +4200,82 @@ def _burn_sync_group(
         expected_volume_index=expected_volume_index,
         slow=getattr(args, "slow", False),
     )
+
+
+def _fill_not_stubbed(
+    archive_id: str, fill_index: int, newest_index: int | None,
+    newest_not_stubbed: bool,
+) -> list[int]:
+    """Input: fill and newest indices. Output: volumes that will not get a stub."""
+    indices = [
+        index for index in _fill_candidate_indices(archive_id, fill_index)
+        if index != fill_index
+    ]
+    if newest_not_stubbed or newest_index is None:
+        return sorted(indices)
+    return sorted(index for index in indices if index != newest_index)
+
+
+def _resolve_fill_burn(
+    chunks: list[tuple[Path, int, bool]],
+    measured: list[_MeasuredFillVolume],
+    fill_chosen: list[int],
+    backend: "BurnBackend",
+    base_volume_index: int,
+    chunk0_first_session: int,
+    expected_archive_id: str | None,
+    expected_volume_index: int | None,
+    session_n: int,
+    inserted_index: int | None,
+    history: list[Manifest],
+    baseline: object,
+    crypto: "CryptoBackend",
+    space: dict,
+    newest_not_stubbed: bool = False,
+) -> tuple["BurnBackend", int, int, str | None, int | None, int, bool, object]:
+    """
+    Input: staged chunks and measured fill volumes
+    Output: burn backend, overflow base, first session, identity, expected
+            count, whether the burn leaves the inserted disc, and snapshot
+    """
+    if not fill_chosen or not chunks:
+        return (
+            backend, base_volume_index, chunk0_first_session,
+            expected_archive_id, expected_volume_index, session_n, False, None,
+        )
+    snap = _lookup_measured(measured, fill_chosen[-1])
+    if snap is None:
+        return (
+            backend, base_volume_index, chunk0_first_session,
+            expected_archive_id, expected_volume_index, session_n, False, None,
+        )
+    not_stubbed = _fill_not_stubbed(
+        snap.marker.archive_id, snap.volume_index, inserted_index,
+        newest_not_stubbed,
+    )
+    snapshot = _restage_fill_catalog(
+        chunks[0][0], snap.marker, chunks[0][1], snap.sessions,
+        history, baseline, crypto, space, not_stubbed,
+    )
+    switched = (
+        inserted_index is not None and snap.volume_index != inserted_index
+    )
+    overflow_base = base_volume_index
+    if switched:
+        highest = highest_seen_volume(snap.marker.archive_id)
+        if highest is not None:
+            overflow_base = highest
+    expected_count = archive_session_count(
+        snap.backend, listed=list(snap.sessions),
+    )
+    return (
+        snap.backend, overflow_base, snap.marker.first_session,
+        snap.marker.archive_id, snap.volume_index, expected_count, switched,
+        snapshot,
+    )
+
+
+
 
 
 def _refresh_sync_volume(
@@ -3059,6 +4320,1459 @@ def _sync_volume_identity(
     )
 
 
+def _apply_sync_prefill(args: argparse.Namespace, backend: "BurnBackend") -> None:
+    """Input: sync args and backend. Output: None; applies --prefill to an ISO backend."""
+    prefill = getattr(args, "prefill", None)
+    if prefill:
+        if isinstance(backend, ISOBackend):
+            backend.prefill(parse_disc_size(prefill))
+
+
+def _holder_disc_name(volume_index: int, label: str | None) -> str:
+    """Input: volume index and label. Output: name for a refusal message."""
+    shown = safe_display(label) if label else "ARCHIVE"
+    return f"{shown} (volume {volume_index})"
+
+
+def _inserted_session_max(backend: "BurnBackend | None", marker: object) -> int:
+    """Input: backend and marker. Output: highest session on the inserted disc."""
+    if backend is not None:
+        listed = _backend_session_numbers(backend)
+        if listed:
+            return max(listed)
+    if marker is None:
+        return -1
+    return marker.first_session
+
+
+def _memory_session_holder(archive_id: str) -> tuple[int, int, str] | None:
+    """Input: archive id. Output: (last session, volume index, label) or None."""
+    holder = disc_holding_highest_session(archive_id)
+    if holder is None or holder.volume_index is None:
+        return None
+    sessions = remembered_volume_sessions(archive_id).get(holder.volume_index, set())
+    if not sessions:
+        return None
+    return max(sessions), holder.volume_index, holder.label
+
+
+def _iso_volume_session_max(
+    backend: "BurnBackend", marker: object, volume_index: int,
+) -> tuple[int, str] | None:
+    """Input: ISO backend, marker, volume. Output: (last session, label) or None."""
+    origin, disc_size = _volume_iso_origin(backend, marker.volume_index)
+    if origin is None:
+        return None
+    path = _fill_iso_path(origin, volume_index)
+    if volume_index != marker.volume_index and not path.is_file():
+        return None
+    if volume_index == marker.volume_index:
+        other = backend
+    else:
+        other = ISOBackend(path, disc_size=disc_size)
+    numbers = other.list_session_numbers()
+    if not numbers:
+        return None
+    discs = remembered_discs(marker.archive_id)
+    label = discs[volume_index].label if volume_index in discs else "ARCHIVE"
+    return max(numbers), label
+
+
+def _iso_scan_session_holder(
+    backend: "BurnBackend | None", marker: object,
+) -> tuple[int, int, str] | None:
+    """Input: backend and marker. Output: ISO sibling with the highest session."""
+    if backend is None or marker is None or not isinstance(backend, ISOBackend):
+        return None
+    best: tuple[int, int, str] | None = None
+    for index in range(0, marker.volume_index + 32):
+        found = _iso_volume_session_max(backend, marker, index)
+        if found is None:
+            if index > marker.volume_index:
+                break
+            continue
+        last, label = found
+        if best is None or last > best[0]:
+            best = (last, index, label)
+    return best
+
+
+def _stale_catalog_holder(
+    backend: "BurnBackend | None", marker: object,
+) -> tuple[int, int, str] | None:
+    """Input: backend and marker. Output: other disc if its session beats this one."""
+    if marker is None:
+        return None
+    inserted_last = _inserted_session_max(backend, marker)
+    memory = _memory_session_holder(marker.archive_id)
+    if memory is not None and memory[1] == marker.volume_index:
+        memory = None
+    iso = _iso_scan_session_holder(backend, marker)
+    if iso is not None and iso[1] == marker.volume_index:
+        iso = None
+    holders = [item for item in (memory, iso) if item is not None]
+    if not holders:
+        return None
+    holder = max(holders, key=lambda item: item[0])
+    if holder[0] <= inserted_last:
+        return None
+    return holder
+
+
+
+def _baseline_sessions(baseline: object) -> set[int]:
+    """Input: volume baseline or None. Output: sessions already in that snapshot."""
+    from oddarchiver.volume import baseline_covered_sessions
+
+    return baseline_covered_sessions(baseline)
+
+
+def _snapshot_highest(snapshot: object) -> int:
+    """Input: catalog snapshot. Output: highest session it names, or -1."""
+    if snapshot is None:
+        return -1
+    highs = list(_baseline_sessions(snapshot))
+    layout = getattr(snapshot, "layout", None)
+    if layout is not None:
+        highs.append(layout.highest_session)
+    return max(highs) if highs else -1
+
+
+def _best_snapshot(baseline: object, stub: object) -> object:
+    """Input: volume_baseline and layout stub. Output: the newer complete snapshot."""
+    if stub is None:
+        return baseline
+    if baseline is None:
+        return stub
+    if _snapshot_highest(stub) >= _snapshot_highest(baseline):
+        return stub
+    return baseline
+
+
+def _covered_sessions(manifests: list[Manifest], snapshot: object) -> set[int]:
+    """Input: disc manifests and snapshot. Output: sessions this disc can supply."""
+    have = {m.session for m in manifests if not m.suspect}
+    have |= _baseline_sessions(snapshot)
+    return have
+
+
+def _highest_known(
+    marker: object, manifests: list[Manifest], snapshot: object,
+) -> int:
+    """Input: marker, manifests, snapshot. Output: highest session this host knows."""
+    highs = list(_covered_sessions(manifests, snapshot))
+    layout = getattr(snapshot, "layout", None) if snapshot is not None else None
+    if layout is not None:
+        highs.append(layout.highest_session)
+    if marker is not None:
+        inserted = marker.volume_index
+        for index, sessions in remembered_volume_sessions(marker.archive_id).items():
+            if index == inserted:
+                continue
+            highs.extend(sessions)
+    return max(highs) if highs else -1
+
+
+def _holder_session_covered(
+    holder: tuple[int, int, str] | None, manifests: list[Manifest],
+    snapshot: object,
+) -> bool:
+    """Input: stale holder and snapshot. Output: True when this disc already covers it."""
+    if holder is None:
+        return True
+    have = _covered_sessions(manifests, snapshot)
+    if holder[0] in have:
+        return True
+    return holder[0] <= _snapshot_highest(snapshot)
+
+
+def _baseline_is_complete(
+    marker: object, manifests: list[Manifest], snapshot: object,
+    backend: "BurnBackend | None" = None,
+) -> bool:
+    """
+    Input: disc context and optional backend
+    Output: True when other-volume sessions are covered
+    Details:
+        Sessions the ledger places on the inserted disc stay with
+        recover-scan when they read as torn. Only a different
+        volume_index is a baseline gap.
+    """
+    if _memory_gap_sessions(marker, manifests, snapshot):
+        return False
+    holder = _stale_catalog_holder(backend, marker)
+    return _holder_session_covered(holder, manifests, snapshot)
+
+
+def _memory_gap_sessions(
+    marker: object, manifests: list[Manifest], baseline: object,
+) -> set[int]:
+    """Input: marker, manifests, baseline. Output: other-volume sessions still missing."""
+    if marker is None:
+        return set()
+    have = _covered_sessions(manifests, baseline)
+    needed: set[int] = set()
+    inserted = marker.volume_index
+    for index, sessions in remembered_volume_sessions(marker.archive_id).items():
+        if index == inserted:
+            continue
+        needed |= sessions
+    return needed - have
+
+
+
+
+def _holder_from_layout(snapshot: object) -> tuple[int, int, str] | None:
+    """Input: snapshot. Output: layout holder if the layout names a volume."""
+    layout = getattr(snapshot, "layout", None) if snapshot is not None else None
+    if layout is None:
+        return None
+    return (
+        layout.highest_session, layout.highest_session_volume, "ARCHIVE",
+    )
+
+
+def _prepare_sync_baseline(
+    backend: "BurnBackend", crypto: "CryptoBackend", marker: object,
+    manifests: list[Manifest], fill_on: bool, baseline: object = None,
+) -> tuple[list[Manifest], list[Manifest], object] | None:
+    """Input: loaded disc and fill flag. Output: (manifests, extra, snapshot) or None."""
+    from oddarchiver.volume import BaselineReadError, read_layout_stub
+
+    stub = None
+    try:
+        stub = read_layout_stub(backend, crypto, marker)
+    except BaselineReadError:
+        _log.exception("Cannot read layout_stub on the inserted disc")
+    snapshot = _best_snapshot(baseline, stub)
+    if _baseline_is_complete(marker, manifests, snapshot, backend):
+        return manifests, [], snapshot
+    holder = _stale_catalog_holder(backend, marker) or _holder_from_layout(snapshot)
+    missing = _memory_gap_sessions(marker, manifests, snapshot)
+    _print_need_catalog_disc(marker, holder, fill_on, missing)
+    return None
+
+
+
+def _catalog_gap_sessions_text(missing: set[int]) -> str:
+    """Input: missing session numbers. Output: text for the refusal line."""
+    if not missing:
+        return "unknown"
+    return ", ".join(str(n) for n in sorted(missing))
+
+
+def _inserted_holds_highest(
+    marker: object, holder: tuple[int, int, str] | None,
+) -> bool:
+    """Input: marker and named holder. Output: True when no other disc is newer."""
+    if holder is None:
+        return True
+    if marker is None:
+        return True
+    return holder[1] == marker.volume_index
+
+
+def _print_incomplete_own_catalog(fill_on: bool, missing: set[int]) -> None:
+    """Input: fill flag and missing sessions. Output: None; prints own-disc gap."""
+    sessions = _catalog_gap_sessions_text(missing)
+    print(
+        "error: This disc holds the highest session but cannot supply a "
+        "complete catalog.",
+        file=sys.stderr,
+    )
+    print(
+        "It was written by an older build, or it is missing its snapshot "
+        "or layout stub.",
+        file=sys.stderr,
+    )
+    print(f"Missing sessions: {sessions}.", file=sys.stderr)
+    if fill_on:
+        print(
+            "Run sync --fill after you insert a disc that has a complete "
+            "catalog snapshot or layout stub.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Insert a disc that has a complete catalog snapshot or layout "
+            "stub, or wait for --fill.",
+            file=sys.stderr,
+        )
+    print(
+        "For an archive that a build before snapshots created, continue "
+        "with that build.",
+        file=sys.stderr,
+    )
+
+
+def _print_need_catalog_disc(
+    marker: object, holder: tuple[int, int, str] | None, fill_on: bool,
+    missing: set[int] | None = None,
+) -> int:
+    """Input: marker, holder, fill flag, missing sessions. Output: 1 after print."""
+    gaps = missing if missing is not None else set()
+    if _inserted_holds_highest(marker, holder):
+        _print_incomplete_own_catalog(fill_on, gaps)
+        _log.error(
+            "sync refused on volume %s; inserted disc lacks a complete catalog",
+            getattr(marker, "volume_index", None),
+        )
+        return 1
+    name = _holder_disc_name(holder[1], holder[2])
+    if fill_on:
+        print(
+            "error: Fill needs the newest catalog disc. "
+            f"Insert {name}.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "error: This disc is an older volume of the archive. "
+            f"Insert {name}, or wait for --fill.",
+            file=sys.stderr,
+        )
+    _log.error(
+        "sync refused on volume %s; insert %s",
+        getattr(marker, "volume_index", None), name,
+    )
+    return 1
+
+
+def _refuse_sync_catalog(
+    marker: object, fill_on: bool, backend: "BurnBackend | None",
+    extra: list[Manifest] | None,
+) -> int | None:
+    """Input: marker, fill flag, backend, extra manifests. Output: 1 or None."""
+    if extra is not None:
+        return None
+    if marker is None:
+        return None
+    holder = _stale_catalog_holder(backend, marker)
+    return _print_need_catalog_disc(marker, holder, fill_on)
+
+
+
+
+def _require_initialized_disc(
+    disc_info: object, backend: "BurnBackend",
+) -> int | None:
+    """Input: disc info and backend. Output: 1 when uninitialized, else None."""
+    if disc_info.session_count == 0:
+        _log.error("sync: disc not initialized (%s)", _backend_id(backend))
+        print("error: disc not initialized; run 'init' first.", file=sys.stderr)
+        return 1
+    return None
+
+
+def _planned_file_sizes(source: Path, groups: list) -> list[int]:
+    """Input: source root and path groups. Output: size of each planned file."""
+    sizes: list[int] = []
+    for group in groups:
+        for rel in group:
+            path = source / rel
+            try:
+                if path.is_file():
+                    sizes.append(path.stat().st_size)
+            except OSError:
+                _log.warning("Cannot stat planned path %s", rel)
+    return sizes
+
+
+def _min_planned_blob_bytes(source: Path, groups: list) -> int:
+    """Input: source root and path groups. Output: smallest planned file size."""
+    sizes = _planned_file_sizes(source, groups)
+    return min(sizes) if sizes else 1
+
+
+def _planned_source_bytes(source: Path, groups: list) -> int:
+    """Input: source root and path groups. Output: sum of planned file sizes."""
+    return sum(_planned_file_sizes(source, groups))
+
+
+def _space_disc_info(rec: object) -> object:
+    """Input: remembered volume record. Output: DiscInfo for fill packing."""
+    from oddarchiver.disc import DiscInfo
+
+    remaining = rec.remaining_bytes
+    return DiscInfo(
+        session_count=1,
+        remaining_bytes=remaining or 0,
+        used_bytes=rec.used_bytes or 0,
+        label=rec.label or "",
+        appendable=rec.appendable is not False,
+    )
+
+
+def _fill_target_from_record(
+    index: int, rec: object, inserted: _MeasuredFillVolume | None,
+) -> object | None:
+    """Input: volume index, space record, inserted snapshot. Output: FillTarget or None."""
+    from oddarchiver.session import FillTarget
+
+    if rec.appendable is False:
+        return None
+    if inserted is not None and index == inserted.volume_index:
+        return FillTarget(
+            volume_index=index,
+            disc_info=inserted.disc_info,
+            prior_file_count=inserted.prior_file_count,
+        )
+    remaining = rec.remaining_bytes
+    if remaining is not None and remaining < 1:
+        return None
+    return FillTarget(
+        volume_index=index,
+        disc_info=_space_disc_info(rec),
+        prior_file_count=rec.file_count or 0,
+    )
+
+
+def _recorded_fill_targets(
+    space: dict, inserted: _MeasuredFillVolume | None,
+) -> list:
+    """Input: space map and inserted snapshot. Output: FillTarget list."""
+    targets = []
+    for index in sorted(space):
+        target = _fill_target_from_record(index, space[index], inserted)
+        if target is not None:
+            targets.append(target)
+    return targets
+
+
+
+def _fill_disc_already_ready(
+    fill_chosen: list[int], marker: object, inserted_index: int | None,
+    backend: "BurnBackend",
+) -> bool:
+    """Input: chosen fill volume and loaded disc. Output: True when no swap is needed."""
+    if not fill_chosen or marker is None:
+        return True
+    if inserted_index is not None and fill_chosen[-1] == inserted_index:
+        return True
+    return isinstance(backend, ISOBackend)
+
+
+def _ensure_fill_disc_for_burn(
+    backend: "BurnBackend",
+    marker: object,
+    label: str,
+    fill_chosen: list[int],
+    measured: list[_MeasuredFillVolume],
+    inserted_index: int | None,
+) -> tuple[list[_MeasuredFillVolume], "BurnBackend"] | None:
+    """
+    Input: drive state and the volume that will receive the burn
+    Output: updated measured list and backend, or None on skip or abort
+    """
+    from oddarchiver.volume import read_volume_marker
+
+    if _fill_disc_already_ready(fill_chosen, marker, inserted_index, backend):
+        return measured, backend
+    want = fill_chosen[-1]
+    disc_label, remaining = _prompt_fields_from_record(
+        remembered_discs(marker.archive_id), want, label,
+    )
+    print(
+        f"Fill: insert volume {want} ({safe_display(disc_label)}) "
+        "for the planned burn.",
+        flush=True,
+    )
+    action = _prompt_fill_disc(
+        backend, marker.archive_id, want, disc_label, remaining,
+    )
+    if action != "ok":
+        return None
+    found = read_volume_marker(backend)
+    if found is None:
+        return None
+    snap = _snapshot_fill_volume(backend, found, disc_label)
+    if snap is None:
+        return None
+    rest = [item for item in measured if item.volume_index != want]
+    return rest + [snap], backend
+
+
+
+
+
+
+
+def _apply_burn_result(
+    rc: int, fill_switched: bool, last_backend: "BurnBackend",
+    backend: "BurnBackend",
+) -> tuple[int, "BurnBackend"]:
+    """Input: burn exit code and media-switch state. Output: exit code and active backend."""
+    if rc != 0:
+        return rc, backend
+    if not fill_switched:
+        backend = last_backend
+    return rc, backend
+
+
+def _refresh_after_sync_group(
+    group_index: int,
+    group_count: int,
+    fill_switched: bool,
+    backend: "BurnBackend",
+    crypto: "CryptoBackend",
+    marker: object,
+    manifests: list[Manifest],
+    baseline: object,
+    base_volume_index: int,
+    chunk0_first_session: int,
+    expected_archive_id: str | None,
+    expected_volume_index: int | None,
+) -> tuple[object, list[Manifest], object, int, int, str | None, int | None]:
+    """Input: group position and sync state. Output: refreshed volume state."""
+    if group_index < group_count - 1 and not fill_switched:
+        marker, manifests, baseline = _refresh_sync_volume(backend, crypto)
+        if marker is not None:
+            base_volume_index = marker.volume_index
+            chunk0_first_session = marker.first_session
+            expected_archive_id = marker.archive_id
+            expected_volume_index = marker.volume_index
+    return (
+        marker, manifests, baseline, base_volume_index, chunk0_first_session,
+        expected_archive_id, expected_volume_index,
+    )
+
+
+def _sync_diff_and_groups(
+    args: argparse.Namespace,
+    source: Path,
+    disc_state: dict[str, str],
+    disc_origin: dict[str, int],
+    backend: "BurnBackend",
+    crypto: "CryptoBackend",
+    manifests: list[Manifest],
+    session_mod: object,
+) -> tuple[dict[str, str], CacheManager, list] | None:
+    """Input: sync context. Output: scanned state, cache, and groups, or None when unchanged."""
+    current_state = _scan_source_with_progress(source)
+    diff = _diff_sync_source(current_state, disc_state)
+    if diff is None:
+        return None
+    paths, deleted_files = diff
+    cache = CacheManager()
+    groups = _sync_changes(
+        args, source, paths, deleted_files, current_state, disc_state,
+        disc_origin, backend, crypto, manifests, session_mod,
+    )
+    if groups is None:
+        return None
+    return current_state, cache, groups
+
+def _snapshot_with_not_stubbed(snapshot: object, not_stubbed: list[int]) -> object:
+    """Input: snapshot and not-stubbed volumes. Output: copy with that list."""
+    from oddarchiver.volume import ArchiveLayout, VolumeBaseline
+
+    layout = getattr(snapshot, "layout", None)
+    if layout is None or not isinstance(snapshot, VolumeBaseline):
+        return snapshot
+    new_layout = ArchiveLayout(
+        highest_session=layout.highest_session,
+        highest_session_volume=layout.highest_session_volume,
+        session_ranges=dict(layout.session_ranges),
+        not_stubbed=sorted(not_stubbed),
+    )
+    return VolumeBaseline(
+        snapshot.version, snapshot.volumes, snapshot.history,
+        snapshot.state, snapshot.origin, new_layout,
+    )
+
+
+def _append_root_stub(
+    backend: "BurnBackend", marker: object, label: str, write_fn,
+) -> bool:
+    """Input: disc, identity, label, staging writer. Output: True on append."""
+    from oddarchiver.session import _default_staging_root, remove_tree
+
+    staging = _default_staging_root() / f"oddarchiver_layout_stub_{marker.volume_index}"
+    try:
+        if staging.exists():
+            remove_tree(staging, "layout stub staging")
+        staging.mkdir(parents=True)
+        write_fn(staging)
+        listed = _backend_session_numbers(backend) or []
+        expected = archive_session_count(backend, listed=list(listed))
+        backend.invalidate_session_list()
+        check_volume_identity(backend, marker.archive_id, marker.volume_index)
+        backend.append(
+            staging, label, expected_session_count=expected,
+            expected_archive_id=marker.archive_id,
+            expected_volume_index=marker.volume_index,
+        )
+        backend.invalidate_session_list()
+        after = _backend_session_numbers(backend) or []
+        if after:
+            _record_volume_space_after_burn(
+                backend, max(after), label, marker.archive_id,
+                marker.volume_index, marker.first_session,
+            )
+        return True
+    except (RuntimeError, OSError, TypeError, AttributeError, ValueError) as exc:
+        _log.exception(
+            "Cannot write a stub session on volume %s", marker.volume_index,
+        )
+        if is_media_write_error(exc):
+            _record_stub_media_write_error(backend, marker, exc)
+            print(str(exc), file=sys.stderr)
+        return False
+    finally:
+        if staging.exists():
+            remove_tree(staging, "layout stub staging")
+
+
+def _append_layout_stub(
+    backend: "BurnBackend", marker: object, snapshot: object,
+    crypto: "CryptoBackend", label: str,
+) -> bool:
+    """Input: target disc and snapshot. Output: True when the stub append succeeds."""
+    from oddarchiver.volume import write_layout_stub
+
+    return _append_root_stub(
+        backend, marker, label,
+        lambda staging: write_layout_stub(staging, snapshot, crypto, marker),
+    )
+
+
+def _stub_candidate_indices(
+    space: dict, fill_index: int, skip_indices: set[int] | None = None,
+) -> list[int]:
+    """Input: space map, fill volume, skip set. Output: volumes that may take a stub."""
+    skip = set(skip_indices or ())
+    skip.add(fill_index)
+    indices: list[int] = []
+    for index in sorted(space):
+        if index in skip:
+            continue
+        disc = space[index]
+        if disc.appendable is False:
+            continue
+        remaining = disc.remaining_bytes
+        if remaining is not None and remaining < 4096:
+            continue
+        indices.append(index)
+    return indices
+
+
+def _write_one_layout_stub(
+    backend: "BurnBackend", marker: object, snapshot: object,
+    crypto: "CryptoBackend", label: str, volume_index: int,
+    not_stubbed: list[int],
+) -> bool:
+    """Input: one stub target. Output: True when the stub is on disc."""
+    stub = _snapshot_with_not_stubbed(snapshot, not_stubbed)
+    if not _append_layout_stub(backend, marker, stub, crypto, label):
+        print(
+            f"Fill: could not write a layout stub on volume {volume_index}.",
+            flush=True,
+        )
+        return False
+    print(f"Layout stub written on volume {volume_index}.", flush=True)
+    return True
+
+
+def _write_iso_layout_stubs(
+    backend: "BurnBackend", marker: object, snapshot: object,
+    crypto: "CryptoBackend", label: str, fill_index: int, space: dict,
+    skip_indices: set[int] | None = None,
+) -> None:
+    """Input: ISO fill context. Output: None. Details: Write stubs without prompts."""
+    from oddarchiver.volume import read_volume_marker
+
+    iso_origin, disc_size = _volume_iso_origin(backend, marker.volume_index)
+    if iso_origin is None and isinstance(backend, ISOBackend):
+        iso_origin = Path(backend.iso_path)
+        disc_size = getattr(backend, "disc_size", None)
+    if iso_origin is None:
+        return
+    written: set[int] = set()
+    candidates = _stub_candidate_indices(space, fill_index, skip_indices)
+    all_indices = set(space) | set(candidates) | {fill_index}
+    for volume_index in candidates:
+        not_stubbed = sorted(all_indices - written - {volume_index})
+        other = _open_iso_fill_backend(
+            iso_origin, volume_index, disc_size, backend,
+        )
+        if other is None:
+            continue
+        found = read_volume_marker(other)
+        if found is None:
+            continue
+        if _write_one_layout_stub(
+            other, found, snapshot, crypto, label, volume_index, not_stubbed,
+        ):
+            written.add(volume_index)
+
+
+def _write_drive_layout_stubs(
+    backend: "BurnBackend", marker: object, snapshot: object,
+    crypto: "CryptoBackend", label: str, fill_index: int, space: dict,
+    skip_indices: set[int] | None = None,
+) -> None:
+    """Input: drive fill context. Output: None. Details: Prompt, s skips, q stops."""
+    from oddarchiver.volume import read_volume_marker
+
+    written: set[int] = set()
+    candidates = _stub_candidate_indices(space, fill_index, skip_indices)
+    all_indices = set(space) | set(candidates) | {fill_index}
+    discs = remembered_discs(marker.archive_id)
+    for volume_index in candidates:
+        not_stubbed = sorted(all_indices - written - {volume_index})
+        disc_label, remaining = _prompt_fields_from_record(
+            discs, volume_index, label,
+        )
+        action = _prompt_fill_disc(
+            backend, marker.archive_id, volume_index, disc_label, remaining,
+        )
+        if action == "abort":
+            return
+        if action == "skip":
+            print(
+                f"Fill: skipped layout stub on volume {volume_index}.",
+                flush=True,
+            )
+            continue
+        found = read_volume_marker(backend)
+        if found is None:
+            continue
+        if _write_one_layout_stub(
+            backend, found, snapshot, crypto, label, volume_index, not_stubbed,
+        ):
+            written.add(volume_index)
+
+
+def _write_layout_stubs(
+    backend: "BurnBackend", marker: object, snapshot: object,
+    crypto: "CryptoBackend", label: str, fill_index: int, space: dict,
+    skip_indices: set[int] | None = None,
+) -> None:
+    """Input: fill result context. Output: None. Details: Offer stubs oldest first."""
+    if snapshot is None or marker is None:
+        return
+    print(
+        "Fill: write an outcome stub on other appendable volumes that have room.",
+        flush=True,
+    )
+    if isinstance(backend, ISOBackend):
+        _write_iso_layout_stubs(
+            backend, marker, snapshot, crypto, label, fill_index, space,
+            skip_indices,
+        )
+        return
+    _write_drive_layout_stubs(
+        backend, marker, snapshot, crypto, label, fill_index, space,
+        skip_indices,
+    )
+
+
+def _newest_can_take_stub(
+    backend: "BurnBackend",
+    archive_id: str | None = None,
+    volume_index: int | None = None,
+) -> bool:
+    """Input: newest disc backend. Output: True when a stub session can append."""
+    from oddarchiver.disc import GROWISOFS_MERGE_LIMIT_BYTES
+
+    if archive_id is not None and volume_index is not None:
+        if _memory_marks_closed(archive_id, volume_index):
+            return False
+    if getattr(backend, "_merge_appendable", True) is False:
+        return False
+    try:
+        info = backend.mediainfo()
+    except (RuntimeError, OSError, TypeError, AttributeError):
+        _log.exception("Cannot measure the newest disc for a fill stub")
+        return False
+    if getattr(info, "appendable", True) is False:
+        return False
+    if info.used_bytes >= GROWISOFS_MERGE_LIMIT_BYTES:
+        return False
+    return info.remaining_bytes >= 4096
+
+
+def _newest_stub_skip_text(
+    archive_id: str | None, volume_index: int | None,
+) -> str:
+    """Input: newest volume identity. Output: skip message for stubs."""
+    reason = None
+    if archive_id is not None and volume_index is not None:
+        disc = remembered_discs(archive_id).get(volume_index)
+        if disc is not None:
+            reason = disc.appendable_reason
+    if reason:
+        return (
+            "Fill: skipping the intent and outcome stubs on the newest disc. "
+            f"It is not appendable ({reason})."
+        )
+    return (
+        "Fill: skipping the intent and outcome stubs on the newest disc. "
+        "It has no room for a stub, or it is closed for growisofs -M "
+        "(the 4 GiB rule)."
+    )
+
+
+def _confirm_skip_intent(backend: "BurnBackend") -> bool:
+    """Input: newest backend. Output: True only after an explicit skip."""
+    from oddarchiver.volume import FILL_STUB_BLOCKS
+
+    if isinstance(backend, ISOBackend):
+        return False
+    print(
+        "Fill: write an intent stub on the newest disc first.\n"
+        f"A stub session uses about 15.9 MiB ({FILL_STUB_BLOCKS} blocks).\n"
+        "Press Enter to write it.\n"
+        "Type yes to skip it. Skip reopens the quit-after-burn gap.",
+        flush=True,
+    )
+    try:
+        return input().strip().lower() == "yes"
+    except EOFError:
+        _log.warning("fill: EOF on the intent skip prompt")
+        return False
+
+
+def _confirm_continue_without_intent() -> bool:
+    """Input: None. Output: True only after an explicit yes."""
+    print(
+        "Type yes to continue the fill without the intent stub. "
+        "Any other answer aborts.",
+        flush=True,
+    )
+    try:
+        return input().strip().lower() == "yes"
+    except EOFError:
+        _log.warning("fill: EOF on the continue-without-intent prompt")
+        return False
+
+
+def _record_stub_media_write_error(
+    backend: "BurnBackend", marker: object, exc: BaseException,
+) -> None:
+    """Input: failed stub backend and error. Output: None. Records closed."""
+    reason = media_write_reason(exc)
+    backend._merge_appendable = False
+    backend._merge_closed_reason = reason
+    try:
+        remember_volume_not_appendable(
+            marker.archive_id, marker.volume_index, reason,
+        )
+    except Exception:
+        _log.exception(
+            "Cannot record volume %s as not appendable", marker.volume_index,
+        )
+
+
+def _planned_fill_files(groups: list, current_state: dict[str, str]) -> list:
+    """Input: path groups and checksums. Output: FillFile list."""
+    from oddarchiver.volume import FillFile
+
+    files = []
+    seen: set[str] = set()
+    for group in groups:
+        for path in sorted(group):
+            if path in seen:
+                continue
+            checksum = current_state.get(path)
+            if not checksum:
+                continue
+            seen.add(path)
+            files.append(FillFile(path, checksum))
+    return files
+
+
+
+
+def _write_fill_intent_stub(
+    backend: "BurnBackend", marker: object, crypto: "CryptoBackend",
+    label: str, intent: object,
+) -> bool:
+    """Input: newest disc and intent. Output: True when the intent stub is on disc."""
+    from oddarchiver.volume import FILL_STUB_BLOCKS, write_fill_stub
+
+    print(
+        "Fill: writing an intent stub on the newest disc. "
+        f"A stub session uses about 15.9 MiB ({FILL_STUB_BLOCKS} blocks).",
+        flush=True,
+    )
+    return _append_root_stub(
+        backend, marker, label,
+        lambda staging: write_fill_stub(staging, marker, crypto, intent=intent),
+    )
+
+
+def _write_fill_outcome_stub(
+    backend: "BurnBackend", marker: object, crypto: "CryptoBackend",
+    label: str, outcome: object, snapshot: object,
+) -> bool:
+    """Input: newest disc and outcome. Output: True when the outcome stub is on disc."""
+    from oddarchiver.volume import write_fill_stub
+
+    def _write(staging):
+        write_fill_stub(
+            staging, marker, crypto, outcome=outcome, snapshot=snapshot,
+        )
+
+    return _append_root_stub(backend, marker, label, _write)
+
+
+def _acquire_resume_volume(
+    backend: "BurnBackend", marker: object, volume_index: int, label: str,
+) -> "BurnBackend | None":
+    """Input: current backend and target index. Output: backend for that volume, or None."""
+    if isinstance(backend, ISOBackend):
+        origin, disc_size = _volume_iso_origin(backend, marker.volume_index)
+        if origin is None:
+            origin = Path(backend.iso_path)
+            disc_size = getattr(backend, "disc_size", None)
+        return _open_iso_fill_backend(origin, volume_index, disc_size, backend)
+    disc_label, remaining = _prompt_fields_from_record(
+        remembered_discs(marker.archive_id), volume_index, label,
+    )
+    action = _prompt_fill_disc(
+        backend, marker.archive_id, volume_index, disc_label, remaining,
+    )
+    if action != "ok":
+        return None
+    return backend
+
+
+def _outcome_from_intent(
+    intent: object, status: str, snapshot: object,
+) -> object:
+    """Input: intent, status, optional snapshot. Output: FillOutcome."""
+    from oddarchiver.volume import FillOutcome
+
+    layout = getattr(snapshot, "layout", None) if snapshot is not None else None
+    return FillOutcome(
+        target_volume_index=intent.target_volume_index,
+        session=intent.session,
+        status=status,
+        files=list(intent.files),
+        time=datetime.now(timezone.utc).isoformat(),
+        layout=layout,
+    )
+
+
+def _record_pending_outcome(
+    newest: "BurnBackend", marker: object, crypto: "CryptoBackend",
+    label: str, intent: object, status: str, snapshot: object,
+) -> int:
+    """Input: newest disc and pending result. Output: 0 or 1."""
+    from oddarchiver.volume import read_volume_marker
+
+    if not isinstance(newest, ISOBackend):
+        disc_label, remaining = _prompt_fields_from_record(
+            remembered_discs(marker.archive_id), marker.volume_index, label,
+        )
+        action = _prompt_fill_disc(
+            newest, marker.archive_id, marker.volume_index, disc_label, remaining,
+        )
+        if action != "ok":
+            print(
+                "error: Insert the newest disc to record the fill outcome.",
+                file=sys.stderr,
+            )
+            return 1
+        found = read_volume_marker(newest)
+        if found is not None:
+            marker = found
+    if not _newest_can_take_stub(
+        newest, marker.archive_id, marker.volume_index,
+    ):
+        print(
+            "Fill: the newest disc cannot take the outcome stub.",
+            flush=True,
+        )
+        return 0
+    outcome = _outcome_from_intent(intent, status, snapshot)
+    if not _write_fill_outcome_stub(
+        newest, marker, crypto, label, outcome, snapshot,
+    ):
+        print("Fill: could not write the outcome stub.", flush=True)
+        return 1
+    print(
+        f"Fill outcome recorded: session {intent.session} {status} "
+        f"on volume {intent.target_volume_index}.",
+        flush=True,
+    )
+    return 0
+
+
+def _complete_pending_fill(
+    backend: "BurnBackend", crypto: "CryptoBackend", marker: object,
+    label: str,
+) -> int:
+    """Input: loaded disc. Output: 0, or 1 when the target volume is missing."""
+    from oddarchiver.volume import (
+        read_volume_baseline, read_volume_marker, unmatched_fill_intent,
+    )
+
+    if marker is None:
+        return 0
+    intent = unmatched_fill_intent(backend, crypto, marker)
+    if intent is None:
+        return 0
+    print(
+        f"A fill to volume {intent.target_volume_index} "
+        f"({safe_display(intent.target_label)}) session {intent.session} "
+        "was attempted.",
+        flush=True,
+    )
+    target = _acquire_resume_volume(
+        backend, marker, intent.target_volume_index,
+        intent.target_label or label,
+    )
+    if target is None:
+        print(
+            f"error: Volume {intent.target_volume_index} is not available. "
+            "Insert it and run this command again to record the fill outcome.",
+            file=sys.stderr,
+        )
+        return 1
+    listed = _backend_session_numbers(target) or []
+    landed = intent.session in listed
+    snapshot = None
+    if landed:
+        tmarker = read_volume_marker(target)
+        snapshot = read_volume_baseline(target, crypto, marker=tmarker)
+        status = "landed"
+    else:
+        status = "failed"
+    return _record_pending_outcome(
+        backend, marker, crypto, label, intent, status, snapshot,
+    )
+
+
+def _write_intent_for_fill(
+    backend: "BurnBackend", marker: object, crypto: "CryptoBackend",
+    label: str, space: dict, target_index: int, session_n: int, files: list,
+) -> bool:
+    """Input: newest disc and chosen fill target. Output: True when intent is on disc."""
+    from oddarchiver.volume import FillIntent
+
+    record = space.get(target_index)
+    target_label = (record.label if record is not None else "") or label
+    intent = FillIntent(
+        target_volume_index=target_index,
+        target_label=target_label,
+        session=session_n,
+        files=files,
+        time=datetime.now(timezone.utc).isoformat(),
+        attempted=True,
+    )
+    return _write_fill_intent_stub(backend, marker, crypto, label, intent)
+
+
+def _after_intent_stub_failure(marker: object) -> bool | None:
+    """Input: newest marker after a stub write fail. Output: skip flag or None."""
+    if _memory_marks_closed(marker.archive_id, marker.volume_index):
+        if _confirm_continue_without_intent():
+            print(
+                "Fill: skipped the intent stub after confirmation.",
+                flush=True,
+            )
+            return True
+        return None
+    print("error: Could not write the fill intent stub.", file=sys.stderr)
+    return None
+
+
+def _maybe_write_fill_intent(
+    backend: "BurnBackend", marker: object, crypto: "CryptoBackend",
+    label: str, space: dict, fill_chosen: list[int], inserted_index: int | None,
+    session_n: int, files: list,
+) -> bool | None:
+    """
+    Input: newest disc and chosen fill volume
+    Output: True if newest cannot take a stub, False if it can, None on write fail
+    """
+    if not fill_chosen or marker is None or inserted_index is None:
+        return False
+    if fill_chosen[-1] == inserted_index:
+        print(
+            "Fill: the inserted disc receives this session. "
+            "This run does not ask for other volumes.",
+            flush=True,
+        )
+        return False
+    if not _newest_can_take_stub(
+        backend, marker.archive_id, marker.volume_index,
+    ):
+        print(
+            _newest_stub_skip_text(marker.archive_id, marker.volume_index),
+            flush=True,
+        )
+        return True
+    if _confirm_skip_intent(backend):
+        print("Fill: skipped the intent stub after confirmation.", flush=True)
+        return False
+    if not _write_intent_for_fill(
+        backend, marker, crypto, label, space, fill_chosen[-1],
+        session_n, files,
+    ):
+        return _after_intent_stub_failure(marker)
+    return False
+
+
+
+def _prepare_fill_two_phase(
+    backend: "BurnBackend", marker: object, label: str, fill_on: bool,
+    min_blob: int, space: dict, total_planned: int, session_n: int,
+    files: list, crypto: "CryptoBackend",
+) -> tuple[list[_MeasuredFillVolume], list, bool] | None:
+    """
+    Input: fill context after planning
+    Output: measured volumes, targets, and newest-not-stubbed, or None on abort
+    """
+    if not fill_on or marker is None:
+        return [], [], False
+    inserted = _measure_inserted_fill(backend, marker, label)
+    if isinstance(backend, ISOBackend):
+        collected = _collect_iso_fill_volumes(
+            backend, marker, label, min_blob, space,
+        )
+        if collected is None:
+            return None
+        return collected, _fill_targets_from_measured(collected), False
+    measured = [inserted] if inserted is not None else []
+    return measured, _recorded_fill_targets(space, inserted), False
+
+
+
+
+def _acquire_newest_for_outcome(
+    backend: "BurnBackend", marker: object, label: str,
+) -> tuple["BurnBackend | None", object]:
+    """Input: newest disc. Output: backend and marker, or None backend on skip."""
+    from oddarchiver.volume import read_volume_marker
+
+    newest: "BurnBackend | None" = backend
+    newest_marker = marker
+    if not isinstance(backend, ISOBackend):
+        disc_label, remaining = _prompt_fields_from_record(
+            remembered_discs(marker.archive_id), marker.volume_index, label,
+        )
+        action = _prompt_fill_disc(
+            backend, marker.archive_id, marker.volume_index, disc_label, remaining,
+        )
+        if action != "ok":
+            print(
+                "Fill: skipped the outcome stub on the newest disc.",
+                flush=True,
+            )
+            return None, newest_marker
+        found = read_volume_marker(backend)
+        if found is not None:
+            newest_marker = found
+        return newest, newest_marker
+    found = read_volume_marker(newest)
+    if found is not None:
+        newest_marker = found
+    return newest, newest_marker
+
+
+def _write_fill_landed_outcome(
+    backend: "BurnBackend", marker: object, snapshot: object,
+    crypto: "CryptoBackend", label: str, fill_index: int,
+    fill_session: int, files: list, newest_not_stubbed: bool,
+) -> None:
+    """Input: fill result. Output: None. Details: Write the landed outcome stub."""
+    from oddarchiver.volume import FillOutcome
+
+    if newest_not_stubbed:
+        return
+    newest, newest_marker = _acquire_newest_for_outcome(backend, marker, label)
+    if newest is None:
+        return
+    layout = getattr(snapshot, "layout", None)
+    outcome = FillOutcome(
+        target_volume_index=fill_index,
+        session=fill_session,
+        status="landed",
+        files=files,
+        time=datetime.now(timezone.utc).isoformat(),
+        layout=layout,
+    )
+    if _write_fill_outcome_stub(
+        newest, newest_marker, crypto, label, outcome, snapshot,
+    ):
+        print(
+            f"Fill outcome recorded: session {fill_session} landed "
+            f"on volume {fill_index}.",
+            flush=True,
+        )
+
+
+def _finish_fill_two_phase(
+    backend: "BurnBackend", marker: object, snapshot: object,
+    crypto: "CryptoBackend", label: str, fill_index: int, space: dict,
+    newest_not_stubbed: bool, inserted_index: int | None,
+    fill_session: int, files: list, switched: bool,
+) -> None:
+    """Input: fill result. Output: None. Details: Outcome on newest, then sweep."""
+    if not switched or snapshot is None or marker is None:
+        return
+    _write_fill_landed_outcome(
+        backend, marker, snapshot, crypto, label, fill_index,
+        fill_session, files, newest_not_stubbed,
+    )
+    skip = set()
+    if inserted_index is not None:
+        skip.add(inserted_index)
+    _write_layout_stubs(
+        backend, marker, snapshot, crypto, label, fill_index, space, skip,
+    )
+
+
+class _SyncFillPlan:
+    """Mutable state for one locked fill-capable sync."""
+
+    def __init__(self, **fields: object) -> None:
+        self.__dict__.update(fields)
+
+
+def _sync_disc_history(
+    backend: "BurnBackend", crypto: "CryptoBackend", marker: object,
+    manifests: list[Manifest], fill_on: bool, baseline: object,
+) -> tuple[int | None, tuple | None]:
+    """Input: loaded disc and fill flag. Output: exit code with no tuple, or history tuple."""
+    pending_rc = _complete_pending_fill(
+        backend, crypto, marker, _archive_label(manifests),
+    )
+    if pending_rc:
+        return pending_rc, None
+    marker, manifests, baseline = _refresh_sync_volume(backend, crypto)
+    prepared = _prepare_sync_baseline(
+        backend, crypto, marker, manifests, fill_on, baseline,
+    )
+    if prepared is None:
+        return 1, None
+    manifests, extra, snapshot = prepared
+    history = manifests + extra
+    refused = _refuse_sync_catalog(marker, fill_on, backend, extra)
+    if refused is not None:
+        return refused, None
+    seed, disc_state, disc_origin = _sync_seed_state(snapshot, baseline, history)
+    return None, (
+        marker, manifests, baseline, extra, snapshot, seed, history,
+        disc_state, disc_origin, _archive_label(manifests),
+        _sync_next_session(marker, history),
+    )
+
+
+def _plan_sync_fill(
+    args: argparse.Namespace,
+    backend: "BurnBackend",
+    crypto: "CryptoBackend",
+    manifests: list[Manifest],
+    marker: object,
+    baseline: object,
+    session_mod: object,
+    verify_mod: object,
+    mirror_backend: "BurnBackend | None",
+) -> tuple[int, _SyncFillPlan | None]:
+    """Select fill targets and plan staging groups. Output: exit code and plan."""
+    fill_on = _fill_enabled(args)
+    hist_rc, hist = _sync_disc_history(
+        backend, crypto, marker, manifests, fill_on, baseline,
+    )
+    if hist is None:
+        return hist_rc, None
+    (
+        marker, manifests, baseline, _extra, _snapshot, seed, history,
+        disc_state, disc_origin, label, session_n,
+    ) = hist
+    split_prefixes = build_split_prefixes(history)
+    enc_block = _encryption_block(crypto)
+    source = Path(args.source)
+    planned = _sync_diff_and_groups(
+        args, source, disc_state, disc_origin, backend, crypto,
+        history, session_mod,
+    )
+    if planned is None:
+        return 0, None
+    current_state, cache, groups = planned
+    space = merge_snapshot_space(
+        marker.archive_id if marker else "", seed,
+    )
+    min_blob = _min_planned_blob_bytes(source, groups)
+    total_planned = _planned_source_bytes(source, groups)
+    fill_files = _planned_fill_files(groups, current_state)
+    fill_prep = _prepare_fill_two_phase(
+        backend, marker, label, fill_on, min_blob, space, total_planned,
+        session_n, fill_files, crypto,
+    )
+    if fill_prep is None:
+        return 1, None
+    measured, fill_targets, newest_not_stubbed = fill_prep
+    (
+        archive_id, base_volume_index, chunk0_first_session,
+        expected_archive_id, expected_volume_index,
+    ) = _sync_volume_identity(marker)
+    return 0, _SyncFillPlan(
+        args=args,
+        backend=backend,
+        crypto=crypto,
+        marker=marker,
+        manifests=manifests,
+        baseline=baseline,
+        history=history,
+        seed=seed,
+        disc_state=disc_state,
+        disc_origin=disc_origin,
+        split_prefixes=split_prefixes,
+        enc_block=enc_block,
+        label=label,
+        session_n=session_n,
+        source=source,
+        current_state=current_state,
+        cache=cache,
+        groups=groups,
+        space=space,
+        fill_files=fill_files,
+        measured=measured,
+        fill_targets=fill_targets,
+        newest_not_stubbed=newest_not_stubbed,
+        archive_id=archive_id,
+        base_volume_index=base_volume_index,
+        chunk0_first_session=chunk0_first_session,
+        expected_archive_id=expected_archive_id,
+        expected_volume_index=expected_volume_index,
+        inserted_index=marker.volume_index if marker else None,
+        inserted_backend=backend,
+        catalog_marker=marker,
+        fill_on=fill_on,
+        mirror_backend=mirror_backend,
+        session_mod=session_mod,
+        verify_mod=verify_mod,
+        fill_switched=False,
+        fill_snapshot=None,
+        last_fill_chosen=[],
+        fill_session=session_n,
+    )
+
+
+def _burn_sync_fill_group(
+    plan: _SyncFillPlan, group_index: int, group_paths: object,
+) -> int:
+    """Intent phase, fill disc swap, burn, and refresh for one staging group."""
+    fill_chosen: list[int] = []
+    chunks = _stage_sync_group(
+        plan.args, plan.session_mod, group_paths, group_index,
+        plan.current_state, plan.disc_state, plan.disc_origin, plan.source,
+        plan.inserted_backend, plan.cache, plan.crypto, plan.history,
+        plan.baseline, plan.catalog_marker, plan.chunk0_first_session,
+        plan.session_n, plan.label,
+        fill_targets=plan.fill_targets, fill_chosen=fill_chosen,
+        inserted_volume_index=plan.inserted_index,
+        split_prefixes=plan.split_prefixes,
+    )
+    stub_skip = _maybe_write_fill_intent(
+        plan.inserted_backend, plan.catalog_marker, plan.crypto, plan.label,
+        plan.space, fill_chosen, plan.inserted_index, plan.session_n,
+        plan.fill_files,
+    )
+    if stub_skip is None:
+        return 1
+    plan.newest_not_stubbed = bool(stub_skip)
+    ensured = _ensure_fill_disc_for_burn(
+        plan.backend, plan.catalog_marker, plan.label, fill_chosen,
+        plan.measured, plan.inserted_index,
+    )
+    if ensured is None:
+        return 1
+    plan.measured, plan.backend = ensured
+    (
+        burn_backend, burn_base, burn_first, burn_id, burn_vol,
+        expected_count, switched, group_snapshot,
+    ) = _resolve_fill_burn(
+        chunks, plan.measured, fill_chosen, plan.backend,
+        plan.base_volume_index, plan.chunk0_first_session,
+        plan.expected_archive_id, plan.expected_volume_index,
+        plan.session_n, plan.inserted_index, plan.history, plan.seed,
+        plan.crypto, plan.space,
+        newest_not_stubbed=plan.newest_not_stubbed,
+    )
+    plan.fill_switched |= switched
+    if group_snapshot is not None:
+        plan.fill_snapshot = group_snapshot
+    if fill_chosen:
+        plan.last_fill_chosen = fill_chosen
+        plan.fill_session = plan.session_n
+    rc, last_backend = _burn_sync_group(
+        chunks, burn_backend, plan.args, plan.label, plan.enc_block,
+        plan.crypto, plan.cache, plan.verify_mod, plan.mirror_backend,
+        plan.archive_id, burn_base, burn_first, plan.session_n,
+        burn_id, burn_vol, chunk0_expected_session_count=expected_count,
+    )
+    rc, plan.backend = _apply_burn_result(
+        rc, plan.fill_switched, last_backend, plan.backend,
+    )
+    if rc != 0:
+        return rc
+    plan.session_n += len(chunks)
+    (
+        plan.marker, plan.manifests, plan.baseline, plan.base_volume_index,
+        plan.chunk0_first_session, plan.expected_archive_id,
+        plan.expected_volume_index,
+    ) = _refresh_after_sync_group(
+        group_index, len(plan.groups), plan.fill_switched, plan.backend,
+        plan.crypto, plan.marker, plan.manifests, plan.baseline,
+        plan.base_volume_index, plan.chunk0_first_session,
+        plan.expected_archive_id, plan.expected_volume_index,
+    )
+    return 0
+
+
+def _burn_sync_fill_groups(plan: _SyncFillPlan) -> int:
+    """Burn every staging group for this sync."""
+    rc = 0
+    for group_index, group_paths in enumerate(plan.groups):
+        rc = _burn_sync_fill_group(plan, group_index, group_paths)
+        if rc != 0:
+            return rc
+    return rc
+
+
+def _finish_sync_fill(plan: _SyncFillPlan) -> None:
+    """Write the fill outcome and layout stubs after a successful burn."""
+    if not plan.fill_on or not plan.last_fill_chosen or plan.fill_snapshot is None:
+        return
+    _finish_fill_two_phase(
+        plan.inserted_backend, plan.catalog_marker, plan.fill_snapshot,
+        plan.crypto, plan.label, plan.last_fill_chosen[-1], plan.space,
+        plan.newest_not_stubbed, plan.inserted_index, plan.fill_session,
+        plan.fill_files, plan.fill_switched,
+    )
+
+
+def _run_sync_locked(
+    args: argparse.Namespace,
+    backend: "BurnBackend",
+    crypto: "CryptoBackend",
+    manifests: list[Manifest],
+    marker: object,
+    baseline: object,
+    mirror_backend: "BurnBackend | None",
+    session_mod: object,
+    verify_mod: object,
+) -> int:
+    """Run sync after the archive lock is held."""
+    rc, plan = _plan_sync_fill(
+        args, backend, crypto, manifests, marker, baseline,
+        session_mod, verify_mod, mirror_backend,
+    )
+    if plan is None:
+        return rc
+    rc = _burn_sync_fill_groups(plan)
+    if rc != 0:
+        return rc
+    _finish_sync_fill(plan)
+    return rc
+
+
 def _run_sync(args: argparse.Namespace) -> int:
     """
     Input:  args - parsed sync namespace
@@ -3088,84 +5802,29 @@ def _run_sync(args: argparse.Namespace) -> int:
     _require_iso_exists(backend)
     disc_info = backend.mediainfo()
 
-    if disc_info.session_count == 0:
-        _log.error("sync: disc not initialized (%s)", _backend_id(backend))
-        print("error: disc not initialized; run 'init' first.", file=sys.stderr)
-        return 1
+    refused = _require_initialized_disc(disc_info, backend)
+    if refused is not None:
+        return refused
 
     _log.info("sync: source=%s session=%d device=%s",
               args.source, disc_info.session_count, _backend_id(backend))
 
     mirror_backend = _make_mirror_backend(args)
 
-    if getattr(args, "prefill", None):
-        if isinstance(backend, ISOBackend):
-            backend.prefill(parse_disc_size(args.prefill))
+    _apply_sync_prefill(args, backend)
 
     loaded = _load_sync_disc(backend, args, disc_info)
     if loaded is None:
         return 1
     crypto, manifests, marker, baseline = loaded
-    disc_state = build_disc_state(
-        manifests, seed=baseline.state if baseline else None,
-    )
-    disc_origin = build_disc_origin(
-        manifests, seed=baseline.origin if baseline else None,
-    )
-    enc_block = _encryption_block(crypto)
-    label = manifests[0].label if manifests else "ARCHIVE"
-
-    # Use marker.first_session + manifest count, not dvd+rw-mediainfo
-    # session count. BD-R SRM+POW always reports session_count=1
-    # regardless of how many appends occurred. A missing marker
-    # (legacy/single-volume) treats first_session as 0.
-    session_n = (marker.first_session if marker else 0) + len(manifests)
-    source = Path(args.source)
-
-    # Scan source with progress bar, compute diff, always show summary.
-    current_state = _scan_source_with_progress(source)
-    diff = _diff_sync_source(current_state, disc_state)
-    if diff is None:
-        return 0
-    paths, deleted_files = diff
-
-    cache = CacheManager()
-    groups = _sync_changes(
-        args, source, paths, deleted_files, current_state, disc_state,
-        disc_origin, backend, crypto, manifests, session_mod,
-    )
-    if groups is None:
-        return 0
-
-    (
-        archive_id, base_volume_index, chunk0_first_session,
-        expected_archive_id, expected_volume_index,
-    ) = _sync_volume_identity(marker)
-    rc = 0
-    for group_index, group_paths in enumerate(groups):
-        chunks = _stage_sync_group(
-            args, session_mod, group_paths, group_index, current_state,
-            disc_state, disc_origin, source, backend, cache, crypto,
-            manifests, baseline, marker, chunk0_first_session, session_n,
-            label,
+    with _archive_sync_lock(marker):
+        return _run_sync_locked(
+            args, backend, crypto, manifests, marker, baseline,
+            mirror_backend, session_mod, verify_mod,
         )
-        rc, backend = _burn_sync_group(
-            chunks, backend, args, label, enc_block, crypto, cache,
-            verify_mod, mirror_backend, archive_id, base_volume_index,
-            chunk0_first_session, session_n, expected_archive_id,
-            expected_volume_index,
-        )
-        if rc != 0:
-            return rc
-        session_n += len(chunks)
-        if group_index < len(groups) - 1:
-            marker, manifests, baseline = _refresh_sync_volume(backend, crypto)
-            if marker is not None:
-                base_volume_index = marker.volume_index
-                chunk0_first_session = marker.first_session
-                expected_archive_id = marker.archive_id
-                expected_volume_index = marker.volume_index
-    return rc
+
+
+
 
 
 def _print_catalog_notices(catalog, marker, higher: int | None) -> None:
@@ -3185,12 +5844,19 @@ def _print_catalog_notices(catalog, marker, higher: int | None) -> None:
             "Insert the newer disc for a newer catalog.",
             file=sys.stderr,
         )
+    for index, last in later_sessions_by_disc(catalog, catalog.last_session):
+        print(
+            f"Local records show {disc_name(catalog, index)} holds session {last}. "
+            f"Insert disc {index} to include it.",
+            file=sys.stderr,
+        )
     if not catalog.complete:
         print(
             "The disc names for some older sessions are not known. "
             "Insert each older disc one time to record its name.",
             file=sys.stderr,
         )
+
 
 
 def _restore_from_catalog(
@@ -3214,13 +5880,16 @@ def _restore_from_catalog(
     higher = highest_seen_volume(marker.archive_id)
     remember_discs(catalog)
     _print_catalog_notices(catalog, marker, higher)
-    return restore_archive(
+    result = restore_archive(
         **options, catalog=catalog,
         unskip_volumes=getattr(args, "unskip_volumes", None),
         acquisition=DiscAcquisition(
             backend, image=getattr(args, "test_iso", None),
         ),
     )
+    remember_discs(catalog)
+    return result
+
 
 
 def _restore_single_disc(
@@ -3293,6 +5962,29 @@ def _restore_iso_exists(args: argparse.Namespace) -> bool:
     return True
 
 
+def _restore_no_disc_check(backend: "BurnBackend") -> None:
+    """
+    Input:  backend - restore source backend
+    Output: None
+    Details:
+        On a real drive, probe mediainfo first. An empty or unreadable
+        drive must say so, not report a failed xorriso path batch.
+    """
+    if isinstance(backend, ISOBackend):
+        return
+    try:
+        backend.mediainfo()
+    except RuntimeError as exc:
+        from oddarchiver.disc import _is_no_media_text
+
+        if _is_no_media_text(str(exc)):
+            raise RuntimeError(
+                f"No readable disc is loaded in {backend.device}. "
+                "Insert the archive disc and run the command again."
+            ) from exc
+        raise
+
+
 def _run_restore(args: argparse.Namespace) -> int:
     """
     Input:  args - parsed restore namespace
@@ -3305,6 +5997,7 @@ def _run_restore(args: argparse.Namespace) -> int:
         return 1
 
     backend = _make_backend(args)
+    _restore_no_disc_check(backend)
     crypto, manifests, raw = _crypto_and_manifests(
         backend,
         key_path=getattr(args, "key", None),
@@ -3318,7 +6011,15 @@ def _run_restore(args: argparse.Namespace) -> int:
         args=args,
         disc_session_count=disc_info.session_count,
         command="restore",
+        marker=marker,
     )
+    pending_label = manifests[0].label if manifests else "ARCHIVE"
+    pending_rc = _complete_pending_fill(
+        backend, crypto, marker, pending_label,
+    )
+    if pending_rc:
+        return pending_rc
+
 
     all_disks = getattr(args, "all_disks", False)
     options = dict(
@@ -3353,7 +6054,7 @@ def _run_history(args: argparse.Namespace) -> int:
         Columns: session, timestamp, files, total_bytes, encryption mode.
     """
     backend = _make_backend(args)
-    crypto, manifests, _raw = _crypto_and_manifests(
+    crypto, manifests, raw = _crypto_and_manifests(
         backend, key_path=getattr(args, "key", None),
     )
     _check_loaded_manifests(
@@ -3362,6 +6063,7 @@ def _run_history(args: argparse.Namespace) -> int:
         args=args,
         disc_session_count=backend.mediainfo().session_count,
         command="history",
+        marker=getattr(raw, "marker", None),
     )
 
     if not manifests:
@@ -3435,6 +6137,7 @@ def _run_ls(args: argparse.Namespace) -> int:
         args=args,
         disc_session_count=disc_info.session_count,
         command="ls",
+        marker=marker,
     )
 
     all_disks = getattr(args, "all_disks", False)
@@ -3669,6 +6372,7 @@ def _run_browse(args: argparse.Namespace) -> int:
         args=args,
         disc_session_count=disc_info.session_count,
         command="browse",
+        marker=marker,
     )
     if not manifests and not getattr(args, "all_disks", False):
         print("No sessions found.")
@@ -3789,51 +6493,133 @@ def _run_status(args: argparse.Namespace) -> int:
         warnings, and any SUSPECT manifests. The session count is the
         number of session manifests on this disc, not the MMC session
         count: BD-R SRM+POW reports 1 MMC session after any number of
-        appends.
+        appends. --stats or --stats-exact append usage tables. --json
+        prints only the stats object and requires a stats flag.
     """
+    mode = _status_stats_mode(args)
+    as_json = bool(getattr(args, "json", False))
+    if as_json and mode is None:
+        print(
+            "error: --json requires --stats or --stats-exact",
+            file=sys.stderr,
+        )
+        return 2
     backend = _make_backend(args)
     crypto, manifests, raw = _crypto_and_manifests(
         backend, key_path=getattr(args, "key", None),
     )
     disc_info = backend.mediainfo()
-
-    used_pct = (
-        100 * disc_info.used_bytes / (disc_info.used_bytes + disc_info.remaining_bytes)
-        if (disc_info.used_bytes + disc_info.remaining_bytes) > 0
-        else 0
-    )
-
-    print(f"Label:     {safe_display(disc_info.label) if disc_info.label else '(none)'}")
-    print(f"Sessions:  {len(manifests)}")
-    print(f"Used:      {_fmt_bytes(disc_info.used_bytes)} ({used_pct:.0f}%)")
-    print(f"Remaining: {_fmt_bytes(disc_info.remaining_bytes)}")
-
-    check_capacity(used_pct, disc_info.remaining_bytes, _log)
-
+    if not as_json:
+        _print_status_overview(disc_info, manifests)
     _check_loaded_manifests(
         manifests,
         backend=backend,
         args=args,
         disc_session_count=disc_info.session_count,
         command="status",
+        marker=getattr(raw, "marker", None),
     )
+    if not as_json:
+        _print_status_incomplete(backend, manifests, raw)
+        _print_status_suspects(manifests)
+        _print_status_mirrors(manifests, backend)
+    if mode is not None:
+        _emit_disc_stats(
+            backend, manifests, raw, disc_info, crypto, mode, as_json,
+        )
+    return 0
+
+
+def _status_stats_mode(args: argparse.Namespace) -> str | None:
+    """
+    Input:  args - parsed status namespace
+    Output: estimate, exact, or None when no stats flag is set
+    """
+    if getattr(args, "stats", False):
+        return "estimate"
+    if getattr(args, "stats_exact", False):
+        return "exact"
+    return None
+
+
+def _print_status_overview(disc_info: object, manifests: list[Manifest]) -> None:
+    """
+    Input:  disc_info - capacity snapshot; manifests - loaded sessions
+    Output: printed label, session count, and used space
+    """
+    used = disc_info.used_bytes
+    remaining = disc_info.remaining_bytes
+    total = used + remaining
+    used_pct = 100 * used / total if total > 0 else 0
+    label = safe_display(disc_info.label) if disc_info.label else "(none)"
+    print(f"Label:     {label}")
+    print(f"Sessions:  {len(manifests)}")
+    print(f"Used:      {_fmt_bytes(used)} ({used_pct:.0f}%)")
+    print(f"Remaining: {_fmt_bytes(remaining)}")
+    check_capacity(used_pct, remaining, _log)
+
+
+def _print_status_incomplete(
+    backend: "BurnBackend",
+    manifests: list[Manifest],
+    raw: dict[str, bytes],
+) -> None:
+    """
+    Input:  backend, manifests, raw control bytes
+    Output: printed incomplete-session warning, if any
+    """
     from oddarchiver.verify import detect_incomplete_session
     incomplete = detect_incomplete_session(
         backend, {m.session if m.session >= 0 else i: m for i, m in enumerate(manifests)},
         control_raw=raw,
     )
-    if incomplete is not None:
-        print(
-            f"\nINCOMPLETE trailing session {incomplete:03d} "
-            "(interrupted burn, not corruption)."
-        )
-        print(
-            "Do not eject; run 'oddarchiver verify --level checksum' "
-            "before another sync."
-        )
-    _print_status_suspects(manifests)
-    _print_status_mirrors(manifests, backend)
-    return 0
+    if incomplete is None:
+        return
+    print(
+        f"\nINCOMPLETE trailing session {incomplete:03d} "
+        "(interrupted burn, not corruption)."
+    )
+    print(
+        "Do not eject; run 'oddarchiver verify --level checksum' "
+        "before another sync."
+    )
+
+
+def _emit_disc_stats(
+    backend: "BurnBackend",
+    manifests: list[Manifest],
+    raw: dict[str, bytes],
+    disc_info: object,
+    crypto: object,
+    mode: str,
+    as_json: bool,
+) -> None:
+    """
+    Input:  loaded disc state, stats mode, and json flag
+    Output: printed stats tables or a JSON object
+    """
+    from oddarchiver.stats import compute_stats, render_json, render_text
+    exact_sizes = _exact_size_map(backend, mode)
+    report = compute_stats(manifests, raw, disc_info, crypto, exact_sizes)
+    if as_json:
+        print(render_json(report))
+        return
+    print()
+    print(render_text(report), end="")
+
+
+def _exact_size_map(backend: "BurnBackend", mode: str) -> dict[str, int] | None:
+    """
+    Input:  backend and stats mode
+    Output: list_file_sizes result in exact mode, else None
+    """
+    if mode != "exact":
+        return None
+    try:
+        return backend.list_file_sizes()
+    except (RuntimeError, NotImplementedError):
+        _log.exception("Failed to list on-disc file sizes")
+        raise
 
 
 def _print_status_suspects(manifests: list[Manifest]) -> None:

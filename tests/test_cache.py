@@ -265,5 +265,16 @@ def test_put_round_trips_through_get_and_get_with_fallback(cache):
     backend.read_path.assert_not_called()
 
 
+def test_put_file_streams_blob_and_records_size(cache, tmp_path):
+    """put_file copies bytes from a path; get returns them with matching size."""
+    src = tmp_path / "src.bin"
+    payload = b"streamed-cache-blob" * 100
+    src.write_bytes(payload)
+    cache.put_file("docs/big.bin", 3, src)
+    assert cache.get("docs/big.bin", 3) == payload
+    index = cache_mod._load_manifest(cache.cache_dir)
+    assert index["3:docs/big.bin"]["size"] == len(payload)
+
+
 if __name__ == "__main__":
     pass

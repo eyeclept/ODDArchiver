@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -36,6 +37,8 @@ DVD_DL_DISC_BYTES = 8_547_991_552  # ~8.5 GB dual-layer DVD usable capacity
 # Same GiB-floor headroom as bd-r (23 GiB) and bdxl (93 GiB): floor(50_050_629_632 / 2**30).
 BD_DL_DISC_BYTES = 46 * 2**30      # 50 GB dual-layer BD-R usable headroom (~46 GiB)
 BDXL_DISC_BYTES = 93 * 2**30       # 100 GB BDXL usable headroom (~93 GiB)
+# ISO9660 file size is 32-bit. growisofs -M fails near this used size.
+GROWISOFS_MERGE_LIMIT_BYTES = 4 * 2**30
 _SMALL_CONTROL_MAX_BYTES = 1024 * 1024
 _LARGE_CONTROL_MAX_BYTES = 64 * 1024 * 1024
 # Fixed, root-owned path, never the PATH of the invoking user. See
@@ -43,6 +46,9 @@ _LARGE_CONTROL_MAX_BYTES = 64 * 1024 * 1024
 # be a manual `sudo install` target, not something
 # `pip install -e .` creates.
 _USB_REAUTH_HELPER = "/usr/local/sbin/oddarchiver-usb-reauth"
+# Listings and mediainfo finish in seconds on a healthy drive, including
+# spin-up. A drive locked by an interrupted write never answers.
+_METADATA_TIMEOUT_S = 180
 logger = logging.getLogger(__name__)
 _log = logger
 # Text growisofs prints when the drive stops answering mid-write. Captured
@@ -86,7 +92,19 @@ class DiscInfo:
     used_bytes: int
     label: str
     mirror_device: str = ""
+    appendable: bool = True
 
+
+
+
+class DriveUnresponsive(BaseException):
+    """
+    Raised when a drive metadata command gets no answer within
+    _METADATA_TIMEOUT_S. Every later command to the same drive would hang
+    the same way, so this derives from BaseException: no fallback handler
+    (except Exception / RuntimeError) can swallow it and move on to an
+    unbounded read. cli.dispatch reports it; finally blocks still run.
+    """
 
 
 class BurnInterrupted(RuntimeError):
@@ -100,6 +118,21 @@ class BurnInterrupted(RuntimeError):
         (Power on / bus device reset / SCSI Unit Attention). Callers
         must not treat this as an ordinary command error.
     """
+
+
+class MediaWriteError(RuntimeError):
+    """
+    Input:  message - user text; write_error - short block description
+    Output: N/A (exception)
+    Details:
+        Distinct from a disconnect. The drive stayed present. A failed
+        append does not change earlier sessions.
+    """
+
+    def __init__(self, message: str, write_error: str) -> None:
+        super().__init__(message)
+        self.write_error = write_error
+
 
 class BurnBackend(abc.ABC):
     """Abstract interface for disc-write and disc-read operations."""
@@ -191,6 +224,18 @@ class BurnBackend(abc.ABC):
             cache, so this is a no-op here.
         """
         return None
+
+    def list_file_sizes(self) -> dict[str, int]:
+        """
+        Input:  None
+        Output: dict mapping disc-root-relative POSIX path to size in bytes
+        Details:
+            Lists every regular file on the medium. Keys have no leading
+            slash. Values are file size in bytes. The base class raises
+            NotImplementedError so test fakes that subclass BurnBackend
+            keep working.
+        """
+        raise NotImplementedError("This backend cannot list file sizes.")
 
     @abc.abstractmethod
     def read_path(self, path: str) -> bytes:
@@ -301,6 +346,47 @@ def _control_file_cap(path: str) -> int | None:
     )
 
 
+def _is_read_disconnect(stderr: str, device: str) -> bool:
+    """
+    Input:  stderr - xorriso or libburn text from a read
+            device - device path used for the read
+    Output: True if the drive left the bus during the read
+    """
+    blob = stderr.lower()
+    if "sg_err_did_error" in blob or "host problem" in blob:
+        return True
+    if "no such device" in blob:
+        return True
+    return _is_disconnect(stderr.splitlines(), device)
+
+
+def _raise_read_disconnected(device: str) -> None:
+    """
+    Input:  device - device path used for the read
+    Output: never returns
+    """
+    raise RuntimeError(
+        f"The drive at {device} disconnected during the read. "
+        "Nothing partial was kept. Reconnect the drive and run the same "
+        "command again to resume."
+    )
+
+
+def _retry_read_disconnect(device: str, attempt: int) -> bool:
+    """
+    Input:  device, attempt
+    Output: True to retry once while the device node is still present
+    """
+    if attempt == 0 and os.path.exists(device):
+        _log.warning(
+            "Drive disconnect signature on %s; retrying once",
+            device,
+        )
+        return True
+    _raise_read_disconnected(device)
+    return False
+
+
 def _retry_xorriso_read(
     device: str, stderr: str, attempt: int, retries: int, retry_delay: float,
 ) -> bool:
@@ -308,6 +394,8 @@ def _retry_xorriso_read(
     Input:  device, stderr, attempt, retries, retry_delay
     Output: True if the read should be retried
     """
+    if _is_read_disconnect(stderr, device):
+        return _retry_read_disconnect(device, attempt)
     if "no media" in stderr.lower() and attempt < retries:
         print(
             f"  Drive not ready (attempt {attempt + 1}/{retries + 1}); "
@@ -380,6 +468,9 @@ class DiscBackend(BurnBackend):
     def __init__(self, device: str) -> None:
         self.device = device
         self._session_numbers_cache: list[int] | None = None
+        self._extents_cache: dict[str, tuple[int, int]] | None = None
+        self._merge_appendable = True
+        self._merge_closed_reason: str | None = None
 
     def init(
         self,
@@ -412,6 +503,7 @@ class DiscBackend(BurnBackend):
             "-udf", "-allow-limited-size", "-R", "-T",
             "-V", label,
             "-use-the-force-luke=notray",
+            "-m", r"\.lock",
             str(staging),
         ]
         returncode, output_lines = _run_growisofs(cmd)
@@ -428,7 +520,10 @@ class DiscBackend(BurnBackend):
             self._raise_if_disc_full(
                 output_lines, staging, expected_session_count, is_init=True,
             )
-            raise RuntimeError(f"growisofs -Z failed with exit code {returncode}")
+            _raise_if_long_write(output_lines)
+            self._finish_nonzero_burn(
+                returncode, output_lines, staging, expected_session_count, "-Z",
+            )
 
     def append(
         self,
@@ -463,12 +558,15 @@ class DiscBackend(BurnBackend):
             expected_archive_id=expected_archive_id,
             expected_volume_index=expected_volume_index,
         )
+        self._refuse_closed_merge()
         self.invalidate_session_list()
+
         cmd = [
             "growisofs", "-M", self.device,
             "-udf", "-allow-limited-size", "-R", "-T",
             "-V", label,
             "-use-the-force-luke=notray",
+            "-m", r"\.lock",
             str(staging),
         ]
         returncode, output_lines = _run_growisofs(cmd)
@@ -476,8 +574,74 @@ class DiscBackend(BurnBackend):
             cmd, returncode, output_lines,
         )
         self._raise_append_failure(
-            returncode, output_lines, stale_cache, staging, expected_session_count,
+            returncode, output_lines, stale_cache, staging,
+            expected_session_count, expected_archive_id, expected_volume_index,
         )
+
+    def _merge_still_allowed(self) -> bool:
+        """Input: None. Output: True when growisofs -M may run."""
+        if self._merge_appendable is False:
+            return False
+        info = self.mediainfo()
+        if info.used_bytes >= GROWISOFS_MERGE_LIMIT_BYTES:
+            self._merge_appendable = False
+            _log.warning(
+                "Disc %s used_bytes=%s reaches the growisofs -M 4 GiB limit",
+                self.device, info.used_bytes,
+            )
+            return False
+        return True
+
+    def _refuse_closed_merge(self) -> None:
+        """Input: None. Output: None. Raises when this volume cannot accept -M."""
+        if self._merge_still_allowed():
+            return
+        if self._merge_closed_reason:
+            raise RuntimeError(
+                f"This disc is not appendable ({self._merge_closed_reason}). "
+                "Do not append to this disc again: use another disc."
+            )
+        raise RuntimeError(
+            "This disc is not appendable. growisofs -M cannot merge a session "
+            "once used space reaches 4 GiB. Insert a blank disc for a new volume."
+        )
+
+    def _mark_merge_too_large(self, output_lines: list[str]) -> None:
+        """Input: writer lines. Output: None. Marks the volume closed for -M."""
+        self._merge_appendable = False
+        _log.warning(
+            "growisofs -M merge source is too large on %s: %s",
+            self.device, " | ".join(output_lines[-8:]),
+        )
+
+
+    def _mark_media_write_closed(self, write_error: str) -> None:
+        """Input: write_error text. Output: None. Marks the volume closed for -M."""
+        self._merge_appendable = False
+        self._merge_closed_reason = write_error
+        _log.warning(
+            "Disc %s is not appendable after media write error: %s",
+            self.device, write_error,
+        )
+
+    def _remember_not_appendable(
+        self, write_error: str, archive_id: str | None,
+        volume_index: int | None,
+    ) -> None:
+        """Input: error text and volume identity. Output: None."""
+        if archive_id is None or volume_index is None:
+            _log.warning(
+                "Cannot record a closed volume after a media write error; "
+                "archive identity is missing",
+            )
+            return
+        try:
+            from oddarchiver.catalog import remember_volume_not_appendable
+            remember_volume_not_appendable(archive_id, volume_index, write_error)
+        except Exception:
+            _log.exception(
+                "Cannot record volume %s as not appendable", volume_index,
+            )
 
     def _retry_stale_append(
         self, cmd: list[str], returncode: int, output_lines: list[str],
@@ -489,10 +653,7 @@ class DiscBackend(BurnBackend):
             On the stale-cache signature, re-enumerates USB once, waits
             for the device node, and retries growisofs once.
         """
-        stale_cache = returncode != 0 and any(
-            "pread64" in ln and "primary volume descriptor" in ln
-            for ln in output_lines
-        )
+        stale_cache = returncode != 0 and _is_stale_append_output(output_lines)
         if stale_cache:
             print(
                 "  growisofs could not read the prior session back (stale "
@@ -508,10 +669,7 @@ class DiscBackend(BurnBackend):
                 if self._wait_for_device_node():
                     print("  Device is back; retrying append...", flush=True)
                     returncode, output_lines = _run_growisofs(cmd)
-                    stale_cache = returncode != 0 and any(
-                        "pread64" in ln and "primary volume descriptor" in ln
-                        for ln in output_lines
-                    )
+                    stale_cache = returncode != 0 and _is_stale_append_output(output_lines)
                 else:
                     _log.warning(
                         "%s did not reappear within the wait budget after "
@@ -523,6 +681,8 @@ class DiscBackend(BurnBackend):
     def _raise_append_failure(
         self, returncode: int, output_lines: list[str], stale_cache: bool,
         staging: Path, expected_session_count: int,
+        expected_archive_id: str | None = None,
+        expected_volume_index: int | None = None,
     ) -> None:
         """
         Input:  returncode, output_lines, stale_cache, staging,
@@ -550,6 +710,21 @@ class DiscBackend(BurnBackend):
                 "-- check the warning logged above it. Physically eject "
                 "and reinsert the disc (or reboot), then retry this sync."
             )
+        if _is_merge_too_large(output_lines):
+            self._mark_merge_too_large(output_lines)
+            raise RuntimeError(
+                "growisofs -M failed because the prior session is too large "
+                "to merge. This volume is not appendable."
+            )
+        if _crosses_4gb_boundary(output_lines):
+            self._mark_merge_too_large(output_lines)
+            raise RuntimeError(
+                "growisofs refused the append: the new session would cross "
+                "the 4 GiB boundary. Nothing was written. This disc is full "
+                "for appends; run sync again with a blank disc for a new "
+                "volume."
+            )
+
         if _is_disconnect(output_lines, self.device):
             _log.warning(
                 "%s: %s vanished mid-write; treating as disconnect",
@@ -562,7 +737,99 @@ class DiscBackend(BurnBackend):
         self._raise_if_disc_full(
             output_lines, staging, expected_session_count, is_init=False,
         )
-        raise RuntimeError(f"growisofs -M failed with exit code {returncode}")
+        _raise_if_long_write(output_lines)
+        self._finish_nonzero_burn(
+            returncode, output_lines, staging, expected_session_count, "-M",
+            expected_archive_id, expected_volume_index,
+        )
+
+    def _finish_nonzero_burn(
+        self,
+        returncode: int,
+        output_lines: list[str],
+        staging: Path,
+        expected_session_count: int,
+        flag: str,
+        archive_id: str | None = None,
+        volume_index: int | None = None,
+    ) -> None:
+        """
+        Input:  returncode, output_lines, staging, expected_session_count,
+                flag - "-Z" or "-M"
+        Output: None
+        Details:
+            After known failure signatures, treat a completed write as
+            success when the disc shows the session and volume.json.
+            Otherwise raise the existing exit-code error.
+        """
+        if self._confirm_completed_write(
+            returncode, output_lines, staging, expected_session_count,
+        ):
+            return
+        write_error = _media_write_error(output_lines)
+        if write_error is not None:
+            _log.warning("growisofs %s: media write error: %s", flag, write_error)
+            if flag == "-M":
+                self._mark_media_write_closed(write_error)
+                self._remember_not_appendable(
+                    write_error, archive_id, volume_index,
+                )
+                raise MediaWriteError(
+                    _media_write_append_message(write_error), write_error,
+                )
+            raise MediaWriteError(
+                f"The drive could not write this disc ({write_error}). "
+                "Use another blank disc and run init again.",
+                write_error,
+            )
+        raise RuntimeError(
+            f"growisofs {flag} failed with exit code {returncode}"
+        )
+
+    def _confirm_completed_write(
+        self,
+        returncode: int,
+        output_lines: list[str],
+        staging: Path,
+        expected_session_count: int,
+    ) -> bool:
+        """
+        Input:  returncode, output_lines, staging, expected_session_count
+        Output: True when the disc shows the new session and volume.json
+        Details:
+            growisofs can exit nonzero after it prints closing session.
+            The drive may report no medium for a short time. This
+            method invalidates listings, re-reads mediainfo, then
+            checks the session directory and volume.json. A readable
+            disc without those files returns False.
+        """
+        if not _write_completed(output_lines):
+            return False
+        session_n = _session_n_from_staging(staging)
+        if session_n is None:
+            session_n = expected_session_count
+        self.invalidate_session_list()
+        try:
+            self.mediainfo(retries=4, retry_delay=2.0)
+            listed = self.list_session_numbers()
+            found = self.read_paths(["volume.json"])
+        except Exception:
+            _log.exception(
+                "growisofs exited %s after the write completed. "
+                "The drive did not confirm the session",
+                returncode,
+            )
+            raise RuntimeError(_CLOSE_EXIT_UNREADABLE) from None
+        if session_n not in listed or "volume.json" not in found:
+            return False
+        _log.warning(
+            "growisofs exited %s after the write completed. "
+            "session_%03d and volume.json are on the disc. "
+            "Continuing as success.",
+            returncode,
+            session_n,
+        )
+        return True
 
     def _prior_session_clause(self, attempted: int) -> tuple[bool, str]:
         """
@@ -823,16 +1090,18 @@ class DiscBackend(BurnBackend):
         """
         last_err = ""
         for attempt in range(retries + 1):
-            result = subprocess.run(
-                ["dvd+rw-mediainfo", self.device],
-                capture_output=True,
-            )
+            result = _run_metadata(["dvd+rw-mediainfo", self.device])
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
             if result.returncode == 0:
                 stdout = result.stdout.decode("utf-8", errors="replace")
                 info = _parse_mediainfo(stdout)
                 info.label = self._read_label()
+                # scbc ignore[is-true-false-strict] None means unknown; only False closes -M
+                if info.appendable is False:
+                    self._merge_appendable = False
+
                 return info
+
             last_err = stderr
             if not _retry_mediainfo_error(
                 stderr, attempt, retries, retry_delay, self.device,
@@ -856,10 +1125,7 @@ class DiscBackend(BurnBackend):
             return list(self._session_numbers_cache)
         last_err = ""
         for _attempt in range(2):
-            result = subprocess.run(
-                ["xorriso", "-indev", self.device, "-ls", "/"],
-                capture_output=True,
-            )
+            result = _run_metadata(["xorriso", "-indev", self.device, "-ls", "/"])
             if result.returncode == 0:
                 entries = result.stdout.decode("utf-8", errors="replace").splitlines()
                 numbers = sorted(
@@ -878,13 +1144,54 @@ class DiscBackend(BurnBackend):
             f"Cannot list sessions on {self.device} after 2 attempts: {last_err}"
         )
 
+    def list_file_sizes(self) -> dict[str, int]:
+        """
+        Input:  None
+        Output: dict mapping disc-root-relative POSIX path to size in bytes
+        Details:
+            Runs one xorriso -find / -type f -exec report_lba call.
+            Retries once. A busy drive is unmounted before the retry.
+            Failure raises RuntimeError with the stderr tail.
+        """
+        cmd = [
+            "xorriso", "-indev", self.device,
+            "-find", "/", "-type", "f", "-exec", "report_lba",
+        ]
+        last_err = ""
+        for attempt in range(2):
+            result = _run_metadata(cmd)
+            stdout = result.stdout.decode("utf-8", errors="replace")
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            if result.returncode == 0:
+                return _parse_report_lba(stdout + stderr)
+            last_err = next(
+                (
+                    line for line in reversed(stderr.strip().splitlines())
+                    if line.strip()
+                ),
+                "unknown xorriso failure",
+            )
+            _log.warning(
+                "Cannot list file sizes on %s (attempt %d): %s",
+                self.device, attempt + 1, last_err,
+            )
+            if attempt == 0:
+                _retry_xorriso_read(self.device, stderr, 0, 1, 5.0)
+        raise RuntimeError(
+            f"Cannot list file sizes on {self.device} after 2 attempts: "
+            f"{last_err}"
+        )
+
     def invalidate_session_list(self) -> None:
         """
         Input:  None
         Output: None
-        Details: Clears the cached root listing so the next call lists fresh.
+        Details:
+            Clears the cached root and extent listings so the next call
+            reads the inserted medium.
         """
         self._session_numbers_cache = None
+        self._extents_cache = None
 
     def _read_xorriso_attempt(
         self, unique_paths: list[str],
@@ -916,6 +1223,67 @@ class DiscBackend(BurnBackend):
                         raise RuntimeError(f"Control file exceeds size limit: {path}")
                     found[path] = dest.read_bytes()
             return found, stderr, bool(found) or "Cannot determine attributes of" in stderr
+
+    def list_file_extents(self) -> dict[str, tuple[int, int]]:
+        """
+        Input:  None
+        Output: dict mapping path to (start LBA, size in bytes)
+        Details:
+            One xorriso -find / -type f -exec report_lba call, cached
+            until invalidate_session_list. Failure raises RuntimeError.
+        """
+        if self._extents_cache is not None:
+            return dict(self._extents_cache)
+        cmd = [
+            "xorriso", "-indev", self.device,
+            "-find", "/", "-type", "f", "-exec", "report_lba",
+        ]
+        for attempt in range(2):
+            result = _run_metadata(cmd)
+            stdout = result.stdout.decode("utf-8", errors="replace")
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            if result.returncode == 0:
+                self._extents_cache = _parse_report_lba_extents(stdout + stderr)
+                return dict(self._extents_cache)
+            last_err = next(
+                (
+                    line for line in reversed(stderr.strip().splitlines())
+                    if line.strip()
+                ),
+                "unknown xorriso failure",
+            )
+            if not _retry_xorriso_read(self.device, stderr, attempt, 1, 5.0):
+                break
+        raise RuntimeError(
+            f"Cannot list file extents on {self.device}: {last_err}"
+        )
+
+    def _order_paths_by_lba(self, paths: list[str]) -> list[str]:
+        """
+        Input:  paths - validated disc paths in request order
+        Output: the same paths sorted by start LBA, unknown paths last
+        Details:
+            A DVD seek costs about 100 ms, roughly 1 MB of read time at
+            DVD speed. One listing call is only worth it for a batch of
+            small files, so short batches keep their request order.
+        """
+        if len(paths) < _LBA_ORDER_MIN_PATHS:
+            return paths
+        try:
+            extents = self.list_file_extents()
+        except (RuntimeError, OSError) as exc:
+            _log.warning("Cannot order reads by LBA: %s", exc)
+            return paths
+        indexed = list(enumerate(paths))
+        return [
+            path for _index, path in sorted(
+                indexed,
+                key=lambda item: (
+                    extents[item[1]][0] if item[1] in extents else _LBA_UNKNOWN,
+                    item[0],
+                ),
+            )
+        ]
 
     def read_paths(
         self,
@@ -950,16 +1318,14 @@ class DiscBackend(BurnBackend):
             validate_disc_read_path(path)
         if not unique_paths:
             return {}
+        unique_paths = self._order_paths_by_lba(unique_paths)
 
         last_err = ""
         for attempt in range(retries + 1):
             found, stderr, complete = self._read_xorriso_attempt(unique_paths)
             if complete:
                 return found
-            last_err = next(
-                (line for line in reversed(stderr.strip().splitlines()) if line.strip()),
-                "unknown xorriso failure",
-            )
+            last_err = _xorriso_cause(stderr)
             if not _retry_xorriso_read(self.device, stderr, attempt, retries, retry_delay):
                 break
         raise RuntimeError(
@@ -1001,6 +1367,8 @@ class DiscBackend(BurnBackend):
         result = subprocess.run(cmd, capture_output=True)
         stderr = result.stderr.decode("utf-8", errors="replace")
         if dest.exists() and dest.is_file():
+            if not self._extracted_sizes_match([(path, dest)], stderr):
+                return False, stderr
             return True, stderr
         if "Cannot determine attributes of" in stderr:
             raise FileNotFoundError(f"Path not found on disc: {path!r}")
@@ -1028,10 +1396,11 @@ class DiscBackend(BurnBackend):
             extracted, stderr = self._extract_xorriso_attempt(path, dest)
             if extracted:
                 return
-            last_err = next(
-                (line for line in reversed(stderr.strip().splitlines()) if line.strip()),
-                "unknown xorriso failure",
-            )
+            last_err = _xorriso_cause(stderr)
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                _log.exception("Could not remove partial extract dest %s", dest)
             if not _retry_xorriso_read(self.device, stderr, attempt, retries, retry_delay):
                 break
         raise RuntimeError(
@@ -1046,32 +1415,24 @@ class DiscBackend(BurnBackend):
         Input:  unique_paths - requested paths in extraction order
                 max_bytes - maximum total listed bytes
         Output: listed paths that fit the budget
+        Details:
+            Uses the cached extent listing, so a batch that is already
+            sorted get no second xorriso pass.
         """
-        cmd = [
-            "xorriso", "-indev", self.device,
-            "-find", "/", "-type", "f", "-exec", "report_lba", "--",
-        ]
-        result = subprocess.run(cmd, capture_output=True)
-        if result.returncode != 0:
-            error = result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Cannot list disc file sizes: {error}")
-        sizes: dict[str, int] = {}
-        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
-            match = re.fullmatch(
-                r"File data lba:\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,"
-                r"\s*(\d+)\s*,\s*'(/[^']+)'", line,
-            )
-            if match:
-                sizes[match.group(2)[1:]] = int(match.group(1))
+        try:
+            extents = self.list_file_extents()
+        except (RuntimeError, OSError) as exc:
+            _log.warning("Cannot list disc file sizes: %s", exc)
+            raise RuntimeError(f"Cannot list disc file sizes: {exc}") from exc
         written = 0
         for path in unique_paths:
-            size = sizes.get(path)
-            if size is None:
+            found = extents.get(path)
+            if found is None:
                 continue
-            if written + size > max_bytes:
+            if written + found[1] > max_bytes:
                 raise RuntimeError("Not enough local space to extract archive blobs.")
-            written += size
-        return [path for path in unique_paths if path in sizes]
+            written += found[1]
+        return [path for path in unique_paths if path in extents]
 
     def extract_paths(
         self,
@@ -1099,6 +1460,7 @@ class DiscBackend(BurnBackend):
             validate_disc_read_path(path)
         if not unique_paths:
             return 0
+        unique_paths = self._order_paths_by_lba(unique_paths)
         if max_bytes is not None:
             unique_paths = self._paths_within_disc_budget(unique_paths, max_bytes)
             if not unique_paths:
@@ -1118,6 +1480,11 @@ class DiscBackend(BurnBackend):
         """
         Input: paths and scratch root
         Output: whether extraction is complete and xorriso stderr
+        Details:
+            A device error can stop xorriso after it created an output
+            file, so each extracted file must match its listed size.
+            Otherwise a truncated blob looks complete and restore loops
+            on the same disc.
         """
         dests: list[tuple[str, Path]] = []
         cmd = [
@@ -1133,10 +1500,40 @@ class DiscBackend(BurnBackend):
         result = subprocess.run(cmd, capture_output=True)
         stderr = result.stderr.decode("utf-8", errors="replace")
         if any(dest.is_file() for _path, dest in dests):
+            if not self._extracted_sizes_match(dests, stderr):
+                return False, stderr
             return True, stderr
         if "Cannot determine attributes of" in stderr:
             return True, stderr
         return False, stderr
+
+    def _extracted_sizes_match(
+        self, dests: list[tuple[str, Path]], stderr: str,
+    ) -> bool:
+        """
+        Input:  dests - (disc path, extracted file) pairs; stderr - xorriso text
+        Output: True when every extracted file matches the listed size
+        Details:
+            Uses the cached extent listing. When listing fails, accept
+            the extraction rather than block a restore on the listing.
+        """
+        try:
+            extents = self.list_file_extents()
+        except (RuntimeError, OSError) as exc:
+            _log.warning("Cannot verify extracted sizes: %s", exc)
+            return True
+        for disc_path, dest in dests:
+            found = extents.get(disc_path)
+            if found is None or not dest.is_file():
+                continue
+            if dest.stat().st_size != found[1]:
+                _log.warning(
+                    "Short read of %s: %d of %d bytes; retrying",
+                    disc_path, dest.stat().st_size, found[1],
+                )
+                dest.unlink(missing_ok=True)
+                return False
+        return True
 
     def _xorriso_extract_all(
         self,
@@ -1155,10 +1552,7 @@ class DiscBackend(BurnBackend):
             complete, stderr = self._xorriso_extract_attempt(paths, scratch)
             if complete:
                 return
-            last_err = next(
-                (line for line in reversed(stderr.strip().splitlines()) if line.strip()),
-                "unknown xorriso failure",
-            )
+            last_err = _xorriso_cause(stderr)
             if not _retry_xorriso_read(self.device, stderr, attempt, retries, retry_delay):
                 break
         raise RuntimeError(
@@ -1278,6 +1672,34 @@ def _copy_iso_blob(src: Path, dest: Path, size: int, path: str) -> None:
     finally:
         if owned:
             os.close(fd)
+
+
+def _list_tree_file_sizes(root: Path) -> dict[str, int]:
+    """
+    Input:  root - sessions_root directory
+    Output: dict of relative POSIX path to size in bytes
+    Details:
+        Walks root. Does not follow symbolic links. Skips publish temp
+        names at the root, the same names recover treats.
+    """
+    sizes: dict[str, int] = {}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        current = Path(dirpath)
+        if current == root:
+            dirnames[:] = [
+                name for name in dirnames
+                if _PUBLISH_TEMP_RE.fullmatch(name) is None
+            ]
+            filenames = [
+                name for name in filenames
+                if _PUBLISH_TEMP_RE.fullmatch(name) is None
+            ]
+        for name in filenames:
+            path = current / name
+            st = path.lstat()
+            if stat.S_ISREG(st.st_mode):
+                sizes[path.relative_to(root).as_posix()] = st.st_size
+    return sizes
 
 
 class ISOBackend(BurnBackend):
@@ -1425,6 +1847,23 @@ class ISOBackend(BurnBackend):
         numbers = self._scan_session_numbers()
         self._session_numbers_cache = numbers
         return numbers
+
+    def list_file_sizes(self) -> dict[str, int]:
+        """
+        Input:  None
+        Output: dict mapping disc-root-relative POSIX path to size in bytes
+        Details:
+            Walks the sessions_root tree. Skips publish temp items.
+            Does not follow symbolic links.
+        """
+        root = self._sessions_root
+        if not root.exists():
+            return {}
+        try:
+            return _list_tree_file_sizes(root)
+        except OSError:
+            _log.exception("Cannot list file sizes in %s", root)
+            raise RuntimeError(f"Cannot list file sizes in {root}")
 
     def invalidate_session_list(self) -> None:
         """
@@ -1705,6 +2144,8 @@ def _pvd_label(descriptor: bytes) -> str:
 _GROWISOFS_PROGRESS_RE = re.compile(
     r"^\s*(\d+)/(\d+)\s+\(\s*([\d.]+)%\)\s+@([^,]+),\s*remaining\s+(\S+):(\S+)"
 )
+# growisofs disc-write complete: "builtin_dd: N*2KB out" or "N*2KB written".
+_EXTENTS_WRITTEN_RE = re.compile(r"\d+\*\d+\s*kb\s+(out|written)")
 # The build-phase update from the mkisofs/xorriso child process, e.g.
 # "xorriso : UPDATE :       8 files added in 1 seconds".
 _XORRISO_FILES_ADDED_RE = re.compile(r"UPDATE\s*:\s*(\d+)\s+files added")
@@ -1757,6 +2198,15 @@ _XORRISO_ISO_SESSION_VOLID_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _XORRISO_PROFILE_HEX_RE = re.compile(r"\(([0-9A-Fa-f]{4})h\)")
+# A batch below this size reads faster in request order than it gains
+# from a listing call plus seeks worth avoiding.
+_LBA_ORDER_MIN_PATHS = 6
+# Sort key for a path that is absent from the extent listing.
+_LBA_UNKNOWN = 1 << 62
+
+_REPORT_LBA_RE = re.compile(
+    r"^File data lba:\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(.*\S)\s*$"
+)
 
 
 
@@ -1868,6 +2318,112 @@ def _run_burn_cmd(
     return returncode, output_lines
 
 
+_UNREADABLE_TREE_HINT = (
+    " The disc has no readable ISO filesystem. The last burn was probably "
+    "interrupted before it closed. A DVD-R in this state cannot be "
+    "rewritten; use a new blank disc."
+)
+
+
+def _xorriso_cause(stderr: str) -> str:
+    """
+    Input:  stderr - xorriso error output
+    Output: the most specific failure line, with a hint for known causes
+    Details:
+        xorriso ends with a generic "-return_with SORRY 32" NOTE. The
+        FAILURE line before it names the real cause.
+    """
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    failure = next((line for line in lines if ": FAILURE :" in line), None)
+    cause = failure or (lines[-1] if lines else "unknown xorriso failure")
+    if "Cannot read ISO image tree" in cause:
+        cause += _UNREADABLE_TREE_HINT
+    return cause
+
+
+def _run_metadata(cmd: list[str]) -> subprocess.CompletedProcess:
+    """
+    Input:  cmd - a drive listing or mediainfo command
+    Output: CompletedProcess
+    Details:
+        Raises DriveUnresponsive on timeout instead of returning a failed
+        result, so callers do not retry or fall back to unbounded reads.
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=_METADATA_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        _log.warning("%s did not answer within %d s", cmd[0], _METADATA_TIMEOUT_S)
+        raise DriveUnresponsive(
+            f"The drive did not answer {cmd[0]} within {_METADATA_TIMEOUT_S} s. "
+            "It may be locked by an interrupted write. Unplug its power and "
+            "USB cable, wait 10 seconds, reconnect it, and retry."
+        ) from exc
+
+
+def _is_stale_append_output(output_lines: list[str]) -> bool:
+    """
+    Input:  output_lines - growisofs and genisoimage output
+    Output: True when the kernel served a stale view of the prior session
+    Details:
+        Two shapes are known on a USB bridge: xorriso reporting a bad
+        primary volume descriptor while it preads the old image, and
+        genisoimage failing to seek in the old image it was given.
+    """
+    text = "\n".join(output_lines).lower()
+    if "pread64" in text and "primary volume descriptor" in text:
+        return True
+    return "seek error on old image" in text
+
+_LONG_WRITE_MESSAGE = (
+    "The drive is still finishing an interrupted write (LONG WRITE IN "
+    "PROGRESS) and refuses new commands. A USB reset does not clear this. "
+    "Unplug the drive's power and USB cable, wait 10 seconds, reconnect it, "
+    "and run the command again. A DVD-R whose first burn was interrupted "
+    "can stay unwritable after that; use a new blank disc if it does."
+)
+
+_CLOSE_EXIT_UNREADABLE = (
+    "The write finished. The drive did not confirm the new session. "
+    "Run oddarchiver-usb-reauth or reinsert the disc. Then run sync. "
+    "Sync resumes safely. This error does not mean the disc is bad."
+)
+
+
+def _raise_if_long_write(output_lines: list[str]) -> None:
+    """
+    Input:  output_lines - growisofs output after a failed burn
+    Output: None; raises RuntimeError when the drive reports a pending write
+    Details:
+        A killed burn leaves the drive answering every MODE SELECT with
+        SK=2h LONG WRITE IN PROGRESS, after which growisofs exits 139.
+    """
+    if "long write in progress" in "\n".join(output_lines).lower():
+        _log.warning("Drive reports LONG WRITE IN PROGRESS after a failed burn")
+        raise RuntimeError(_LONG_WRITE_MESSAGE)
+
+
+def _crosses_4gb_boundary(output_lines: list[str]) -> bool:
+    """
+    Input:  output_lines - growisofs output after a failed -M
+    Output: True when growisofs refused a session past the 4 GiB boundary
+    """
+    return "would cross 4gb boundary" in "\n".join(output_lines).lower()
+
+
+def _is_merge_too_large(output_lines: list[str]) -> bool:
+    """
+    Input:  output_lines - growisofs and genisoimage output
+    Output: True when the merge source exceeds the ISO9660 file size
+    Details:
+        Do not treat USB stale-cache pread64 failures as this limit.
+    """
+    if _is_stale_append_output(output_lines):
+        return False
+    blob = "\n".join(output_lines).lower()
+    return "value too large for defined data type" in blob
+
+
+
 def _run_growisofs(cmd: list[str]) -> tuple[int, list[str]]:
     """
     Input:  cmd - full growisofs argv
@@ -1926,6 +2482,109 @@ def _is_disc_full_signature(output_lines: list[str]) -> bool:
     )
 
 
+_WRITE_ERROR_RE = re.compile(r"unable to write@lba=([0-9a-f]+)h", re.IGNORECASE)
+
+
+def _media_write_error(output_lines: list[str]) -> str | None:
+    """
+    Input:  output_lines - captured growisofs stdout/stderr lines
+    Output: short description of a media write error, or None
+    Details:
+        Real DVD-R T19A: growisofs printed ":-( unable to WRITE@LBA=1954d0h:
+        Input/output error" and "write failed: Input/output error", then
+        closed the session and exited 5. The LBA is hex.
+    """
+    for line in output_lines:
+        match = _WRITE_ERROR_RE.search(line)
+        if match:
+            return f"write error at block {int(match.group(1), 16)}"
+    blob = "\n".join(output_lines).lower()
+    if "write failed: input/output error" in blob:
+        return "write error"
+    return None
+
+
+def _media_write_append_message(write_error: str) -> str:
+    """Input: short write-error text. Output: append failure message."""
+    return (
+        f"The drive could not write this disc ({write_error}). "
+        "The new session did not land. A failed append does not "
+        "change earlier sessions; run verify on this disc to "
+        "confirm them. Do not append to this disc again: use "
+        "another disc for this sync."
+    )
+
+
+def is_media_write_error(exc: BaseException) -> bool:
+    """Input: exception. Output: True when growisofs reported a media write error."""
+    if isinstance(exc, MediaWriteError):
+        return True
+    return "write error at block" in str(exc)
+
+
+def media_write_reason(exc: BaseException) -> str:
+    """Input: media write exception. Output: short reason for local memory."""
+    if isinstance(exc, MediaWriteError):
+        return exc.write_error
+    match = _WRITE_ERROR_RE.search(str(exc))
+    if match:
+        return f"write error at block {int(match.group(1), 16)}"
+    return "media write error"
+
+
+
+def _write_completed(output_lines: list[str]) -> bool:
+    """
+    Input:  output_lines - captured growisofs stdout/stderr lines
+    Output: True when growisofs printed a session-close or extents-written line
+    Details:
+        The genisoimage "N extents written" line is ISO build, not disc
+        close. Match growisofs N*2KB out/written instead.
+    """
+    for line in output_lines:
+        lower = line.lower()
+        if "closing session" in lower or "closing track" in lower:
+            return True
+        if _EXTENTS_WRITTEN_RE.search(lower):
+            return True
+        match = _GROWISOFS_PROGRESS_RE.match(line)
+        if (
+            match is not None
+            and match.group(1) == match.group(2)
+            and match.group(1) != "0"
+        ):
+            return True
+    return False
+
+
+
+def _count_from_listing(listed: list[int], first_session: int | None) -> int:
+    """Input: session listing and first session. Output: next session number."""
+    if listed:
+        return max(listed) + 1
+    return 0 if first_session is None else first_session
+
+
+def _count_from_manifests(
+    backend: "BurnBackend", first_session: int | None,
+) -> int:
+    """Input: backend and first session. Output: next session number from manifests."""
+    from oddarchiver.volume import read_volume_marker
+    from oddarchiver.manifest import load_session_manifests
+
+    marker = read_volume_marker(backend)
+    first = first_session if first_session is not None else (
+        marker.first_session if marker else 0
+    )
+    loaded = load_session_manifests(
+        backend, start_session=first, marker=marker,
+    )
+    # scbc ignore[type-equality] Reject bool as a session number
+    sessions = [m.session for m in loaded if type(m.session) is int and m.session >= 0]
+    if sessions:
+        return max(sessions) + 1
+    return first
+
 
 def archive_session_count(
     backend: BurnBackend,
@@ -1936,39 +2595,28 @@ def archive_session_count(
     Input:  backend       - BurnBackend to read the current volume from
             listed        - session numbers the caller already knows
             first_session - first session on this volume, if the caller knows it
-    Output: int - first_session plus the number of archive sessions on
-            this volume
+    Output: int - one more than the highest session number on this volume
     Details:
         Authoritative counter for the double-burn guard. MMC
         session_count is not this number. BD-R SRM+POW reports 1 after
         the first burn, because growisofs appends each new archive
         session as a track inside one MMC session.
 
-        When the caller passes a session listing, the count is the
-        listing size plus the first session, with no control-file read.
-        Without a listing, the backend lists once (cached per command).
-        A backend that cannot list falls back to loading session
-        manifests from first_session.
-
-        A missing volume marker treats first_session as 0 (legacy or
-        single-volume).
+        When the caller passes a session listing, the count is one more
+        than the highest listed session, with no control-file read.
+        An empty listing uses first_session, or 0. Without a listing,
+        the backend lists once (cached per command). A backend that
+        cannot list falls back to loading session manifests from
+        first_session. A missing volume marker treats first_session as
+        0 (legacy or single-volume). For a contiguous disc this matches
+        first_session plus the listing length.
     """
-    from oddarchiver.volume import read_volume_marker
-    from oddarchiver.manifest import load_session_manifests
-
     if listed is None:
         listed = backend.list_session_numbers()
     if listed is not None:
-        if first_session is None:
-            first_session = min(listed, default=0)
-        return first_session + len(listed)
-    marker = read_volume_marker(backend)
-    first = first_session if first_session is not None else (
-        marker.first_session if marker else 0
-    )
-    return first + len(load_session_manifests(
-        backend, start_session=first, marker=marker,
-    ))
+        return _count_from_listing(listed, first_session)
+    return _count_from_manifests(backend, first_session)
+
 
 
 def check_volume_identity(
@@ -2119,7 +2767,15 @@ def parse_disc_size(size_str: str) -> int:
     for suffix, multiplier in sorted(units.items(), key=lambda x: -len(x[0])):
         if s.endswith(suffix):
             return int(float(s[: -len(suffix)]) * multiplier)
-    return int(s)
+    try:
+        return int(s)
+    except ValueError as exc:
+        logger.warning("Unrecognized disc size %r", size_str)
+        raise ValueError(
+            f"Unrecognized disc size {size_str!r}. Use a number with a unit "
+            f"(500mb, 25gb, 93gib), a byte count, or a preset: "
+            f"{', '.join(_DISC_SIZE_PRESETS)}."
+        ) from exc
 
 
 def _copy_staging(staging: Path, dest_root: Path) -> None:
@@ -2365,6 +3021,78 @@ def _remaining_media_bytes(
     return 0
 
 
+def _unquote_xorriso_path(quoted: str) -> str:
+    """
+    Input:  quoted - xorriso Text_shellsafe path field
+    Output: decoded path string
+    Details:
+        xorriso wraps the ISO path in single quotes. An apostrophe in a
+        name is written as '"'"' (POSIX shell concatenation).
+    """
+    text = quoted.strip()
+    if not text or text[0] != "'":
+        return text
+    parts: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "'":
+            i += 1
+            start = i
+            while i < n and text[i] != "'":
+                i += 1
+            parts.append(text[start:i])
+            if i < n:
+                i += 1
+            continue
+        if text.startswith('"\'"', i):
+            parts.append("'")
+            i += 3
+            continue
+        parts.append(text[i:])
+        break
+    return "".join(parts)
+
+
+def _parse_report_lba_extents(text: str) -> dict[str, tuple[int, int]]:
+    """
+    Input:  text - xorriso report_lba stdout and stderr
+    Output: dict mapping disc-root-relative path to (start LBA, size in bytes)
+    Details:
+        Reads File data lba lines. A multi-extent file keeps its first LBA.
+    """
+    extents: dict[str, tuple[int, int]] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("File data lba:"):
+            continue
+        match = _REPORT_LBA_RE.match(stripped)
+        if match is None:
+            _log.warning("Cannot parse xorriso report_lba line: %s", stripped)
+            continue
+        lba = int(match.group(2))
+        size = int(match.group(4))
+        path = _unquote_xorriso_path(match.group(5))
+        if path.startswith("/"):
+            path = path[1:]
+        if not path:
+            continue
+        if path not in extents:
+            extents[path] = (lba, size)
+    return extents
+
+
+def _parse_report_lba(text: str) -> dict[str, int]:
+    """
+    Input:  text - xorriso report_lba stdout and stderr
+    Output: dict mapping disc-root-relative POSIX path to size in bytes
+    Details:
+        Reads lines that start with File data lba:. Filesize is column 4
+        and is the whole file size. A multi-extent file is counted once.
+    """
+    return {path: size for path, (_lba, size) in _parse_report_lba_extents(text).items()}
+
+
 def _parse_mediainfo(stdout: str) -> DiscInfo:
     """
     Input:  stdout - text output from dvd+rw-mediainfo
@@ -2382,6 +3110,8 @@ def _parse_mediainfo(stdout: str) -> DiscInfo:
     # Free Blocks: appears once per track. The last entry is the writable track.
     free_blocks_all = re.findall(r"Free Blocks:\s+" + _BLOCKS_RE, stdout)
     capacity_match = re.search(r"READ CAPACITY:\s+" + _BLOCKS_RE, stdout)
+    # Last entry: the open track, where the next session would start.
+    next_writable_all = re.findall(r"Next Writable Address:\s+" + _BLOCKS_RE, stdout)
     disc_status_match = re.search(r"Disc status:\s+(\S+)", stdout, re.IGNORECASE)
     last_session_match = re.search(r"State of Last Session:\s+(\S+)", stdout, re.IGNORECASE)
 
@@ -2394,7 +3124,15 @@ def _parse_mediainfo(stdout: str) -> DiscInfo:
     remaining_bytes = _remaining_media_bytes(remaining_match, free_blocks_all)
 
     total_bytes = int(capacity_match.group(1)) * 2048 if capacity_match else 0
-    used_bytes = max(0, total_bytes - remaining_bytes)
+    # READ CAPACITY is the whole medium on BD-R SRM but only the recorded
+    # area on DVD-R, so "capacity minus remaining" under-reports DVD-R use
+    # (T15: 3.99 GB reported, 4.30 GB recorded). The next writable address
+    # is where growisofs places the next session on both, and its 4 GiB
+    # boundary check measures exactly that.
+    if next_writable_all:
+        used_bytes = int(next_writable_all[-1]) * 2048
+    else:
+        used_bytes = max(0, total_bytes - remaining_bytes)
 
     disc_status = disc_status_match.group(1).lower() if disc_status_match else ""
     last_session_state = last_session_match.group(1).lower() if last_session_match else ""
@@ -2409,4 +3147,5 @@ def _parse_mediainfo(stdout: str) -> DiscInfo:
         remaining_bytes=remaining_bytes,
         used_bytes=used_bytes,
         label="",
+        appendable=used_bytes < GROWISOFS_MERGE_LIMIT_BYTES,
     )

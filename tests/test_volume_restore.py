@@ -17,19 +17,25 @@ from unittest.mock import MagicMock
 import pytest
 
 from oddarchiver.cache import CacheManager
-from oddarchiver.catalog import remember_encryption_mode
-from oddarchiver.cli import _run_restore
+from oddarchiver.catalog import (
+    ArchiveCatalog, CatalogDisc, build_archive_catalog, learn_disc,
+    remember_encryption_mode,
+)
+from oddarchiver.cli import _run_restore, build_parser, dispatch
 from oddarchiver.crypto import NullCrypto
 from oddarchiver.disc import ISOBackend
 from oddarchiver.ledger import ledger_dir
-from oddarchiver.manifest import Manifest, ManifestEntry, read_manifest, write_manifest
+from oddarchiver.manifest import Manifest, ManifestEntry, load_session_manifests, read_manifest, write_manifest
 from oddarchiver.restore import restore
+from oddarchiver.restore_plan import restore_archive
 from oddarchiver.restore_state import load_restore_state
 from oddarchiver.session import build_staging
 from oddarchiver.volume import (
-    VolumeMarker, build_volume_baseline, write_volume_marker,
+    PathVersion, VolumeMarker, build_volume_baseline, read_volume_marker,
+    write_volume_marker,
 )
-from tests.helpers import _write_prior_baseline
+from tests.helpers import _write_prior_baseline, fill
+from tests.test_fill_layout import IsolatedDrive, _copy_isolated_iso
 
 # Globals
 _DISC = 100_000
@@ -85,11 +91,11 @@ def _build_three_volumes(tmp_path: Path) -> tuple[Path, list[Path]]:
     """Build three independent marked ISO discs and their v2 baselines."""
     source = tmp_path / "src"
     source.mkdir()
-    (source / "a.bin").write_bytes(b"A" * _FILE_BYTES)
-    (source / "b.bin").write_bytes(b"B" * _FILE_BYTES)
+    (source / "a.bin").write_bytes(fill(b"A", _FILE_BYTES))
+    (source / "b.bin").write_bytes(fill(b"B", _FILE_BYTES))
     sub = source / "sub"
     sub.mkdir()
-    (sub / "c.bin").write_bytes(b"C" * _FILE_BYTES)
+    (sub / "c.bin").write_bytes(fill(b"C", _FILE_BYTES))
 
     pack_backend = ISOBackend(tmp_path / "pack.iso", disc_size=_DISC)
     chunks = build_staging(
@@ -278,14 +284,14 @@ def test_delta_without_prior_volume_is_unresolved(tmp_path):
 def _assert_single_disc_cli_files(dest: Path, source: Path) -> None:
     """Input: destination and source paths. Output: verified single-disc contents."""
     assert (dest / "sub" / "c.bin").read_bytes() == (source / "sub" / "c.bin").read_bytes()
-    assert (dest / "sub" / "c.bin").read_bytes() == b"C" * _FILE_BYTES
+    assert (dest / "sub" / "c.bin").read_bytes() == fill(b"C", _FILE_BYTES)
     assert not (dest / "a.bin").exists()
     assert not (dest / "b.bin").exists()
     restored = {
         str(path.relative_to(dest)): path.read_bytes()
         for path in dest.rglob("*") if path.is_file()
     }
-    assert restored == {"sub/c.bin": b"C" * _FILE_BYTES}
+    assert restored == {"sub/c.bin": fill(b"C", _FILE_BYTES)}
 
 
 def test_cli_single_disc_notice_without_needed_volume(tmp_path, capsys):
@@ -317,3 +323,271 @@ def test_cli_single_disc_notice_without_needed_volume(tmp_path, capsys):
     assert "Restore needs volume" not in out.out + out.err
     assert "Other discs can hold newer versions" in out.err
     _assert_single_disc_cli_files(dest, source)
+
+
+_FILL_DISC = "8mb"
+_FILL_DISC_BYTES = 8_000_000
+
+
+def _fill_dispatch(argv: list[str]) -> int:
+    """Input: CLI argv. Output: dispatch exit code."""
+    return dispatch(build_parser().parse_args(argv))
+
+
+def _restored_files(dest: Path) -> dict[str, bytes]:
+    """Input: restore destination. Output: relative path to file bytes."""
+    return {
+        str(path.relative_to(dest)): path.read_bytes()
+        for path in dest.rglob("*") if path.is_file()
+    }
+
+
+def _build_filled_two_volume_archive(tmp_path: Path, monkeypatch):
+    """
+    Input: tmp_path, monkeypatch
+    Output: source dir, volume-0 ISO, volume-1 ISO, and source file bytes
+    Details: Volume 0 holds a.bin then a fill session for c.bin. Volume 1
+        holds b.bin. Matches the host fill-restore data-loss layout.
+    """
+    def _boom(prompt=""):
+        raise AssertionError(f"ISOBackend must not call input(): {prompt!r}")
+
+    monkeypatch.setattr("builtins.input", _boom)
+    source = tmp_path / "src"
+    source.mkdir()
+    a_bytes = fill(b"A", 3_000_000)
+    b_bytes = fill(b"B", 5_500_000)
+    c_bytes = fill(b"C", 40_000)
+    (source / "a.bin").write_bytes(a_bytes)
+    iso = tmp_path / "v.iso"
+    assert _fill_dispatch([
+        "init", str(source), "--test-iso", str(iso),
+        "--disc-size", _FILL_DISC, "--label", "FS",
+    ]) == 0
+    (source / "b.bin").write_bytes(b_bytes)
+    assert _fill_dispatch([
+        "sync", str(source), "--test-iso", str(iso),
+        "--disc-size", _FILL_DISC, "--no-fill",
+    ]) == 0
+    vol1 = tmp_path / "v.vol1.iso"
+    assert vol1.is_file()
+    (source / "c.bin").write_bytes(c_bytes)
+    assert _fill_dispatch([
+        "sync", str(source), "--test-iso", str(vol1),
+        "--disc-size", _FILL_DISC, "--fill",
+    ]) == 0
+    return source, iso, vol1, {"a.bin": a_bytes, "b.bin": b_bytes, "c.bin": c_bytes}
+
+
+def _restore_all_disks(dest: Path, iso: Path) -> int:
+    """Input: dest and starting ISO. Output: restore exit code."""
+    return _fill_dispatch([
+        "restore", str(dest), "--test-iso", str(iso), "--all-disks",
+    ])
+
+
+class _ScriptedIsolatedAcquisition:
+    """Yield IsolatedDrive volumes by index. No sibling ISO scan."""
+
+    image = None
+
+    def __init__(self, volumes: dict[int, IsolatedDrive]) -> None:
+        self.volumes = volumes
+        self.needed_log: list[dict[int, int]] = []
+        self.yielded: list[int] = []
+
+    def acquire(self, needed, catalog, archive_id):
+        self.needed_log.append(dict(needed))
+        for index in sorted(needed):
+            drive = self.volumes.get(index)
+            if drive is None:
+                continue
+            self.yielded.append(index)
+            return drive, None, False
+        return None, next(iter(needed)), False
+
+
+def _isolated_fill_volumes(tmp_path: Path, iso: Path, vol1: Path) -> dict[int, IsolatedDrive]:
+    """Input: tmp_path and the two ISO paths. Output: IsolatedDrive per volume."""
+    iso0 = _copy_isolated_iso(iso, tmp_path / "only0")
+    iso1 = _copy_isolated_iso(vol1, tmp_path / "only1")
+    return {
+        0: IsolatedDrive(iso0, _FILL_DISC_BYTES),
+        1: IsolatedDrive(iso1, _FILL_DISC_BYTES),
+    }
+
+
+def _restore_isolated(
+    dest: Path, start_index: int, volumes: dict[int, IsolatedDrive],
+) -> tuple[object, _ScriptedIsolatedAcquisition]:
+    """
+    Input: dest, starting volume index, IsolatedDrive map
+    Output: restore result and the scripted acquisition
+    """
+    start = volumes[start_index]
+    marker = read_volume_marker(start)
+    assert marker is not None
+    manifests = load_session_manifests(
+        start, _crypto, start_session=marker.first_session, marker=marker,
+    )
+    catalog = build_archive_catalog(start, _crypto, manifests, marker)
+    acquisition = _ScriptedIsolatedAcquisition(volumes)
+    result = restore_archive(
+        dest, start, _crypto, catalog, manifests=manifests,
+        acquisition=acquisition,
+    )
+    return result, acquisition
+
+
+def _assert_missing_requested_once(
+    acquisition: _ScriptedIsolatedAcquisition, start_index: int, missing: set[int],
+) -> None:
+    """Input: acquisition log, start index, missing indexes. Output: None."""
+    requested = [index for needed in acquisition.needed_log for index in needed]
+    for index in missing:
+        assert requested.count(index) == 1, requested
+    assert start_index not in requested
+
+
+def test_fill_restore_all_disks_from_either_volume(tmp_path, monkeypatch):
+    """
+    Input: two ISO volumes in separate dirs after a fill onto volume 0
+    Output: each missing volume requested once; all three files match from either start
+    """
+    _source, iso, vol1, expected = _build_filled_two_volume_archive(
+        tmp_path, monkeypatch,
+    )
+    volumes_new = _isolated_fill_volumes(tmp_path / "from1", iso, vol1)
+    dest_new = tmp_path / "out-new"
+    result_new, acq_new = _restore_isolated(dest_new, 1, volumes_new)
+    assert result_new.failures == 0
+    _assert_missing_requested_once(acq_new, 1, {0})
+    assert _restored_files(dest_new) == expected
+    volumes_old = _isolated_fill_volumes(tmp_path / "from0", iso, vol1)
+    dest_old = tmp_path / "out-old"
+    result_old, acq_old = _restore_isolated(dest_old, 0, volumes_old)
+    assert result_old.failures == 0
+    _assert_missing_requested_once(acq_old, 0, {1})
+    assert _restored_files(dest_old) == expected
+
+
+
+def test_fill_verify_full_both_volumes(tmp_path, monkeypatch, capsys):
+    """
+    Input: filled two-volume ISO archive with the burn ledger still present
+    Output: verify --level full reports 0 errors on both volumes
+    """
+    from oddarchiver.ledger import load_ledger
+
+    _source, iso, vol1, _expected = _build_filled_two_volume_archive(
+        tmp_path, monkeypatch,
+    )
+    marker = read_volume_marker(ISOBackend(iso, disc_size=_FILL_DISC_BYTES))
+    assert marker is not None
+    assert load_ledger(
+        "FS", str(iso), volume_index=0, archive_id=marker.archive_id,
+    ) is not None
+    capsys.readouterr()
+    assert _fill_dispatch([
+        "verify", "--test-iso", str(iso), "--level", "full",
+    ]) == 0
+    out0 = capsys.readouterr().out
+    assert "0 error" in out0
+    assert _fill_dispatch([
+        "verify", "--test-iso", str(vol1), "--level", "full",
+    ]) == 0
+    out1 = capsys.readouterr().out
+    assert "0 error" in out1
+
+
+def test_fill_restore_without_local_memory_learns_filled_disc(tmp_path, monkeypatch):
+    """
+    Input: filled archive with local disc records removed; isolated volume 1
+    Output: acquisition yields volume 0 once; all three files match
+    """
+    from oddarchiver.catalog import archive_memory_path
+
+    _source, iso, vol1, expected = _build_filled_two_volume_archive(
+        tmp_path, monkeypatch,
+    )
+    marker = read_volume_marker(ISOBackend(vol1, disc_size=_FILL_DISC_BYTES))
+    assert marker is not None
+    memory = archive_memory_path(marker.archive_id)
+    memory.unlink(missing_ok=True)
+    remember_encryption_mode(marker.archive_id, "none")
+    volumes = _isolated_fill_volumes(tmp_path / "cold", iso, vol1)
+    dest = tmp_path / "out-cold"
+    result, acquisition = _restore_isolated(dest, 1, volumes)
+    assert result.failures == 0
+    assert acquisition.yielded.count(0) == 1
+    assert _restored_files(dest) == expected
+
+
+
+def test_fill_restore_skip_older_volume_then_second_run(tmp_path, monkeypatch):
+    """
+    Input: restore from volume 1 with volume 0 marked missing, then a rerun
+    Output: first run lacks fill files; second run restores them
+    """
+    _source, iso, vol1, expected = _build_filled_two_volume_archive(
+        tmp_path, monkeypatch,
+    )
+    dest = tmp_path / "out-skip"
+    rc = _fill_dispatch([
+        "restore", str(dest), "--test-iso", str(vol1),
+        "--all-disks", "--skip-volume", "0",
+    ])
+    assert rc == 0
+    first = _restored_files(dest)
+    assert first.get("b.bin") == expected["b.bin"]
+    assert "a.bin" not in first
+    assert "c.bin" not in first
+    rc = _fill_dispatch([
+        "restore", str(dest), "--test-iso", str(vol1),
+        "--all-disks", "--unskip-volume", "0",
+    ])
+    assert rc == 0
+    assert _restored_files(dest) == expected
+
+
+def test_learn_disc_keeps_explained_fill_session():
+    """
+    Input: volume 0 manifests for sessions 0 and 2, session 1 on volume 1
+    Output: learn_disc keeps the fill session and ignores a forged later slot
+    """
+    def _full(path, session, checksum):
+        return ManifestEntry(
+            path=path, type="full", result_checksum=checksum, full_size_bytes=1,
+            file=f"session_{session:03d}/full/{checksum}",
+        )
+
+    def _manifest(session, entries):
+        return Manifest(
+            version=2, session=session, timestamp="t", source="", label="FS",
+            based_on_session=None, encryption={}, entries=list(entries),
+            deleted=[], manifest_checksum="",
+        )
+
+    catalog = ArchiveCatalog(
+        "fill-learn", 1, 1,
+        {
+            0: CatalogDisc(0, "FS", 0, 0),
+            1: CatalogDisc(1, "FS", 1, 1),
+        },
+        {
+            "a.bin": [PathVersion(0, 0, "full", "a", 1, "t", 0)],
+            "b.bin": [PathVersion(1, 1, "full", "b", 1, "t", 1)],
+        },
+        True,
+    )
+    marker = VolumeMarker("fill-learn", 0, 0, "now", "", session_ranges=[[0, 0], [2, 2]])
+    changed = learn_disc(catalog, marker, "FS", [
+        _manifest(0, [_full("a.bin", 0, "a")]),
+        _manifest(2, [_full("c.bin", 2, "c")]),
+        _manifest(5, [_full("forged.bin", 5, "x")]),
+    ])
+    assert "c.bin" in changed
+    assert "forged.bin" not in catalog.history
+    assert [version.session for version in catalog.history["c.bin"]] == [2]
+    assert catalog.discs[0].session_ranges == [[0, 0], [2, 2]]
+

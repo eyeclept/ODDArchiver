@@ -19,6 +19,7 @@ import pytest
 
 from oddarchiver.cache import CacheManager
 from oddarchiver.cli import _run_browse, _run_dry_run, _run_ls, dispatch
+from tests.helpers import fill
 from oddarchiver.crypto import KeyfileCrypto, NullCrypto, generate_keyfile
 from oddarchiver.disc import DiscInfo, ISOBackend
 from oddarchiver.manifest import load_session_manifests, read_manifest
@@ -87,6 +88,8 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "embed_software": None,
         "skip_large": False,
         "slow": False,
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -155,10 +158,10 @@ def test_new_disc_iso_fits_long_encrypted_history(tmp_path, monkeypatch):
     budgets = []
     orig_pack = session_mod._pack_blobs
 
-    def spy(blobs, first, full):
+    def spy(blobs, first, full, **kwargs):
         captured.append(list(blobs))
         budgets.append(full)
-        return orig_pack(blobs, first, full)
+        return orig_pack(blobs, first, full, **kwargs)
 
     monkeypatch.setattr(session_mod, "_pack_blobs", spy)
     chunks = build_staging(
@@ -225,9 +228,9 @@ def test_ordinary_blobs_leave_scratch_not_memory(tmp_path, monkeypatch):
     captured = []
     orig_pack = session_mod._pack_blobs
 
-    def spy(blobs, first, full):
+    def spy(blobs, first, full, **kwargs):
         captured.append(list(blobs))
-        return orig_pack(blobs, first, full)
+        return orig_pack(blobs, first, full, **kwargs)
 
     monkeypatch.setattr(session_mod, "_pack_blobs", spy)
     iso = tmp_path / "plain.iso"
@@ -401,8 +404,8 @@ def _build_split_volume(tmp_path: Path, encrypt: str) -> tuple[Path, str | None,
     """Input: temporary root and encryption mode. Output: second ISO, key, baseline."""
     source = tmp_path / "src"
     source.mkdir()
-    (source / "a.bin").write_bytes(b"A" * 80_000)
-    (source / "b.bin").write_bytes(b"B" * 80_000)
+    (source / "a.bin").write_bytes(fill(b"A", 80_000))
+    (source / "b.bin").write_bytes(fill(b"B", 80_000))
     iso = tmp_path / "split.iso"
     key = None
     if encrypt == "keyfile":
@@ -557,8 +560,8 @@ def test_browse_all_disks_identifies_swapped_disc_on_same_backend(
     """
     source = tmp_path / "src"
     source.mkdir()
-    (source / "a.bin").write_bytes(b"A" * 80_000)
-    (source / "b.bin").write_bytes(b"B" * 80_000)
+    (source / "a.bin").write_bytes(fill(b"A", 80_000))
+    (source / "b.bin").write_bytes(fill(b"B", 80_000))
     iso = tmp_path / "swap.iso"
     rc = dispatch(_make_args(
         command="init", source=str(source), test_iso=str(iso),
@@ -590,7 +593,7 @@ def test_browse_all_disks_identifies_swapped_disc_on_same_backend(
     rc = _run_browse(args)
     capsys.readouterr()
     assert rc == 0
-    assert (dest / "a.bin").read_bytes() == b"A" * 80_000
+    assert (dest / "a.bin").read_bytes() == fill(b"A", 80_000)
     assert backend.volume_json_reads >= 2
 
 
@@ -639,9 +642,9 @@ def test_init_spill_reserves_baseline_on_every_new_disc(tmp_path, monkeypatch):
     budgets = []
     orig_pack = session_mod._pack_blobs
 
-    def spy(blobs, first, full):
+    def spy(blobs, first, full, **kwargs):
         budgets.append(full)
-        return orig_pack(blobs, first, full)
+        return orig_pack(blobs, first, full, **kwargs)
 
     monkeypatch.setattr(session_mod, "_pack_blobs", spy)
     iso = tmp_path / "spill.iso"

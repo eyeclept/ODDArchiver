@@ -11,6 +11,7 @@ Description:
 import hashlib
 import json
 import logging
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -22,7 +23,7 @@ from oddarchiver.crypto import (
 )
 from oddarchiver.disc import DiscInfo
 from oddarchiver.manifest import read_manifest
-from tests.helpers import _assert_build_staging_interrupted
+from tests.helpers import _assert_build_staging_interrupted, fill
 
 # Globals
 logger = logging.getLogger(__name__)
@@ -357,7 +358,7 @@ def test_space_check_splits_when_over_remaining(tmp_path):
         with contiguous session numbers. Combined file content covers
         every new file exactly once.
     """
-    (tmp_path / "big.bin").write_bytes(b"X" * 1024 * 64)   # 64 KB
+    (tmp_path / "big.bin").write_bytes(fill(b"X", 1024) * 64)   # 64 KB
 
     # remaining=1 makes the current-medium budget 0, so the 64 KB file
     # cannot land on volume 0. A mock backend has no int disc_size, so
@@ -406,10 +407,11 @@ def test_append_merge_overhead_forces_split_even_when_raw_bytes_fit(tmp_path):
         the 200,000-byte remaining budget. The new file (150,000 bytes)
         fits the old, undeducted budget (0.95 * 200,000 = 190,000) but not
         the corrected one (0.95 * (200,000 - 81,920) = 112,176), so it must
-        land on a fresh second volume instead of the current, nearly-full
-        medium.
+        land on a fresh volume. Nothing fits the current medium, so sync
+        skips it: no empty session is burned there, the sessions renumber
+        from 4, and the only chunk is a new volume.
     """
-    (tmp_path / "new_big_file.bin").write_bytes(b"X" * 150_000)
+    (tmp_path / "new_big_file.bin").write_bytes(fill(b"X", 150_000))
 
     disc_state = {f"prior_{i:04d}.txt": "checksum" for i in range(10)}
     disc_origin = {p: 0 for p in disc_state}
@@ -426,16 +428,17 @@ def test_append_merge_overhead_forces_split_even_when_raw_bytes_fit(tmp_path):
         _staging_root=tmp_path / "staging",
     )
     try:
-        assert len(chunks) >= 2, "expected a split onto a new volume"
-        _assert_new_volume_chunks(chunks)
-        staged_paths = _staged_paths(chunks)
-        assert staged_paths.count("new_big_file.bin") == 1
-        # The new file must not land on chunk 0 (the nearly-full current medium).
-        chunk0_staging, chunk0_session, _ = chunks[0]
-        chunk0_manifest = read_manifest(
-            chunk0_staging / f"session_{chunk0_session:03d}" / "manifest.json"
+        assert len(chunks) == 1, (
+            "expected no empty session on the full current medium"
         )
-        assert "new_big_file.bin" not in {e.path for e in chunk0_manifest.entries}
+        staging, session, is_new = chunks[0]
+        assert is_new, "the only chunk must burn on a fresh volume"
+        assert session == 4, "sessions renumber from the first session"
+        assert _staged_paths(chunks) == ["new_big_file.bin"]
+        manifest = read_manifest(
+            staging / f"session_{session:03d}" / "manifest.json"
+        )
+        assert [entry.path for entry in manifest.entries] == ["new_big_file.bin"]
     finally:
         import shutil
         for staging, _session_n, _is_new in chunks:
@@ -459,7 +462,7 @@ def test_staging_space_check_exits_1_before_any_blob_written(tmp_path, monkeypat
         left on device" writing an encrypted blob to a full tmpfs staging
         dir, after already hashing all 6497 files and staging 5842 of them.
     """
-    (tmp_path / "big.bin").write_bytes(b"X" * 1024 * 64)   # 64 KB source file
+    (tmp_path / "big.bin").write_bytes(fill(b"X", 1024) * 64)   # 64 KB source file
 
     real_disk_usage = session_mod.shutil.disk_usage
     tiny_usage = real_disk_usage(tmp_path)._replace(free=1)   # 1 byte free
@@ -618,19 +621,145 @@ def test_build_staging_raises_when_locked_by_live_pid(tmp_path):
 
 def test_check_staging_lock_treats_missing_or_corrupt_lockfile_as_stale(tmp_path):
     """
-    Input:  tmp_path
-    Output: None
-    Details:
-        _check_staging_lock must return quietly (no exception) both when
-        there is no .lock file at all and when its contents are not a valid
-        integer PID, since both are safe-to-remove cases rather than an
-        active collision.
+    Input:  missing lockfile and corrupt lockfile under a staging root
+    Output: _check_staging_lock does not raise; later build_staging proceeds
     """
     no_lock_dir = tmp_path / "no_lock"
     no_lock_dir.mkdir()
-    session_mod._check_staging_lock(no_lock_dir, session_n=0)  # must not raise
+    session_mod._check_staging_lock(no_lock_dir, session_n=0)
 
-    corrupt_dir = tmp_path / "corrupt_lock"
-    corrupt_dir.mkdir()
+    staging_root = tmp_path / "staging"
+    corrupt_dir = staging_root / "oddarchiver_staging_000"
+    corrupt_dir.mkdir(parents=True)
     (corrupt_dir / ".lock").write_text("not-a-pid")
-    session_mod._check_staging_lock(corrupt_dir, session_n=0)  # must not raise
+    session_mod._check_staging_lock(corrupt_dir, session_n=0)
+
+    (tmp_path / "file.txt").write_bytes(b"content")
+    chunks = session_mod.build_staging(
+        session_n=0,
+        source=tmp_path,
+        disc_state={},
+        disc_origin={},
+        backend=_make_backend(),
+        cache=_make_cache(),
+        crypto=NullCrypto(),
+        _staging_root=staging_root,
+    )
+    staging = chunks[0][0]
+    try:
+        assert staging.is_dir()
+        assert (staging / ".lock").read_text().strip()
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def test_next_archive_session_uses_catalog_max_not_disc_length(tmp_path, monkeypatch):
+    """
+    Input:  volume 0 with 42 local sessions and catalog last session 50
+    Output: next session is 51, not 42
+    """
+    from oddarchiver.catalog import CatalogDisc, remember_discs, ArchiveCatalog, next_archive_session
+    from oddarchiver.manifest import Manifest
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    remember_discs(ArchiveCatalog(
+        "two-vol", 1, 50,
+        {
+            0: CatalogDisc(0, "V0", 0, 41),
+            1: CatalogDisc(1, "V1", 42, 50),
+        },
+        {},
+        True,
+    ))
+    local = [
+        Manifest(
+            version=3, session=n, timestamp="t", source="s", label="V0",
+            based_on_session=None if n == 0 else n - 1,
+            encryption={"mode": "none"}, entries=[], deleted=[],
+            manifest_checksum="",
+        )
+        for n in range(42)
+    ]
+    assert next_archive_session("two-vol", local, 0) == 51
+
+
+def test_archive_sync_lock_rejects_second_process(tmp_path, monkeypatch):
+    """
+    Input:  held archive sync lock
+    Output: a second process raises RuntimeError naming the lock path
+    """
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    root = str(Path(__file__).resolve().parents[1])
+    with session_mod.archive_sync_lock("lock-arch"):
+        child = subprocess.run(
+            [
+                sys.executable, "-c",
+                "from oddarchiver.session import archive_sync_lock\n"
+                "try:\n"
+                "    with archive_sync_lock('lock-arch'):\n"
+                "        pass\n"
+                "    raise SystemExit(0)\n"
+                "except RuntimeError as exc:\n"
+                "    print(exc)\n"
+                "    raise SystemExit(2)\n",
+            ],
+            cwd=root,
+            env={**__import__("os").environ, "PYTHONPATH": root,
+                 "XDG_STATE_HOME": str(tmp_path / "state")},
+            capture_output=True,
+            text=True,
+        )
+    assert child.returncode == 2
+    assert "lock-arch" in child.stdout or "sync.lock" in child.stdout
+
+
+def test_sync_refuses_older_volume_of_two_volume_iso(tmp_path, monkeypatch, capsys):
+    """
+    Input:  two-volume ISO, then sync against volume 0
+    Output: refuse; stderr does not propose first_session plus manifest count
+    """
+    from oddarchiver.cli import dispatch
+    from oddarchiver.catalog import next_archive_session
+    from oddarchiver.disc import ISOBackend
+    from oddarchiver.manifest import load_session_manifests
+    from oddarchiver.volume import read_volume_marker
+    from tests.helpers import _make_args
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "seed.txt").write_bytes(b"seed")
+    iso = tmp_path / "s.iso"
+    assert dispatch(_make_args(
+        command="init", source=str(source), test_iso=str(iso),
+        disc_size="100000",
+    )) == 0
+    (source / "a.bin").write_bytes(b"A" * 80_000)
+    (source / "b.bin").write_bytes(b"B" * 80_000)
+    assert dispatch(_make_args(
+        command="sync", source=str(source), test_iso=str(iso),
+        disc_size="100000",
+    )) == 0
+    assert (tmp_path / "s.vol1.iso").is_file()
+    vol0 = ISOBackend(iso, disc_size=100000)
+    marker = read_volume_marker(vol0)
+    assert marker is not None
+    manifests = load_session_manifests(vol0, marker=marker)
+    next_n = next_archive_session(marker.archive_id, manifests, marker.first_session)
+    bogus = marker.first_session + len(manifests)
+    assert next_n != bogus
+
+    rc = dispatch(_make_args(
+        command="sync", source=str(source), test_iso=str(iso),
+        disc_size="100000",
+    ))
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "older volume" in err
+    assert f"session {bogus}" not in err.lower()
+    assert f"session_{bogus:03d}" not in err
+
+

@@ -136,6 +136,34 @@ def test_cache_update_streams_one_payload_and_commits_once(tmp_path, monkeypatch
         assert cache.get(f"secret/{i}", 1) == bytes([i]) * 256
 
 
+def test_volume_split_chunk_is_not_cached(tmp_path):
+    """Input: a volume-split manifest entry. Output: cache index has no key for it."""
+    staging = tmp_path / "staging"
+    blob = staging / "session_001" / "full" / "0"
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"split-chunk")
+    entries = [
+        SimpleNamespace(
+            type="full",
+            path="huge.bin",
+            file="session_001/full/0",
+            volume_chunk=0,
+            volume_chunk_count=2,
+        ),
+        SimpleNamespace(
+            type="full",
+            path="small.bin",
+            file="session_001/full/0",
+        ),
+    ]
+    cache = CacheManager(tmp_path / "cache")
+    _update_cache(cache, staging, 1, entries, NullCrypto())
+    index = cache_module._load_manifest(tmp_path / "cache")
+    assert "1:huge.bin" not in index
+    assert cache.get("huge.bin", 1) is None
+    assert cache.get("small.bin", 1) == b"split-chunk"
+
+
 def test_sidecar_refuses_symlink_and_bar_escapes_controls(tmp_path, capsys):
     """Input: a linked sidecar and an untrusted label. Output: refusal and escaped text."""
     target = tmp_path / "target"

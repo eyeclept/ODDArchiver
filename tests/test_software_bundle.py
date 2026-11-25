@@ -80,6 +80,8 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "embed_software": None,
         "recover_scan": False,
         "mirror": None,
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)

@@ -67,11 +67,12 @@ def _fmt_bytes(n: int) -> str:
     Input:  n - the byte count
     Output: a string a person can read easily, for example "1.2 GiB"
     """
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n //= 1024
-    return f"{n:.1f} TiB"
+    value = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
 
 
 def _create_log_parents(log_file: Path) -> None:

@@ -54,6 +54,8 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "session": None,
         "force": True,
         "level": "fast",
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)

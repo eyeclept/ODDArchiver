@@ -135,8 +135,9 @@ cache entries from older runs that contain delta bytes.
 ## Packing budgets
 
 Ordinary blobs pack greedily, largest first, with ties broken by path.
-A dedup reference has encoded size 0. It uses only its manifest-entry
-budget. Same-run references stay in the origin blob's bin.
+A dedup reference has encoded size 0.
+It uses only its manifest-entry budget.
+Same-run references stay in the origin blob bin.
 
 - First chunk: `backend.mediainfo().remaining_bytes * SPACE_SAFETY_MARGIN`
   (`SPACE_SAFETY_MARGIN` is 0.95). This is the free space on the disc or
@@ -148,6 +149,15 @@ budget. Same-run references stay in the origin blob's bin.
   `ISOBackend.disc_size` (the configured `--disc-size`) applies when it is a
   positive int. `DiscBackend` and any backend without an int `disc_size` use
   `disc.BDXL_DISC_BYTES` (93 GiB, BDXL usable headroom).
+
+With fill enabled, the first chunk uses the oldest measured appendable volume.
+That volume must have remaining space that can hold every planned blob.
+The planned blobs include split chunks.
+The burn appends to that volume.
+It does not init a blank disc.
+A blob that fits none of the measured volumes uses the inserted disc.
+It then uses a new volume, as today.
+
 
 Each packed file costs more than its encoded size:
 
@@ -183,26 +193,35 @@ can hold decrypted plaintext.
 
 ## Volume-split files
 
-A file that cannot fit on one fresh volume is split at disc-capacity
-boundaries, minus `SPACE_SAFETY_MARGIN`. Chunk 0 uses the active budget
-(`first_budget` on the current medium, `full_budget` after).
+A file stays whole when it fits one disc.
+Pass `--split-large` on `init` or `sync` to restore greedy splitting.
+That fills leftover space on the current disc.
+A file still splits when it cannot fit on one fresh volume.
+It also splits when its encoded size exceeds the 3 GiB blob cap (`BLOB_SIZE_CAP`).
 
-Later chunks use `full_budget`. The last chunk takes the remainder.
+A file that cannot fit on one fresh volume is split at disc-capacity
+boundaries, minus `SPACE_SAFETY_MARGIN`.
+Chunk 0 uses the active budget (`first_budget` on the current medium, `full_budget` after).
+Later chunks use `full_budget`.
+The last chunk takes the remainder.
 
 Each chunk is its own `_PreparedBlob` (`kind="full"`, `streamed=True`)
-with `volume_chunk` / `volume_chunk_count` set. `encrypt_file` writes each
-range as a complete streamed blob. `decrypt_file` needs no extra params.
+with `volume_chunk` / `volume_chunk_count` set.
+`encrypt_file` writes each range as a complete streamed blob.
+`decrypt_file` needs no extra params.
 `full_size_bytes` and `result_checksum` on each chunk describe the whole
-file. The chunks hold it, so `ls` / `browse` / `history` show the real total.
+file.
+The chunks hold it, so `ls` / `browse` / `history` show the real total.
 
-Each split chunk gets its own dedicated bin. It does not share a bin with
-another file or another chunk of the same file. This keeps chunk order
-ascending when encoded sizes tie.
-
-This wastes space when a small file could have filled the rest of that chunk's disc.
+A split chunk shares the current bin when its cost stays under that bin budget.
+Chunk N cannot land in an earlier bin than chunk N-1.
+After every split chunk is placed, ordinary blobs fill leftover space in each bin.
+They pack largest first.
+Ties use the path.
 
 If a previously split file later fits one disc, it re-encodes as one blob
-with no `volume_chunk` fields. Split files never use the delta path.
+with no `volume_chunk` fields.
+Split files never use the delta path.
 
 The writer records deletions only on the manifest of the first chunk.
 

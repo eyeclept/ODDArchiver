@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import re
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,7 +26,7 @@ from oddarchiver.cli import _volume_iso_path, build_parser, dispatch
 from oddarchiver.crypto import generate_keyfile
 from oddarchiver.disc import ISOBackend, parse_disc_size
 from oddarchiver.volume import VolumeMarker, read_volume_marker
-from tests.helpers import _make_args
+from tests.helpers import _make_args, _sha256
 
 # Globals
 SMALL_DISC = 50 * 2**20  # 50 MiB. Room for a non-splitting session 0.
@@ -481,6 +482,71 @@ def test_mirror_plus_multivolume_raises(tmp_path, capsys):
     assert "mirror" in err.lower()
     assert not iso.exists()
     assert not mirror.exists()
+
+
+def test_fill_refuses_wrong_iso_sibling(tmp_path, monkeypatch):
+    """
+    Input:  volume 1 of archive A with archive.iso replaced by archive B
+    Output: fill skips the wrong disc, leaves it unchanged, and appends to volume 1
+    """
+    from tests.helpers import fill
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    def _boom(prompt=""):
+        raise AssertionError(f"ISOBackend must not call input(): {prompt!r}")
+
+    monkeypatch.setattr("builtins.input", _boom)
+    disc = "8mb"
+    source_a = tmp_path / "src-a"
+    source_a.mkdir()
+    (source_a / "a.bin").write_bytes(fill(b"A", 120_000))
+    iso_a = tmp_path / "archive.iso"
+    rc = dispatch(_make_args(
+        command="init", source=str(source_a), test_iso=str(iso_a), disc_size=disc,
+    ))
+    assert rc == 0
+    (source_a / "overflow.bin").write_bytes(fill(b"B", 6_500_000))
+    rc = dispatch(_make_args(
+        command="sync", source=str(source_a), test_iso=str(iso_a),
+        disc_size=disc, no_fill=True,
+    ))
+    assert rc == 0
+    (source_a / "spill.bin").write_bytes(fill(b"C", 700_000))
+    rc = dispatch(_make_args(
+        command="sync", source=str(source_a), test_iso=str(iso_a),
+        disc_size=disc, no_fill=True,
+    ))
+    assert rc == 0
+    vol1 = tmp_path / "archive.vol1.iso"
+    assert vol1.is_file()
+    source_b = tmp_path / "src-b"
+    source_b.mkdir()
+    (source_b / "other.bin").write_bytes(fill(b"Z", 80_000))
+    iso_b = tmp_path / "other.iso"
+    rc = dispatch(_make_args(
+        command="init", source=str(source_b), test_iso=str(iso_b), disc_size=disc,
+    ))
+    assert rc == 0
+    iso_a.write_bytes(iso_b.read_bytes())
+    other_d = iso_a.with_suffix(".d")
+    if other_d.exists():
+        shutil.rmtree(other_d)
+    shutil.copytree(iso_b.with_suffix(".d"), other_d)
+    wrong_hash = _sha256(iso_a.read_bytes())
+    vol1_sessions = set(
+        ISOBackend(vol1, disc_size=8_000_000).list_session_numbers()
+    )
+    (source_a / "after-wrong.bin").write_bytes(fill(b"C", 20_000))
+    rc = dispatch(build_parser().parse_args([
+        "sync", str(source_a), "--test-iso", str(vol1),
+        "--disc-size", disc, "--fill",
+    ]))
+    assert rc == 0
+    after = set(ISOBackend(vol1, disc_size=8_000_000).list_session_numbers())
+    assert max(after) > max(vol1_sessions)
+    assert _sha256(iso_a.read_bytes()) == wrong_hash
+
 
 
 if __name__ == "__main__":

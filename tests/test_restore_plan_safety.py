@@ -135,7 +135,7 @@ def test_catalog_checksum_mismatch_leaves_dest_untouched(tmp_path, capsys):
     dest = tmp_path / "mismatch"
     result = restore_archive(
         dest, backend, _CRYPTO, catalog, paths=["a.txt"],
-        manifests=manifests, acquisition=Acquisition(discs, [1]),
+        manifests=manifests, acquisition=Acquisition(discs, [1, 0]),
     )
     err = capsys.readouterr().err
     assert result.failures >= 1
@@ -149,7 +149,7 @@ def test_deleted_dest_is_restored_on_resume(tmp_path):
     dest = tmp_path / "resume-missing"
     first = restore_archive(
         dest, backend, _CRYPTO, catalog, paths=["a.txt"],
-        manifests=manifests, acquisition=Acquisition(discs, [1]),
+        manifests=manifests, acquisition=Acquisition(discs, [1, 0]),
     )
     assert first.failures == 0
     assert (dest / "a.txt").read_bytes() == b"A-new"
@@ -170,7 +170,7 @@ def test_changed_dest_bytes_are_restored_on_resume(tmp_path):
     dest = tmp_path / "resume-changed"
     first = restore_archive(
         dest, backend, _CRYPTO, catalog, paths=["a.txt"],
-        manifests=manifests, acquisition=Acquisition(discs, [1]),
+        manifests=manifests, acquisition=Acquisition(discs, [1, 0]),
     )
     assert first.failures == 0
     assert (dest / "a.txt").read_bytes() == b"A-new"
@@ -370,10 +370,11 @@ def test_enter_at_first_prompt_restores_all_present(tmp_path, monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     dest = tmp_path / "enter-all"
     prompts = []
+    replies = iter(["", "m 0", "m 1"])
 
     def ask(prompt):
         prompts.append(prompt)
-        return ""
+        return next(replies)
 
     result = restore_archive(
         dest, backend, _CRYPTO, catalog, paths=["latest.txt"],

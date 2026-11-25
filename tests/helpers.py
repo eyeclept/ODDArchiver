@@ -206,6 +206,8 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "level": "fast",
         "mirror": None,
         "recover_scan": False,
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -232,6 +234,23 @@ def _write_prior_baseline(
         write_manifest(staging / f"session_{session_n:03d}", manifest)
 
 
+def fill(seed: bytes, size: int) -> bytes:
+    """
+    Input: seed - one or more bytes identifying the content; size - bytes
+    Output: deterministic incompressible bytes of the requested size
+    Details:
+        Compressed archives store repeated bytes far smaller, so tests
+        that assert chunk or volume counts must use data that no codec
+        shrinks. The hash chain keeps the same bytes across runs.
+    """
+    out = bytearray()
+    block = hashlib.sha256(seed).digest()
+    while len(out) < size:
+        out += block
+        block = hashlib.sha256(block).digest()
+    return bytes(out[:size])
+
+
 def _args(
     command: str, source: Path, iso: Path, *, label: str = "DELTA_WRITE",
     **overrides,
@@ -246,6 +265,7 @@ def _args(
         label=label, encrypt="none", key=None, dry_run=False,
         no_cache=False, disc_size="64mb", prefill=None, force=False,
         slow=False, skip_large=False, embed_software=None,
+        yubikey=False, yubikey_slot=None,
     )
     options.update(overrides)
     return argparse.Namespace(**options)

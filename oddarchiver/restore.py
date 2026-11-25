@@ -23,7 +23,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from oddarchiver.crypto import blob_aad
+from oddarchiver.crypto import blob_aad, new_blob_aad
+from oddarchiver.compress import CODEC_LZMA, CODEC_NONE, decode_file, decode_payload, decompress_file
 from oddarchiver.delta import apply_delta
 from oddarchiver.diskread import DEFAULT_READ_MODE, make_session_source
 from oddarchiver.filehash import hash_file
@@ -178,8 +179,25 @@ def _write_restored_file(dest_file: Path, data: bytes) -> None:
     Output: None
     Details: Write a private 0600 temp file in the dest directory, check
         its size, then replace the destination. A failed write leaves
-        the old destination file in place.
+        the old destination file in place. Overwriting an existing file
+        whose content differs from the archive prints one warning line.
     """
+    if dest_file.is_file():
+        try:
+            existing = dest_file.read_bytes()
+        except OSError:
+            _log.warning("Cannot read existing destination file %s", dest_file)
+            existing = None
+        if existing is not None and existing != data:
+            _log.warning(
+                "Overwriting existing destination file with archive content: %s",
+                dest_file,
+            )
+            print(
+                f"warning: overwrote existing file with archive content: "
+                f"{dest_file}",
+                flush=True,
+            )
     _mkdir_private(dest_file.parent)
     fd, name = tempfile.mkstemp(
         prefix=".oddarchiver_restore_", dir=str(dest_file.parent),
@@ -196,8 +214,13 @@ def _write_restored_file(dest_file: Path, data: bytes) -> None:
         if tmp.stat().st_size != len(data):
             raise RuntimeError(f"Restored file size differs: {tmp}")
         os.replace(tmp, dest_file)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError) as exc:
         _log.exception("Failed to write restored file %s", dest_file)
+        print(
+            f"error: could not write {dest_file}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
@@ -255,12 +278,23 @@ def _suspect_session_count(manifests: list, first_session: int) -> int:
     Input: selected manifests and the first session number on the disc
     Output: number of suspect sessions
     Details: Use the disc position when an unreadable manifest has session -1.
+        When every manifest on the disc is unreadable, the key or
+        passphrase is wrong (or the disc is from another archive), not
+        a partially damaged session list.
     """
     count = 0
+    all_suspect = bool(manifests) and all(m.suspect for m in manifests)
     for index, manifest in enumerate(manifests, start=first_session):
         if manifest.suspect:
             session_n = manifest.session if manifest.session >= 0 else index
-            message = f"Cannot restore session {session_n}: SUSPECT manifest."
+            if all_suspect:
+                message = (
+                    f"Cannot restore session {session_n}: SUSPECT manifest. "
+                    "Every manifest on this disc is unreadable. The passphrase "
+                    "or key is wrong, or the disc is from another archive."
+                )
+            else:
+                message = f"Cannot restore session {session_n}: SUSPECT manifest."
             _log.error("%s", message)
             print(message, file=sys.stderr, flush=True)
             count += 1
@@ -302,10 +336,15 @@ def restore(
     print("Scanning disc for sessions...", flush=True)
     marker = read_volume_marker(backend)
     if manifests is None:
+        elsewhere = set()
+        if marker is not None:
+            from oddarchiver.catalog import other_volume_sessions
+            elsewhere = other_volume_sessions(marker.archive_id, marker.volume_index)
         manifests = load_session_manifests(
             backend, crypto,
             start_session=marker.first_session if marker else 0,
             marker=marker,
+            elsewhere_sessions=elsewhere,
         )
     with tempfile.TemporaryDirectory(prefix="oddarchiver_restore_read_") as workdir:
         selected = _selected_read_manifests(manifests, session, paths, bool(skip_volumes))
@@ -953,13 +992,49 @@ def _append_split_plain(task: _FileTask, partial: Path, tmp_plain: Path) -> None
             shutil.copyfileobj(inf, outf)
 
 
+def _finalize_split_payload(
+    entry: ManifestEntry, partial: Path, dest_file: Path,
+    target_checksum: str,
+) -> None:
+    """
+    Input:  last split entry, assembled plaintext payload, dest, checksum
+    Output: None; dest holds plaintext that matches target_checksum
+    Details:
+        Each chunk carries its own ciphertext, so the assembled file is
+        the encoded payload: compressed bytes for codec lzma, else the
+        file bytes.
+    """
+    final = partial
+    decoded = None
+    if getattr(entry, "codec", CODEC_NONE) == CODEC_LZMA:
+        decoded = partial.with_name(partial.name + ".decoded")
+        decompress_file(partial, decoded)
+        final = decoded
+    if (
+        getattr(entry, "original_size", None) is not None
+        and final.stat().st_size != getattr(entry, "original_size", None)
+    ):
+        raise ValueError(
+            f"Restored size {final.stat().st_size} does not match "
+            f"original_size {getattr(entry, "original_size", None)} for {entry.path}"
+        )
+    if hash_file(final, HASH_CHUNK_SIZE).hexdigest() != target_checksum:
+        raise ValueError(
+            f"Checksum mismatch for {entry.path}: expected {target_checksum}"
+        )
+    os.replace(final, dest_file)
+    partial.unlink(missing_ok=True)
+    if decoded is not None and decoded.exists():
+        decoded.unlink(missing_ok=True)
+
+
 def _finish_split_chunk(
     task: _FileTask, entry: ManifestEntry, partial: Path,
 ) -> _FileResult | None:
     """
     Input:  task - volume-split file task
             entry - chunk just appended
-            partial - private partial path beside the target
+            partial - assembled plaintext chunks beside the target
     Output: restored result for the last applied chunk, otherwise None
     """
     last_applied = entry.volume_chunk
@@ -968,11 +1043,9 @@ def _finish_split_chunk(
     if task.idx + 1 == len(task.entries):
         count = task.volume_chunk_count
         if last_applied + 1 == count:
-            if hash_file(partial, HASH_CHUNK_SIZE).hexdigest() != task.target_checksum:
-                raise ValueError(
-                    f"Checksum mismatch for {task.rel_path}: expected {task.target_checksum}"
-                )
-            os.replace(partial, task.dest_file)
+            _finalize_split_payload(
+                entry, partial, task.dest_file, task.target_checksum,
+            )
         _log.info("restored %s chunks 0..%d of %d", task.rel_path, last_applied, count)
         return _FileResult(
             "restored",
@@ -1019,12 +1092,14 @@ def _apply_volume_split_chunk(
         outcome = _FileResult("failed")
         if not partial.is_symlink() and not _remove_restore_temp(partial):
             _log.error("Partial file cleanup failed for %s", task.rel_path)
-    if not _remove_restore_temp(tmp_dir, directory=True):
+    finally:
+        # Runs on interrupt too: the directory holds decrypted plaintext.
+        tmp_removed = _remove_restore_temp(tmp_dir, directory=True)
+    if not tmp_removed:
         outcome = _FileResult("failed")
         if not partial.is_symlink() and not _remove_restore_temp(partial):
             _log.error("Partial file cleanup failed for %s", task.rel_path)
     return outcome
-
 
 
 def _apply_full_task_entry(
@@ -1143,7 +1218,23 @@ def _apply_streamed_task(
         tmp_plain = Path(name)
         validate_blob_path(entry.file)
         reader.extract_path_to_file(entry.file, tmp_blob)
-        crypto.decrypt_file(tmp_blob, tmp_plain, aad=blob_aad(entry))
+        tmp_stored = tmp_dir / "stored"
+        crypto.decrypt_file(tmp_blob, tmp_stored, aad=blob_aad(entry))
+        codec = getattr(entry, "codec", CODEC_NONE)
+        if codec == CODEC_LZMA:
+            decode_file(tmp_stored, tmp_plain, codec)
+        else:
+            # The decrypted bytes already equal the file, so adopt them
+            # instead of copying the whole blob a second time.
+            os.replace(tmp_stored, tmp_plain)
+        if (
+            codec == CODEC_LZMA
+            and getattr(entry, "original_size", None)
+            and tmp_plain.stat().st_size != getattr(entry, "original_size", None)
+        ):
+            raise ValueError(
+                f"Restored size {tmp_plain.stat().st_size} != original_size {getattr(entry, "original_size", None)}"
+            )
         if hash_file(tmp_plain, HASH_CHUNK_SIZE).hexdigest() != task.target_checksum:
             raise ValueError(
                 f"Checksum mismatch for {task.rel_path}: expected {task.target_checksum}"
@@ -1352,17 +1443,25 @@ def _advance_replay_task(
     Input: task, rel_path, session_n, reader, crypto - current file and session
            tasks, schedule, record - task state and replay callbacks
     Output: None; applies the next entry and records or schedules the result
+    Details:
+        A volume-split file can hold several chunks in one session, so
+        this applies every consecutive chunk of the current session
+        before it schedules the next session. The session walk visits
+        each session once, so a reschedule here would never run.
     """
     entry = task.entries[task.idx][1]
     if task.volume_split:
-        outcome = _apply_volume_split_chunk(task, reader, crypto)
-        if outcome is not None:
-            del tasks[rel_path]
-            record(rel_path, outcome)
-            return
-        task.idx += 1
-        schedule(rel_path, task.entries[task.idx][0])
-        return
+        while True:
+            outcome = _apply_volume_split_chunk(task, reader, crypto)
+            if outcome is not None:
+                del tasks[rel_path]
+                record(rel_path, outcome)
+                return
+            task.idx += 1
+            next_session = task.entries[task.idx][0]
+            if next_session != session_n:
+                schedule(rel_path, next_session)
+                return
     if task.streamed:
         outcome = _apply_streamed_task(task, reader, crypto)
         del tasks[rel_path]
@@ -1653,7 +1752,8 @@ def _read_full(
     """
     try:
         validate_blob_path(entry.file)
-        return crypto.decrypt(backend.read_path(entry.file), aad=blob_aad(entry)), True
+        stored = crypto.decrypt(backend.read_path(entry.file), aad=blob_aad(entry))
+        return decode_payload(stored, getattr(entry, "codec", CODEC_NONE)), True
     except _BLOB_ERRORS as exc:
         _log.warning("Failed to read full blob for %s: %s", rel_path, exc)
         return b"", False
@@ -1710,8 +1810,11 @@ def _apply_delta_entry(
     """
     try:
         validate_blob_path(entry.delta_file)
-        delta_bytes = crypto.decrypt(
-            backend.read_path(entry.delta_file), aad=blob_aad(entry),
+        delta_bytes = decode_payload(
+            crypto.decrypt(
+                backend.read_path(entry.delta_file), aad=blob_aad(entry),
+            ),
+            getattr(entry, "codec", CODEC_NONE),
         )
     except _BLOB_ERRORS as exc:
         _log.warning("Failed to apply delta for %s: %s", rel_path, exc)

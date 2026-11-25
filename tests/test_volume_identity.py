@@ -137,3 +137,39 @@ def test_read_reraises_backend_failure(caplog):
         with pytest.raises(RuntimeError, match="drive failed"):
             read_volume_marker(_FailingBackend())
     assert any("Failed to read volume.json" in r.message for r in caplog.records)
+
+
+def test_missing_session_ranges_falls_back_to_first_last():
+    """
+    Input:  first_session and last_session only
+    Output: one inclusive pair
+    """
+    from oddarchiver.volume import session_ranges_of
+
+    assert session_ranges_of(0, 41, None) == [(0, 41)]
+    assert session_ranges_of(0, 41, [[0, 41], [51, 51]]) == [(0, 41), (51, 51)]
+
+
+def test_volume_for_session_returns_one_disc_per_session():
+    """
+    Input:  two discs with disjoint session ranges
+    Output: each session maps to one disc
+    """
+    from oddarchiver.catalog import ArchiveCatalog, CatalogDisc, volume_for_session
+
+    catalog = ArchiveCatalog(
+        "arch", 1, 50,
+        {
+            0: CatalogDisc(0, "A", 0, 41, session_ranges=[[0, 41], [51, 51]]),
+            1: CatalogDisc(1, "B", 42, 50, session_ranges=[[42, 50]]),
+        },
+        {},
+        True,
+    )
+    assert volume_for_session(catalog, 0) == 0
+    assert volume_for_session(catalog, 41) == 0
+    assert volume_for_session(catalog, 42) == 1
+    assert volume_for_session(catalog, 50) == 1
+    assert volume_for_session(catalog, 51) == 0
+    assert volume_for_session(catalog, 45) == 1
+

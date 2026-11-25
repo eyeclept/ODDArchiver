@@ -19,16 +19,26 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from oddarchiver.ledger import ledger_dir
+from oddarchiver.volume import parse_session_ranges
 
 # Globals
 logger = logging.getLogger(__name__)
 _log = logger
 
 STATE_FILENAME = ".oddarchiver_restore_state.json"
+
+
+
+def _known_fields(cls, data: dict) -> dict:
+    names = {item.name for item in fields(cls)}
+    extra = [key for key in data if key not in names]
+    if extra:
+        logger.debug("Ignoring unknown %s keys: %s", cls.__name__, extra)
+    return {key: value for key, value in data.items() if key in names}
 
 
 @dataclass
@@ -51,6 +61,8 @@ class VolumeRecord:
     last_session: int
     label: str
     previous_volume_label: str
+    session_ranges: list[list[int]] | None = None
+
 
 
 @dataclass
@@ -190,12 +202,17 @@ def _parse_volume_records(raw: dict) -> dict[int, VolumeRecord]:
     """
     volumes: dict[int, VolumeRecord] = {}
     for item in raw.get("volumes", []):
+        if not isinstance(item, dict):
+            raise TypeError("volume record must be an object")
+        item = _known_fields(VolumeRecord, item)
         rec = VolumeRecord(
             volume_index=int(item["volume_index"]),
             first_session=int(item["first_session"]),
             last_session=int(item["last_session"]),
             label=str(item.get("label", "")),
             previous_volume_label=str(item.get("previous_volume_label", "")),
+            session_ranges=parse_session_ranges(item["session_ranges"])
+            if "session_ranges" in item else None,
         )
         volumes[rec.volume_index] = rec
     return volumes
@@ -231,6 +248,8 @@ def _parse_state(raw: dict) -> RestoreState:
     Details:
         Raises KeyError/TypeError/ValueError for a malformed field.
     """
+    _known_fields(RestoreState, raw)
+
     session_raw = raw.get("session")
     session: int | None
     if session_raw is None:
@@ -273,6 +292,7 @@ def _state_to_dict(state: RestoreState) -> dict:
             "last_session": rec.last_session,
             "label": rec.label,
             "previous_volume_label": rec.previous_volume_label,
+            **({"session_ranges": rec.session_ranges} if rec.session_ranges else {}),
         }
         for rec in sorted(state.volumes.values(), key=lambda r: r.volume_index)
     ]

@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Literal, TYPE_CHECKING
 
 from oddarchiver.crypto import STREAM_CHUNK_SIZE, blob_aad
+from oddarchiver.compress import CODEC_LZMA, CODEC_NONE, decode_file, decode_payload, decompress_bytes
 from oddarchiver.diskread import DEFAULT_READ_MODE, make_session_source
 from oddarchiver.filehash import hash_file
 from oddarchiver.manifest import (
@@ -72,12 +74,16 @@ class _CaptureSource:
 
 def _check_verify_coverage(
     backend: BurnBackend, manifests_by_session: dict[int, Manifest],
+    control_raw: object | None = None,
 ) -> None:
     """
     Input:  backend - disc backend; manifests_by_session - manifests keyed by session
+            control_raw - already-fetched controls or ControlFiles with marker
     Output: None
     """
     from oddarchiver.ledger import backend_identity, check_session_coverage
+    from oddarchiver.volume import parse_volume_marker_bytes, read_volume_marker
+
     label = next(
         (m.label for m in manifests_by_session.values() if m.label), "",
     )
@@ -88,6 +94,11 @@ def _check_verify_coverage(
             "verify: mediainfo failed while checking ledger coverage"
         )
         disc_count = 0
+    marker = getattr(control_raw, "marker", None)
+    if marker is None and isinstance(control_raw, dict):
+        marker = parse_volume_marker_bytes(control_raw.get("volume.json"))
+    if marker is None:
+        marker = read_volume_marker(backend)
     check_session_coverage(
         list(manifests_by_session.values()),
         label=label,
@@ -95,7 +106,11 @@ def _check_verify_coverage(
         recover_scan=False,
         disc_session_count=disc_count,
         backend=backend,
+        archive_id=marker.archive_id if marker else None,
+        volume_index=marker.volume_index if marker else None,
+        session_ranges=marker.session_ranges if marker else None,
     )
+
 
 
 def _verify_manifests(
@@ -117,7 +132,7 @@ def _verify_manifests(
         incomplete_idx = None
     elif manifests is not None:
         manifests_by_session = {m.session: m for m in manifests}
-        _check_verify_coverage(backend, manifests_by_session)
+        _check_verify_coverage(backend, manifests_by_session, control_raw)
         incomplete_idx = detect_incomplete_session(
             backend, manifests_by_session, control_raw=control_raw,
         )
@@ -125,7 +140,7 @@ def _verify_manifests(
         manifests_by_session = _read_all_manifests(
             backend, tmp_path, crypto=crypto, raw=control_raw,
         )
-        _check_verify_coverage(backend, manifests_by_session)
+        _check_verify_coverage(backend, manifests_by_session, control_raw)
         incomplete_idx = detect_incomplete_session(
             backend, manifests_by_session, control_raw=control_raw,
         )
@@ -213,11 +228,18 @@ def _verify_session_pass(
 
     split_progress: dict[str, tuple | None] = {}
     total_errors = 0
-    for s in sorted(session_indexes):
-        total_errors += _verify_one_session(
-            s, incomplete_idx, manifests_by_session, level,
-            backend, crypto, capture_dir, session_source, split_progress,
-        )
+    try:
+        for s in sorted(session_indexes):
+            total_errors += _verify_one_session(
+                s, incomplete_idx, manifests_by_session, level,
+                backend, crypto, capture_dir, session_source, split_progress,
+            )
+    finally:
+        # A chain that never completes (chunk on another disc, interrupt)
+        # still owns a temp directory of decrypted payload.
+        for state in split_progress.values():
+            if state is not None and len(state) > 5:
+                remove_tree(state[5].parent, "verify split temp")
     if level == "full":
         ordered_manifests = [
             manifests_by_session[s] for s in sorted(manifests_by_session)
@@ -294,6 +316,27 @@ def verify(
     return True
 
 
+def _manifests_by_session(
+    loaded: list[Manifest],
+    listed: list[int] | None,
+) -> dict[int, Manifest]:
+    """Input: loaded manifests and listed slots. Output: session to manifest."""
+    by_session: dict[int, Manifest] = {}
+    used: set[int] = set()
+    leftovers: list[Manifest] = []
+    for manifest in loaded:
+        if manifest.session >= 0:
+            by_session[manifest.session] = manifest
+            used.add(manifest.session)
+        else:
+            leftovers.append(manifest)
+    if listed:
+        unassigned = [number for number in listed if number not in used]
+        for number, manifest in zip(unassigned, leftovers):
+            by_session[number] = manifest
+    return by_session
+
+
 def _read_all_manifests(
     backend: "BurnBackend",
     tmp_path: Path | None = None,
@@ -305,10 +348,10 @@ def _read_all_manifests(
             tmp_path - unused. Kept so existing call sites stay valid
             crypto   - CryptoBackend for encrypted manifests (None = plaintext)
             raw      - optional already-fetched control-file bytes
-    Output: dict mapping session index -> Manifest
+    Output: dict mapping session number -> Manifest
     Details:
-        Thin adapter over load_session_manifests(). Keys are contiguous
-        probe indices so a mismatched session field is still detected.
+        Thin adapter over load_session_manifests(). Keys are the directory
+        session numbers so a gapped disc keeps the real session identity.
     """
     from oddarchiver.volume import read_volume_marker
     marker = read_volume_marker(backend)
@@ -316,7 +359,25 @@ def _read_all_manifests(
         backend, crypto, raw=raw, marker=marker,
         start_session=marker.first_session if marker else 0,
     )
-    return {i: m for i, m in enumerate(loaded)}
+    try:
+        listed = backend.list_session_numbers()
+    except (RuntimeError, OSError) as exc:
+        _log.warning("Cannot list sessions while reading manifests: %s", exc)
+        listed = None
+    return _manifests_by_session(loaded, listed)
+
+
+def _later_unparsed_sessions(
+    listed: list[int], manifests: dict[int, Manifest], last_clean: int,
+) -> list[int]:
+    """Input: listed sessions, parsed manifests, last clean session. Output: unparsed later sessions."""
+    return [
+        number for number in listed
+        if number > last_clean and (
+            number not in manifests
+            or (manifests[number].suspect and manifests[number].session < 0)
+        )
+    ]
 
 
 def detect_incomplete_session(
@@ -326,11 +387,11 @@ def detect_incomplete_session(
 ) -> int | None:
     """
     Input:  backend     - BurnBackend to inspect
-            manifests   - session index -> Manifest already loaded
+            manifests   - session number -> Manifest already loaded
             control_raw - already-fetched session control files, if any
     Output: int session index of a dangling trailing slot, or None
     Details:
-        A trailing slot beyond the last cleanly-parsed manifest is
+        A listed session after the last cleanly-parsed manifest is
         INCOMPLETE when code cannot fully read its manifest (blank
         suspect with session < 0) or a session directory exists with
         no readable manifest. A fully-parsed trailing suspect
@@ -338,16 +399,27 @@ def detect_incomplete_session(
         stays FAIL, so the code does not relabel a corrupted first
         session as an interrupted burn.
 
+        The check uses list_session_numbers(), not last_clean + 1, so a
+        gap that lives on another volume is not treated as a torn slot.
         The check uses the session listing and the control bytes that
         the caller already fetched. It never probes the medium with a
         blind read_path call.
     """
     last_clean, trailing_unreadable = _last_clean_and_unreadable(manifests)
+    listed = _listed_trailing_sessions(backend)
+    if listed is not None:
+        if last_clean < 0:
+            return None
+        later_unparsed = _later_unparsed_sessions(listed, manifests, last_clean)
+        return min(later_unparsed) if later_unparsed else None
     if trailing_unreadable is not None and last_clean >= 0:
         return trailing_unreadable
     if last_clean < 0:
         return None
     return _probe_trailing_slot(backend, last_clean, control_raw=control_raw)
+
+
+
 
 
 def _last_clean_and_unreadable(
@@ -384,7 +456,7 @@ def _split_digest_state(
             split_progress[entry.path] = None
             return None
         return hashlib.sha256(), 0, entry.result_checksum
-    digest, next_idx, prev_count, target, _last_blob = state
+    digest, next_idx, prev_count, target = state[:4]
     if prev_count != count or idx != next_idx:
         split_progress[entry.path] = None
         return None
@@ -518,10 +590,20 @@ def _check_streamed_blob(
             captured = capture_dir / blob_path
             captured.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(tmp_blob, captured)
-        crypto.decrypt_file(tmp_blob, tmp_plain, aad=blob_aad(entry))
         if entry.volume_chunk is not None:
-            _fold_volume_split_chunk(entry, blob_path, tmp_plain, split_progress, errors)
+            _fold_volume_split_chunk(
+                entry, blob_path, tmp_blob, split_progress, errors, crypto,
+            )
         elif entry.type == "full":
+            tmp_stored = tmp_dir / "stored"
+            crypto.decrypt_file(tmp_blob, tmp_stored, aad=blob_aad(entry))
+            codec = getattr(entry, "codec", CODEC_NONE)
+            if codec == CODEC_LZMA:
+                decode_file(tmp_stored, tmp_plain, codec)
+            else:
+                # The decrypted bytes already equal the file; adopt them
+                # rather than copying the whole blob again.
+                os.replace(tmp_stored, tmp_plain)
             got = hash_file(tmp_plain, STREAM_CHUNK_SIZE).hexdigest()
             if got != entry.result_checksum:
                 errors.append(
@@ -558,7 +640,9 @@ def _check_buffered_blob(
             captured = capture_dir / blob_path
             captured.parent.mkdir(parents=True, exist_ok=True)
             captured.write_bytes(raw)
-        plaintext = crypto.decrypt(raw, aad=blob_aad(entry))
+        plaintext = decode_payload(
+            crypto.decrypt(raw, aad=blob_aad(entry)), getattr(entry, "codec", CODEC_NONE),
+        )
     except _BLOB_ERRORS as exc:
         _log.warning("Buffered blob read/decrypt failed for %s", blob_path, exc_info=exc)
         errors.append(f"{blob_path}: read/decrypt failed: {exc}")
@@ -652,22 +736,22 @@ def _check_blobs(
 def _fold_volume_split_chunk(
     entry: ManifestEntry,
     blob_path: str,
-    tmp_plain: Path,
+    tmp_cipher: Path,
     split_progress: dict[str, tuple | None],
     errors: list[str],
+    crypto: "CryptoBackend",
 ) -> None:
     """
-    Input:  entry, blob_path - the volume-split chunk just decrypted
-            tmp_plain        - decrypted plaintext of this chunk
-            split_progress   - running concat state keyed by rel_path
+    Input:  entry, blob_path - the volume-split chunk
+            tmp_cipher       - ciphertext of this chunk
+            split_progress   - running payload state keyed by rel_path
             errors           - list to append checksum mismatches to
+            crypto           - decrypts each chunk
     Output: None
     Details:
-        Folds this chunk into a running sha256 when it is the next
-        expected index. A complete 0..count-1 run compares the digest
-        to result_checksum. Gaps (a missing earlier chunk, or a count
-        change) poison the path so a later last-chunk does not hash an
-        incomplete concatenation.
+        Each chunk carries its own ciphertext. Append the decrypted
+        payload slices to a temp file, then decode and hash the whole
+        payload after the last chunk.
     """
     count = entry.volume_chunk_count
     idx = entry.volume_chunk
@@ -677,18 +761,49 @@ def _fold_volume_split_chunk(
     if state is None:
         return
     digest, next_idx, target = state
-    hash_file(tmp_plain, STREAM_CHUNK_SIZE, digest)
+    extra = split_progress.get(entry.path)
+    if extra is not None and len(extra) > 5:
+        payload_path = extra[5]
+    else:
+        tmp_root = Path(tempfile.mkdtemp(prefix="oddarchiver_vsplit_verify_"))
+        payload_path = tmp_root / "payload"
+        payload_path.touch()
+    chunk_plain = payload_path.with_name(f"chunk_{idx}")
+    crypto.decrypt_file(tmp_cipher, chunk_plain, aad=blob_aad(entry))
+    with payload_path.open("ab") as out, chunk_plain.open("rb") as src:
+        shutil.copyfileobj(src, out)
+    chunk_plain.unlink(missing_ok=True)
     next_idx += 1
-    split_progress[entry.path] = (digest, next_idx, count, target, blob_path)
+    split_progress[entry.path] = (
+        digest, next_idx, count, target, blob_path, payload_path,
+    )
     if next_idx != count:
         return
-    got = digest.hexdigest()
-    if got != target:
-        errors.append(
-            f"{blob_path}: checksum mismatch\n"
-            f"    expected: {target[:16]}...\n"
-            f"    got:      {got[:16]}..."
-        )
+    try:
+        final = payload_path
+        decoded = None
+        if getattr(entry, "codec", CODEC_NONE) == CODEC_LZMA:
+            decoded = payload_path.with_name("decoded")
+            decode_file(payload_path, decoded, getattr(entry, "codec", CODEC_NONE))
+            final = decoded
+        if (
+            getattr(entry, "original_size", None) is not None
+            and final.stat().st_size != getattr(entry, "original_size", None)
+        ):
+            errors.append(
+                f"{blob_path}: restored size {final.stat().st_size} does not "
+                f"match original_size {getattr(entry, "original_size", None)}"
+            )
+            return
+        got = hash_file(final, STREAM_CHUNK_SIZE).hexdigest()
+        if got != target:
+            errors.append(
+                f"{blob_path}: checksum mismatch\n"
+                f"    expected: {target[:16]}...\n"
+                f"    got:      {got[:16]}..."
+            )
+    finally:
+        remove_tree(payload_path.parent, "verify split temp")
 
 
 def _check_full(
@@ -731,11 +846,18 @@ def _check_full(
     file_chains, deleted_at = _build_chains(manifests)
     max_session = max((m.session for m in manifests), default=-1)
     source = _CaptureSource(capture_dir)
-    _, failures, *_rest = run_session_replay(
+    (_restored, failures, _files, _empty, unresolved,
+     _stale, _missing) = run_session_replay(
         dest, source, crypto, file_chains, deleted_at, max_session,
-        force=False, paths=None, prior_files={}, allow_unresolved=False,
+        force=False, paths=None, prior_files={}, allow_unresolved=True,
         recover=False,
     )
+    if unresolved:
+        print(
+            f"  {len(unresolved)} split file(s) span discs; verify them "
+            "from the disc that holds chunk 0",
+            flush=True,
+        )
     return failures
 
 

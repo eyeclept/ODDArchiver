@@ -655,7 +655,7 @@ def test_disc_backend_lists_sessions_with_one_xorriso_call(tmp_path, monkeypatch
     from oddarchiver.disc import DiscBackend
     calls = []
 
-    def fake_run(cmd, capture_output):
+    def fake_run(cmd, capture_output, timeout=None):
         calls.append(cmd)
         out = b"'session_000'\n'session_001'\n'session_003'\n'volume.json'\n"
         return subprocess.CompletedProcess(cmd, 0, out, b"")
@@ -676,6 +676,8 @@ def _make_args(**kwargs):
         "mirror": None, "recover_scan": False, "paths": None,
         "show_deleted": False, "path": None, "rescue_key": None,
         "skip_volumes": None,
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)

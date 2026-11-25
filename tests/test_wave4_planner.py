@@ -388,22 +388,27 @@ def test_acquired_drive_disc_load_error_refuses_and_prompts_again(
 
 
 def test_f6_tampered_dest_after_newer_restore_repeats_entry(tmp_path):
-    """F6 drops a newer skip when the destination checksum is wrong."""
+    """F6 drops a newer skip when the destination checksum is wrong.
+
+    Restore checks disc 0 manifests once even though no file needs it.
+    """
     iso0, prior = _stage(tmp_path, 0, {"a.txt": b"old"}, _CRYPTO)
     iso1, _prior = _stage(tmp_path, 1, {"a.txt": b"new"}, _CRYPTO, prior)
     discs = [iso0, iso1]
     backend, catalog, manifests = _source(iso1)
     dest = tmp_path / "tampered"
+    first = Acquisition(discs, [0])
     assert restore_archive(
-        dest, backend, _CRYPTO, catalog, manifests=manifests,
-        acquisition=Acquisition(discs, []),
+        dest, backend, _CRYPTO, catalog, manifests=manifests, acquisition=first,
     ).failures == 0
+    assert first.calls == [{0: 0}]
     (dest / "a.txt").write_bytes(b"tampered")
     backend, catalog, manifests = _source(iso1)
+    second = Acquisition(discs, [])
     result = restore_archive(
-        dest, backend, _CRYPTO, catalog, manifests=manifests,
-        acquisition=Acquisition(discs, []),
+        dest, backend, _CRYPTO, catalog, manifests=manifests, acquisition=second,
     )
+    assert second.calls == []  # saved state already lists disc 0 as checked
     assert result.failures == 0
     assert (dest / "a.txt").read_bytes() == b"new"
 
@@ -475,3 +480,76 @@ def test_e3_siblings_are_discovered_once_per_restore(tmp_path, monkeypatch):
     assert (tmp_path / "siblings" / "a.txt").read_bytes() == b"new"
     assert set(acquisition._siblings) == {0, 1}
     assert calls.count(first.name) == 1
+
+
+def test_acquired_disc_invalidates_cached_session_list():
+    """A disc swap must drop the backend's cached root listing before reading."""
+    from oddarchiver.restore_plan import _read_acquired_manifests
+    from oddarchiver.volume import VolumeMarker
+
+    class _StaleBackend:
+        """Backend that fails unless the session listing cache is invalidated."""
+
+        def __init__(self) -> None:
+            self.fresh = False
+
+        def invalidate_session_list(self) -> None:
+            self.fresh = True
+
+        def list_session_numbers(self) -> list[int]:
+            if not self.fresh:
+                raise AssertionError("stale session listing was used")
+            return []
+
+        def read_paths(self, paths):
+            return {}
+
+    marker = VolumeMarker(
+        archive_id="a", volume_index=0, first_session=0,
+        created_at="2026-01-01T00:00:00Z", previous_volume_label="",
+    )
+    catalog = ArchiveCatalog(
+        archive_id="a", source_volume_index=0, last_session=0,
+        discs={}, history={}, complete=True,
+    )
+    manifests, refusal = _read_acquired_manifests(
+        _StaleBackend(), NullCrypto(), catalog, marker, 0, None,
+    )
+    assert refusal is None
+    assert manifests == []
+
+
+def test_requested_for_disc_keeps_every_chunk_in_one_session():
+    """Two chunks of one file in one session must both be requested from that disc."""
+    from oddarchiver.manifest import Manifest
+    from oddarchiver.restore_plan import _requested_for_disc
+    from oddarchiver.volume import PathVersion
+
+    entries = [
+        ManifestEntry(
+            path="big.bin", type="full", result_checksum="x",
+            full_size_bytes=100, file=f"session_000/full/blob{chunk}",
+            volume_chunk=chunk, volume_chunk_count=2, blob_origin_session=0,
+        )
+        for chunk in (0, 1)
+    ]
+    manifest = Manifest(
+        version=2, session=0, timestamp="t", source="s", label="L",
+        based_on_session=None, encryption={}, entries=entries,
+        deleted=[], manifest_checksum="",
+    )
+    chain = [
+        PathVersion(
+            session=0, volume_index=0, kind="full", result_checksum="x",
+            full_size_bytes=100, timestamp="t", blob_session=0,
+            volume_chunk=chunk, volume_chunk_count=2,
+        )
+        for chunk in (0, 1)
+    ]
+    catalog = ArchiveCatalog(
+        archive_id="a", source_volume_index=0, last_session=0,
+        discs={}, history={}, complete=True,
+    )
+    requested, bad = _requested_for_disc(catalog, {"big.bin": chain}, [manifest], 0)
+    assert bad == set()
+    assert [entry.volume_chunk for _p, _s, entry in requested] == [0, 1]

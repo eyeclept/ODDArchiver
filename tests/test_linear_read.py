@@ -129,6 +129,8 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "level": "fast",
         "mirror": None,
         "read_mode": "sequential",
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)

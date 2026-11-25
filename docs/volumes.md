@@ -29,13 +29,24 @@ A marker that fails a check reads as no marker.
 The marker has `"format": 2`. New manifests have `"version": 2`.
 `archive_id` is `uuid.uuid4().hex`. Later volumes copy this ID.
 
-Session numbers are global and contiguous. Volume 0 may hold sessions 0-41.
+Session numbers are global.
+They increase for the whole archive.
+A disc may hold a set of those numbers, not only one closed interval.
+Volume 0 may hold sessions 0-41.
 Volume 1 then starts at session 42 (`first_session=42`).
+After a fill burn, volume 0 can also hold a later session such as 51.
 
-`sync` computes the next session as
-`marker.first_session + len(manifests)` on the loaded disc. It does not
-trust `dvd+rw-mediainfo` session count. BD-R SRM+POW always reports
-`session_count=1`.
+Readers treat a missing `session_ranges` field as
+`[[first_session, last_session]]` when both bounds exist.
+
+`sync` sets the next session to one more than the highest known session
+in the local archive record and on the inserted disc.
+It does not trust `dvd+rw-mediainfo` session count.
+BD-R SRM+POW always reports `session_count=1`.
+
+Default `sync` appends only to the inserted disc.
+That is wrong on an older volume without `--fill`.
+This build refuses default `sync` when the inserted disc is not the highest known volume.
 
 `read_volume_marker` returns `None` when `volume.json` is absent or
 unreadable. That disc is a legacy single-volume archive. Restore does not
@@ -45,9 +56,10 @@ The manifest scan lists the `session_NNN` directories at the disc root.
 `ISOBackend` lists its session tree. `DiscBackend` runs `xorriso -ls /`.
 The scan reads only those sessions' control files in one `read_paths()` call.
 If a drive listing fails, the scan warns and probes all 1000 session numbers.
-The burn path still refuses a failed listing. The scan stops at the first
-missing session. If directories exist after that gap, the scan reports
-the missing session instead of returning a partial list.
+The burn path still refuses a failed listing. The scan loads every listed
+session directory. A missing slot with a later directory on the same disc
+is an error unless the catalog says that slot lives on another disc.
+
 
 `volume.json` is read in the same control-file batch as the session
 manifests for CLI commands.
@@ -147,13 +159,28 @@ blobs, sorted by path, into as many session directories as needed.
 - Otherwise the budget is `disc.BDXL_DISC_BYTES` (93 GiB).
 - [media.md](media.md) lists named presets and write engines.
 
-A file larger than one disc's blob budget uses separate volume chunks.
-Each chunk has its own blob. The first session of a split records deletions.
+A file larger than one disc blob budget uses separate volume chunks.
+A file whose encoded size reaches the ISO9660 blob cap also uses volume chunks.
+ISO9660 cannot represent a file of 4 GiB or more for the reader.
+Every blob stays below 4 GiB.
+A large file therefore uses several chunks.
+Several chunks can share one disc.
+Each chunk has its own blob.
+
+The first session of a split records deletions.
+The packer places split chunks in path order, then in volume_chunk order.
+A chunk shares a bin when the bin still has space under its budget.
+Ordinary files then fill leftover space in each bin, largest first.
 
 The return value is `list[tuple[Path, int, bool]]`:
-`(staging_path, session_n, is_new_volume)`. Chunk 0 has
-`is_new_volume=False`. Every later chunk has `is_new_volume=True` and the
-next session number.
+`(staging_path, session_n, is_new_volume)`.
+Chunk 0 has `is_new_volume=False`.
+Every later chunk has `is_new_volume=True` and the next session number.
+
+When packing places nothing on the loaded disc, packing drops the empty bin.
+Sessions then renumber from the first session.
+The first returned chunk has `is_new_volume=True`.
+The burn swaps media before that chunk.
 
 ## Disc-swap during init and sync
 
@@ -163,14 +190,54 @@ chunks remain.
 On a real drive (`DiscBackend`) the prompt is:
 
 ```
-Disc <label> is full ({used}/{total}). Insert a new disc for volume {k+1} and press Enter (or 'q' to abort; already-burned data is durable and this sync is resumable).
+Disc <label> has no room for the rest of this sync ({used}/{total} used). Insert a new disc for volume {k+1} and press Enter (or 'q' to abort; already-burned data is durable and this sync is resumable).
 ```
 
 Enter continues. `q` or end of file (EOF) on `input()` returns exit 1.
-Chunks already burned stay on disc and in the cache. The next `sync`
-re-diffs from disc state and stages only leftover files.
-If the program cannot read the baseline of the full disc, it stops before the swap.
-Earlier chunks stay burned. Run sync to resume.
+The tray opens before the prompt, so the user only inserts the next disc.
+
+To resume after `q`, insert the disc that was just burned and run `sync`.
+The inserted disc must hold the archive.
+The scan reads its manifest to see what is already stored.
+An incomplete split is never reported as up to date.
+
+`sync` checks whether the newest entries for a path are consecutive
+chunks 0..k of one split, with recorded chunk sizes, result checksum,
+original size, and codec.
+When they are, it rebuilds the file payload.
+It verifies that payload against those recorded fields.
+It then stages only chunks k+1..n-1.
+The offset is the sum of the burned chunk sizes, so
+chunk k+1 starts exactly where chunk k ended.
+Chunk indices, chunk count, codec, and per-chunk AAD stay as they were.
+Restore therefore assembles chunks 0..n-1 as if the burn had never stopped.
+Restore reuses the burned chunks on the inserted disc.
+
+If the source file changed since the interrupted burn, or the recorded
+chunks are not a clean prefix, or the new disc budget yields a different
+chunk count, `sync` falls back to staging the whole file.
+That is the older behavior.
+It can use more discs than the remaining bytes need.
+
+When packing places no blob on the inserted disc, `sync` does not append
+an empty session to it.
+It skips that disc and goes straight to the next-volume prompt.
+It burns the first real session on the blank disc with
+the same session number the empty one would have used.
+This also covers a disc at the growisofs `-M` 4 GiB merge limit (`DiscInfo.appendable`
+False), whose packing budget is 0.
+
+`init` does not resume an interrupted burn.
+With the burned disc inserted it prints `disc already initialized; skipping init`.
+With a blank disc inserted it stops.
+A medium with no sessions where the ledger expects some looks like a read failure.
+Use `sync`.
+
+The ledger keys on the disc label and the drive path. Every volume of one
+archive shares the label. Verifying or restoring a later volume therefore
+sees fewer sessions than the ledger recorded for an earlier volume and
+stops with `cannot treat as absent`. Pass `--recover-scan` for that disc,
+or verify each volume from the disc that holds its lowest session.
 
 The newly inserted medium must report `session_count == 0`. A non-blank
 disc raises `RuntimeError`. Volume k+1 cannot overwrite volume k.
@@ -198,16 +265,39 @@ oddarchiver restore /tmp/out --all-disks --test-iso archive.vol2.iso
 oddarchiver restore /tmp/out --all-disks --device /dev/sr0
 ```
 
-For an ISO, restore opens the needed sibling files automatically. For a drive, insert any disc from the prompt list.
-The program reads each needed disc once. It does not request discs that hold only older, superseded versions.
-Use `--path P` more than once to select files or directories. Use `--all-files` to select the whole live tree.
-Without either flag, restore also selects the whole live tree. Do not combine `--path` and `--all-files`.
+For an ISO, restore opens the needed sibling files automatically.
+For a drive, insert any disc from the prompt list.
+The program reads each needed disc once for blobs.
+It also requests every known volume once for a manifest check.
+It does not request a volume that you mark missing.
+Use `--path P` more than once to select files or directories.
+Use `--all-files` to select the whole live tree.
+Without either flag, restore also selects the whole live tree.
+Do not combine `--path` and `--all-files`.
 Use `--session N` to select the archive state at session N.
 
-Without `--all-disks`, restore uses only the inserted disc. It never asks for another disc.
-It restores each file's newest version on that disc. If an old delta needs another disc, restore names that disc for the file.
-A marked disc prints a notice because another disc can hold a newer version. A legacy unmarked disc keeps its original behavior.
-Restore skips a destination file whose restore-state record comes from a newer session only when the destination checksum matches that record.
+Without `--all-disks`, restore uses only the inserted disc.
+It never asks for another disc.
+It restores the newest version of each file on that disc.
+If an old delta needs another disc, restore names that disc for the file.
+A marked disc prints a notice because another disc can hold a newer version.
+A legacy unmarked disc keeps its original behavior.
+Restore skips a destination file whose restore-state record comes from a newer session.
+It skips only when the destination checksum matches that record.
+
+After a fill burn, an older disc can hold a later global session.
+`--all-disks` still starts on the inserted disc.
+It merges the local archive record and `session_ranges` from `volume.json`.
+If local memory lists a later session on another disc, restore prints
+that fact and asks for that disc.
+
+Restore then reads the manifests of every known volume that is not missing.
+It does this even when the catalog lists no file on that volume.
+A newly learned session can add files or a newer version.
+If you mark a volume missing, restore does not read it.
+The final report lists volumes that it did not check.
+The result may be incomplete when a volume is unchecked.
+
 
 `restore --all-disks` honors `--read-mode`. Use `--read-mode sequential` to
 extract one session at a time. Use `--read-mode full-copy` to extract every
@@ -253,12 +343,13 @@ It reconstructs the file after it gets every blob in the chain. It removes the s
 Restore learns path events only from verified manifests. These rules apply
 to each disc that restore reads, and also to the starting disc.
 
-- The disc run starts at `first_session` in `volume.json`. It ends at the
-  last loaded session slot. Restore learns events only from a non-SUSPECT
-  manifest whose session is in this run. It ignores a manifest outside the
-  run and a second manifest for the same session. It ignores an event that
-  conflicts with a verified event at the same session. It also ignores an
-  entry with an invalid blob path.
+- The disc holds the session numbers in `session_ranges` when that field
+  exists. Otherwise the run starts at `first_session` and ends at the
+  last loaded session in one closed interval. Restore learns events only
+  from a non-SUSPECT manifest whose session is in this set. It ignores a
+  manifest outside the set and a second manifest for the same session.
+  It ignores an event that conflicts with a verified event at the same
+  session. It also ignores an entry with an invalid blob path.
 - Restore authenticates an acquired disc before it learns the disc. With a
   key, the disc must have one or more non-SUSPECT manifests whose session
   equals the directory slot. When the catalog or the local disc record says
@@ -322,7 +413,8 @@ Start with disc 2 and request only `new.txt`:
 oddarchiver restore /tmp/new --all-disks --test-iso archive.vol2.iso --path new.txt
 ```
 
-Restore uses disc 2 and does not read discs 0 or 1. To restore all files with disc 1 lost, run:
+Restore uses disc 2 for `new.txt`. It also requests discs 0 and 1 for a manifest check.
+To restore all files with disc 1 lost, run:
 
 ```
 oddarchiver restore /tmp/out --all-disks --test-iso archive.vol2.iso --skip-volume 1

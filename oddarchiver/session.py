@@ -10,8 +10,10 @@ Description:
 # Imports
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
+import fcntl
 import hashlib
 import json
 import logging
@@ -27,12 +29,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+
 from oddarchiver.crypto import STREAM_CHUNK_SIZE, NullCrypto, blob_aad, is_bound_ciphertext, new_blob_aad
 from oddarchiver.delta import apply_delta, process_bytes_files
 from oddarchiver.filehash import hash_file
+from oddarchiver.compress import (
+    CODEC_NONE, CODEC_LZMA, DEFAULT_CODEC, PROBE_MIN, compress_bytes,
+    compress_file, decode_payload, encode_bytes, probe_file_incompressible,
+)
 from oddarchiver.catalog import safe_display
 from oddarchiver.manifest import (
-    MANIFEST_VERSION, Manifest, ManifestEntry, write_manifest,
+    MANIFEST_VERSION, Manifest, ManifestEntry, SplitPrefix, write_manifest,
 )
 from oddarchiver.volume import (
     PathVersion, VolumeBaseline, VolumeMarker, VolumeRecord,
@@ -47,6 +54,9 @@ if TYPE_CHECKING:
 
 # Globals
 SPACE_SAFETY_MARGIN = 0.95
+# ISO9660 wraps a file size at 4 GiB. Stay below that after encryption overhead.
+BLOB_SIZE_CAP = 3 * 2**30
+
 # ISO9660 and UDF allocate file data in 2 KiB blocks.
 ISO_BLOCK_BYTES = 2048
 # genisoimage writes about 885 KiB of UDF scaffolding before any file data.
@@ -80,6 +90,27 @@ logger = logging.getLogger(__name__)
 _log = logger
 
 
+@dataclass(frozen=True)
+class FillTarget:
+    """Measured appendable volume used as a fill packing candidate."""
+
+    volume_index: int
+    disc_info: DiscInfo
+    prior_file_count: int
+
+
+
+
+@dataclass(frozen=True)
+class PlannedVolume:
+    """One packed session from size-only dry-run planning."""
+
+    session_n: int
+    is_new_volume: bool
+    file_count: int
+    planned_bytes: int
+    split_notes: tuple[tuple[str, int], ...]
+
 @dataclass
 class _PreparedBlob:
     """On-disc blob location and manifest fields for one staged file.
@@ -104,8 +135,11 @@ class _PreparedBlob:
     blob_path: Path | None = None
     volume_chunk: int | None = None
     volume_chunk_count: int | None = None
+    volume_chunk_size: int | None = None
     dedup_blob_path: str = ""
     dedup_origin_rel_path: str = ""
+    codec: str = CODEC_NONE
+    original_size: int | None = None
     # On-disc bytes beyond encoded_size: block rounding, UDF/Rock Ridge
     # records, and this file's manifest entry. Hand-built packing tests
     # leave it 0 and keep a blob-only budget.
@@ -118,6 +152,8 @@ class _DedupTarget:
     blob_path: str
     origin_rel_path: str
     blob_origin_session: int | None = None
+    codec: str = CODEC_NONE
+    original_size: int | None = None
 
 
 class _CountingDigest:
@@ -288,6 +324,52 @@ def _check_staging_lock(staging: Path, session_n: int) -> None:
         f"running, remove {staging} manually and retry."
     )
 
+def _lock_pid(fd: int) -> str:
+    """Input: lock file descriptor. Output: PID text, or empty after a read failure."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        return os.read(fd, 32).decode("ascii", errors="replace").strip()
+    except OSError as exc:
+        _log.warning("Cannot read archive sync lock pid: %s", exc)
+        return ""
+
+
+@contextlib.contextmanager
+def archive_sync_lock(archive_id: str):
+    """
+    Input:  archive_id - ID from volume.json
+    Output: context manager that holds archive-{id}.sync.lock
+    Details:
+        Takes an exclusive non-blocking flock. A second sync on the same
+        archive raises RuntimeError and names the lock path.
+    """
+    from oddarchiver.catalog import archive_sync_lock_path
+
+    path = archive_sync_lock_path(archive_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pid = _lock_pid(fd)
+            detail = f", pid {pid}" if pid else ""
+            raise RuntimeError(
+                f"Archive {archive_id} already has a sync in progress "
+                f"(lock {path}{detail}). Wait for that process to finish."
+            ) from None
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        os.fsync(fd)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            _log.warning("Cannot unlock archive sync lock %s", path)
+        os.close(fd)
+
+
 
 def _full_medium_bytes(backend: "BurnBackend") -> int:
     """
@@ -295,14 +377,25 @@ def _full_medium_bytes(backend: "BurnBackend") -> int:
     Output: int - bytes of a blank medium
     Details:
         ISOBackend stores the configured --disc-size on .disc_size. The
-        code uses that value when it is a positive int. DiscBackend and anything
-        else (including mocks without an int disc_size) fall back to
-        BDXL_DISC_BYTES, the largest BD medium this tool targets.
+        code uses that value when it is a positive int. DiscBackend uses
+        the capacity of the loaded medium (used plus remaining bytes), so
+        each later disc of a set matches the media type in the drive. A
+        DVD set then splits at DVD size, not at BDXL size. Anything else
+        (mocks without an int disc_size) falls back to BDXL_DISC_BYTES.
     """
+    from oddarchiver.disc import BDXL_DISC_BYTES, DiscBackend
     disc_size = getattr(backend, "disc_size", None)
     if isinstance(disc_size, int) and disc_size > 0:
         return disc_size
-    from oddarchiver.disc import BDXL_DISC_BYTES
+    if isinstance(backend, DiscBackend):
+        info = backend.mediainfo()
+        capacity = info.used_bytes + info.remaining_bytes
+        if capacity > 0:
+            return capacity
+        _log.warning(
+            "Drive %s reports no capacity; using the BDXL size for later discs",
+            backend.device,
+        )
     return BDXL_DISC_BYTES
 
 
@@ -346,15 +439,16 @@ def _volume_split_lengths(
     full_budget: int,
 ) -> list[int]:
     """
-    Input:  plaintext_size     - whole-file size in bytes
+    Input:  plaintext_size     - encoded payload size in bytes
             first_chunk_budget - budget active for chunk 0
             full_budget        - budget for every later chunk
-    Output: list of plaintext lengths, one per volume chunk
+    Output: list of encoded lengths, one per volume chunk
     Details:
-        Chunk 0 is min(remaining, first_chunk_budget) when that budget
-        is positive, otherwise min(remaining, full_budget). Chunks
-        1..N-2 are exactly full_budget. The last chunk takes the
-        remainder. A zero full_budget cannot split a file.
+        Chunk 0 is min(remaining, first_chunk_budget, BLOB_SIZE_CAP)
+        when that budget is positive, otherwise min(remaining,
+        full_budget, BLOB_SIZE_CAP). Later chunks use full_budget
+        capped the same way. The last chunk takes the remainder.
+        A zero full_budget cannot split a file.
     """
     if full_budget <= 0:
         raise RuntimeError(
@@ -364,7 +458,7 @@ def _volume_split_lengths(
     lengths: list[int] = []
     remaining = plaintext_size
     while remaining > 0:
-        n = min(remaining, budget)
+        n = min(remaining, budget, BLOB_SIZE_CAP)
         lengths.append(n)
         remaining -= n
         budget = full_budget
@@ -456,6 +550,8 @@ def _index_manifest_full_blobs(
             blob_path=entry.file,
             origin_rel_path=entry.path,
             blob_origin_session=entry.blob_origin_session,
+            codec=entry.codec,
+            original_size=entry.original_size,
         )
 
 
@@ -500,6 +596,8 @@ def _prepare_dedup_blob(
     blob_path: str = "",
     origin_rel_path: str = "",
     blob_origin_session: int | None = None,
+    codec: str = CODEC_NONE,
+    original_size: int | None = None,
 ) -> _PreparedBlob:
     """
     Input:  rel_path, result_checksum - new path identity
@@ -526,6 +624,8 @@ def _prepare_dedup_blob(
         dedup_blob_path=blob_path,
         dedup_origin_rel_path=origin_rel_path,
         blob_origin_session=blob_origin_session,
+        codec=codec,
+        original_size=original_size,
     )
 
 
@@ -589,6 +689,7 @@ def _dedup_ref(
         return _prepare_dedup_blob(
             rel_path, read_checksum, full_size_bytes, blob_path=hit.blob_path,
             blob_origin_session=hit.blob_origin_session,
+            codec=hit.codec, original_size=hit.original_size,
         )
     origin_rel = this_run_origins.get(read_checksum)
     if origin_rel is not None and origin_rel != rel_path:
@@ -738,14 +839,10 @@ def _attach_dedup_refs(
     return chunks
 
 
-def _start_split_bins(
-    split_items: list[_PreparedBlob], first_budget: int, full_budget: int,
-) -> tuple[list[list[_PreparedBlob]], int]:
+def _ordered_split_chunks(split_items: list[_PreparedBlob]) -> list[_PreparedBlob]:
     """
-    Input:  split_items - volume-split blobs
-            first_budget - budget on the current medium
-            full_budget - budget on a fresh medium
-    Output: dedicated bins and the budget for ordinary blobs
+    Input:  split_items - volume-split blobs in first-seen order
+    Output: the same blobs grouped by rel_path, then by volume_chunk
     """
     groups: dict[str, list[_PreparedBlob]] = {}
     group_order: list[str] = []
@@ -754,31 +851,167 @@ def _start_split_bins(
             group_order.append(item.rel_path)
             groups[item.rel_path] = []
         groups[item.rel_path].append(item)
+    ordered: list[_PreparedBlob] = []
     for rel_path in group_order:
-        groups[rel_path].sort(key=lambda b: b.volume_chunk or 0)
+        group = groups[rel_path]
+        group.sort(key=lambda b: b.volume_chunk or 0)
+        ordered.extend(group)
+    return ordered
 
+
+def _blob_pack_cost(item: _PreparedBlob) -> int:
+    """Input: one prepared blob. Output: encoded_size plus on-disc overhead."""
+    return item.encoded_size + item.on_disc_overhead
+
+
+def _split_chunk_unfittable(item: _PreparedBlob, full_budget: int) -> bool:
+    """
+    Input:  item - one volume-split chunk
+            full_budget - packable budget of a fresh medium
+    Output: True when the chunk cannot occupy an empty full-budget bin
+    """
+    cost = _blob_pack_cost(item)
+    return cost >= full_budget and cost > BLOB_SIZE_CAP
+
+
+def _bin_budget(index: int, first_budget: int, full_budget: int) -> int:
+    """Input: bin index and budgets. Output: budget for that bin."""
+    return first_budget if index == 0 else full_budget
+
+
+def _try_append_split_chunk(
+    chunks: list[list[_PreparedBlob]], item: _PreparedBlob,
+    first_budget: int, full_budget: int,
+) -> bool:
+    """
+    Input:  current bins, one split chunk, and the two budgets
+    Output: True when the chunk was placed in the last bin
+    """
+    if not chunks:
+        return False
+    budget = _bin_budget(len(chunks) - 1, first_budget, full_budget)
+    used = sum(_blob_pack_cost(blob) for blob in chunks[-1])
+    cost = _blob_pack_cost(item)
+    if used + cost < budget:
+        chunks[-1].append(item)
+        return True
+    if chunks[-1]:
+        _log_volume_pack_stop(
+            len(chunks[-1]), used, budget,
+            f"next volume-split chunk {item.rel_path!r} does not fit",
+        )
+        return False
+    if budget <= 0 or cost < full_budget:
+        _log_volume_pack_stop(
+            0, 0, budget,
+            "current medium has no remaining packable space",
+        )
+        return False
+    if _split_chunk_unfittable(item, full_budget):
+        return False
+    chunks[-1].append(item)
+    return True
+
+
+def _place_split_chunk(
+    chunks: list[list[_PreparedBlob]], item: _PreparedBlob,
+    first_budget: int, full_budget: int,
+) -> None:
+    """
+    Input:  bins, one split chunk, and the two budgets
+    Output: None. Appends the chunk to the last bin or opens a new bin.
+    """
+    cost = _blob_pack_cost(item)
+    if _try_append_split_chunk(chunks, item, first_budget, full_budget):
+        return
+    if not chunks and first_budget > 0:
+        # Only chunk 0 was sized to the current medium, so only chunk 0
+        # may land in bin 0 when its cost reaches the first budget. A
+        # resumed tail chunk belongs on a fresh medium instead.
+        sized_for_current = (
+            (item.volume_chunk or 0) == 0
+            and cost >= full_budget
+            and not _split_chunk_unfittable(item, full_budget)
+        )
+        if cost < first_budget or sized_for_current:
+            chunks.append([item])
+            return
+        _log_volume_pack_stop(
+            0, 0, first_budget,
+            "current medium has no remaining packable space",
+        )
+        chunks.append([])
+    if _split_chunk_unfittable(item, full_budget):
+        raise _blob_too_large_error(item.rel_path, cost, full_budget)
+    chunks.append([item])
+
+
+def _pack_split_bins(
+    split_items: list[_PreparedBlob], first_budget: int, full_budget: int,
+) -> list[list[_PreparedBlob]]:
+    """
+    Input:  split_items - volume-split blobs
+            first_budget - budget on the current medium
+            full_budget - budget on a fresh medium
+    Output: bins holding every split chunk in order
+    """
+    ordered = _ordered_split_chunks(split_items)
     chunks: list[list[_PreparedBlob]] = []
-    if group_order:
-        if first_budget <= 0:
-            _log_volume_pack_stop(
-                0, 0, first_budget,
-                "current medium has no remaining packable space",
-            )
-            chunks.append([])
-        for rel_path in group_order:
-            for item in groups[rel_path]:
-                chunks.append([item])
-                chunk_n = (item.volume_chunk or 0) + 1
-                chunk_of = item.volume_chunk_count or 1
-                _log_volume_pack_stop(
-                    1, item.encoded_size, item.encoded_size,
-                    f"dedicated volume-split chunk {item.rel_path!r} "
-                    f"({chunk_n}/{chunk_of})",
-                )
-        ordinary_budget = full_budget
-    else:
-        ordinary_budget = first_budget
-    return chunks, ordinary_budget
+    if not ordered:
+        return chunks
+    if first_budget <= 0:
+        _log_volume_pack_stop(
+            0, 0, first_budget,
+            "current medium has no remaining packable space",
+        )
+        chunks.append([])
+    for item in ordered:
+        _place_split_chunk(chunks, item, first_budget, full_budget)
+    return chunks
+
+
+def _fill_existing_bins(
+    chunks: list[list[_PreparedBlob]], ordinary: list[_PreparedBlob],
+    first_budget: int, full_budget: int,
+) -> list[_PreparedBlob]:
+    """
+    Input:  chunks - bins that already hold split chunks
+            ordinary - non-split blobs
+            first_budget - budget for bin 0
+            full_budget - budget for later bins
+    Output: ordinary blobs that did not fit an existing bin
+    """
+    remaining = sorted(ordinary, key=lambda b: (-b.encoded_size, b.rel_path))
+    for i, bin_items in enumerate(chunks):
+        remaining = _fill_one_bin(
+            i, bin_items, remaining, first_budget, full_budget,
+        )
+    return remaining
+
+
+def _fill_one_bin(
+    index: int, bin_items: list[_PreparedBlob],
+    remaining: list[_PreparedBlob], first_budget: int, full_budget: int,
+) -> list[_PreparedBlob]:
+    """
+    Input:  one bin and leftover ordinary blobs
+    Output: ordinary blobs that did not fit this bin
+    """
+    budget = _bin_budget(index, first_budget, full_budget)
+    used = sum(_blob_pack_cost(item) for item in bin_items)
+    leftover: list[_PreparedBlob] = []
+    for cand in remaining:
+        size = _blob_pack_cost(cand)
+        if used + size < budget:
+            bin_items.append(cand)
+            used += size
+        else:
+            leftover.append(cand)
+    _log_volume_pack_stop(
+        len(bin_items), used, budget,
+        f"filled existing bin {index} with leftover ordinary blobs",
+    )
+    return leftover
 
 
 def _pack_ordinary_bins(
@@ -788,7 +1021,7 @@ def _pack_ordinary_bins(
     """
     Input:  chunks - bins to update
             ordinary - non-split blobs to pack
-            ordinary_budget - budget for the first ordinary bin
+            ordinary_budget - budget for the first new ordinary bin
             full_budget - budget for each later bin
     Output: None
     """
@@ -799,7 +1032,7 @@ def _pack_ordinary_bins(
         deferred: list[_PreparedBlob] = []
         used = 0
         for item in remaining:
-            size = item.encoded_size + item.on_disc_overhead
+            size = _blob_pack_cost(item)
             if used + size < budget:
                 bin_items.append(item)
                 used += size
@@ -833,42 +1066,70 @@ def _pack_ordinary_bins(
         budget = full_budget
 
 
-def _pack_blobs(
-    blobs: list[_PreparedBlob],
-    first_budget: int,
-    full_budget: int,
+def _pack_with_ordinary_first(
+    split_items: list[_PreparedBlob], ordinary: list[_PreparedBlob],
+    first_budget: int, full_budget: int,
 ) -> list[list[_PreparedBlob]]:
     """
-    Input:  blobs        - encoded blobs (ordinary and optional volume-split)
-            first_budget - remaining_bytes * SPACE_SAFETY_MARGIN on the current medium
-            full_budget  - fresh-medium bytes * SPACE_SAFETY_MARGIN
-    Output: list of bins. Each bin holds the blobs for one session directory
-    Details:
-        Volume-split blobs (volume_chunk is not None) each get their own
-        dedicated bin, grouped by rel_path in first-seen order, then by
-        ascending volume_chunk. Dedicated bins never share with another
-        file or another chunk of the same file, so chunk N cannot land
-        in an earlier bin than chunk N-1 even when encoded sizes tie.
-        If first_budget is 0 or negative, the code keeps an empty first
-        bin and skips the current medium. Ordinary blobs then pack with
-        full_budget after the bins of the split file.
-        Ordinary blobs still use greedy largest-first fill (the code
-        breaks ties by rel_path). Each item consumes its encoded_size
-        plus its on_disc_overhead (block rounding, UDF records, and the
-        manifest entry). A non-split blob whose on-disc cost reaches
-        full_budget raises RuntimeError naming that file. The code
-        keeps an empty first bin when nothing fits the remaining space
-        of the current medium.
-        Each closed bin logs packed bytes, leftover budget, and why packing
-        stopped (no more source files, next file did not fit, dedicated
-        volume-split chunk, or the current medium had no packable space).
-        Dedup references have encoded_size=0. This-run refs attach to the
-        origin's bin after real blobs pack. Prior-session refs attach to
-        the first non-empty bin.
+    Input:  split chunks, whole blobs, and the two bin budgets
+    Output: bins with whole blobs packed first, then split chunks
     """
-    if not blobs:
-        return [[]]
+    chunks: list[list[_PreparedBlob]] = []
+    if first_budget <= 0:
+        _log_volume_pack_stop(
+            0, 0, first_budget,
+            "current medium has no remaining packable space",
+        )
+        chunks.append([])
+        ordinary_budget = full_budget
+    else:
+        ordinary_budget = first_budget
+    if ordinary:
+        _pack_ordinary_bins(chunks, ordinary, ordinary_budget, full_budget)
+    for item in _ordered_split_chunks(split_items):
+        _place_split_chunk(chunks, item, first_budget, full_budget)
+    return chunks if chunks else [[]]
 
+
+def _reject_unfittable_ordinary(
+    ordinary: list[_PreparedBlob], full_budget: int,
+) -> None:
+    """Input: whole blobs and full-medium budget. Output: None. Raises if a blob cannot fit."""
+    for item in ordinary:
+        size = _blob_pack_cost(item)
+        if size >= full_budget:
+            raise _blob_too_large_error(item.rel_path, size, full_budget)
+
+
+def _pack_with_splits_first(
+    split_items: list[_PreparedBlob], ordinary: list[_PreparedBlob],
+    first_budget: int, full_budget: int,
+) -> list[list[_PreparedBlob]]:
+    """
+    Input: split chunks, whole blobs, and the two bin budgets
+    Output: bins with split chunks packed first, then whole blobs
+    """
+    chunks = _pack_split_bins(split_items, first_budget, full_budget)
+    if split_items:
+        ordinary = _fill_existing_bins(
+            chunks, ordinary, first_budget, full_budget,
+        )
+        ordinary_budget = full_budget
+    else:
+        ordinary_budget = first_budget
+    if not ordinary:
+        return chunks if chunks else [[]]
+    _pack_ordinary_bins(chunks, ordinary, ordinary_budget, full_budget)
+    return chunks
+
+
+def _partition_pack_blobs(
+    blobs: list[_PreparedBlob],
+) -> tuple[list[_PreparedBlob], list[_PreparedBlob], list[_PreparedBlob]]:
+    """
+    Input: prepared blobs
+    Output: prior-session refs, this-run refs, and real blobs
+    """
     prior_refs = [b for b in blobs if b.dedup_blob_path]
     this_run_refs = [
         b for b in blobs
@@ -878,25 +1139,218 @@ def _pack_blobs(
         b for b in blobs
         if not b.dedup_blob_path and not b.dedup_origin_rel_path
     ]
+    return prior_refs, this_run_refs, real
+
+
+def _pack_blobs(
+    blobs: list[_PreparedBlob],
+    first_budget: int,
+    full_budget: int,
+    ordinary_first: bool = False,
+) -> list[list[_PreparedBlob]]:
+    """
+    Input:  blobs        - encoded blobs (ordinary and optional volume-split)
+            first_budget - remaining_bytes * SPACE_SAFETY_MARGIN on the current medium
+            full_budget  - fresh-medium bytes * SPACE_SAFETY_MARGIN
+    Output: list of bins. Each bin holds the blobs for one session directory
+    Details:
+        Volume-split blobs (volume_chunk is not None) pack in first-seen
+        rel_path order, then by ascending volume_chunk. A chunk shares
+        the current bin when encoded_size plus on_disc_overhead keeps
+        the bin under its budget (strict <). Bin 0 uses first_budget.
+        Later bins use full_budget. A chunk that does not fit closes
+        the bin and opens a new one. A chunk whose cost reaches
+        full_budget and exceeds BLOB_SIZE_CAP raises RuntimeError.
+        Chunk N cannot land in an earlier bin than chunk N-1.
+        After every split chunk is placed, ordinary blobs fill leftover
+        space in each bin, greedy largest-first. Ties use rel_path.
+        Remaining ordinary blobs open new bins. ordinary_first packs
+        whole blobs first so a gap-fill split can share bin 0. If
+        first_budget is 0 or negative, the code keeps an empty first
+        bin and skips the current medium. Leftover ordinary blobs then
+        pack with full_budget after the split bins.
+        Each item consumes its encoded_size plus its on_disc_overhead.
+        A non-split blob whose on-disc cost reaches full_budget raises
+        RuntimeError naming that file. The code keeps an empty first bin
+        when nothing fits the remaining space of the current medium.
+        Each closed bin logs packed bytes, leftover budget, and why packing
+        stopped.
+        Dedup references have encoded_size=0. This-run refs attach to the
+        origin's bin after real blobs pack. Prior-session refs attach to
+        the first non-empty bin.
+    """
+    if not blobs:
+        return [[]]
+
+    prior_refs, this_run_refs, real = _partition_pack_blobs(blobs)
     if not real:
         return _attach_dedup_refs([[]], prior_refs, this_run_refs)
 
     split_items = [b for b in real if b.volume_chunk is not None]
     ordinary = [b for b in real if b.volume_chunk is None]
-
-    for item in ordinary:
-        size = item.encoded_size + item.on_disc_overhead
-        if size >= full_budget:
-            raise _blob_too_large_error(item.rel_path, size, full_budget)
-
-    chunks, ordinary_budget = _start_split_bins(split_items, first_budget, full_budget)
-
-    if not ordinary:
-        packed = chunks if chunks else [[]]
-        return _attach_dedup_refs(packed, prior_refs, this_run_refs)
-
-    _pack_ordinary_bins(chunks, ordinary, ordinary_budget, full_budget)
+    _reject_unfittable_ordinary(ordinary, full_budget)
+    packer = (
+        _pack_with_ordinary_first if ordinary_first else _pack_with_splits_first
+    )
+    chunks = packer(split_items, ordinary, first_budget, full_budget)
     return _attach_dedup_refs(chunks, prior_refs, this_run_refs)
+
+
+def _plan_ordinary_blob(
+    rel_path: str, encoded_size: int, full_size: int, kind: str,
+) -> _PreparedBlob:
+    """Input: path and sizes. Output: a packable blob with no payload bytes."""
+    return _PreparedBlob(
+        rel_path=rel_path,
+        kind=kind,
+        blob=b"",
+        result_checksum="",
+        full_size_bytes=full_size,
+        encoded_size=encoded_size,
+        original_size=full_size,
+    )
+
+
+def _plan_split_blobs(
+    rel_path: str,
+    plaintext_size: int,
+    chunk0: int,
+    full_budget: int,
+    crypto: object,
+) -> list[_PreparedBlob]:
+    """Input: path, size, and split budgets. Output: volume-split size-only blobs."""
+    encoded = _encoded_size_upper_bound(plaintext_size, crypto)
+    lengths = _volume_split_lengths(encoded, chunk0, full_budget)
+    count = len(lengths)
+    blobs: list[_PreparedBlob] = []
+    for index, length in enumerate(lengths):
+        blobs.append(_PreparedBlob(
+            rel_path=rel_path,
+            kind="full",
+            blob=b"",
+            result_checksum="",
+            full_size_bytes=plaintext_size,
+            encoded_size=length,
+            volume_chunk=index,
+            volume_chunk_count=count,
+            volume_chunk_size=length,
+            original_size=plaintext_size,
+        ))
+    return blobs
+
+
+def _plan_prepared_from_classify(
+    source: Path,
+    oversized_jobs: list[tuple[str, int, int]],
+    new_paths: list[str],
+    changed_paths: list[str],
+    encoded_sizes: dict[str, int],
+    crypto: object,
+    full_budget: int,
+) -> list[_PreparedBlob]:
+    """Input: classified paths and sizes. Output: size-only prepared blobs."""
+    prepared: list[_PreparedBlob] = []
+    for rel_path, size, chunk0 in oversized_jobs:
+        prepared.extend(
+            _plan_split_blobs(rel_path, size, chunk0, full_budget, crypto),
+        )
+    for rel_path in new_paths:
+        full_size = (source / rel_path).stat().st_size
+        encoded = encoded_sizes.get(
+            rel_path, _encoded_size_upper_bound(full_size, crypto),
+        )
+        prepared.append(
+            _plan_ordinary_blob(rel_path, encoded, full_size, "full"),
+        )
+    for rel_path in changed_paths:
+        full_size = (source / rel_path).stat().st_size
+        encoded = encoded_sizes.get(
+            rel_path, _encoded_size_upper_bound(full_size, crypto),
+        )
+        prepared.append(
+            _plan_ordinary_blob(rel_path, encoded, full_size, "full"),
+        )
+    return prepared
+
+
+def _bins_to_planned_volumes(
+    bins: list[list[_PreparedBlob]],
+    session_n: int,
+    first_is_new_volume: bool,
+) -> list[PlannedVolume]:
+    """Input: packed bins and session numbering. Output: planned volumes."""
+    volumes: list[PlannedVolume] = []
+    for i, items in enumerate(bins):
+        if not items:
+            continue
+        notes: dict[str, int] = {}
+        for item in items:
+            if item.volume_chunk is not None and item.volume_chunk_count:
+                notes[item.rel_path] = item.volume_chunk_count
+        files = {item.rel_path for item in items}
+        is_new = True if i > 0 else first_is_new_volume
+        volumes.append(PlannedVolume(
+            session_n=session_n + i,
+            is_new_volume=is_new,
+            file_count=len(files),
+            planned_bytes=_real_pack_cost(items),
+            split_notes=tuple(sorted(notes.items())),
+        ))
+    return volumes
+
+
+def plan_session_volumes(
+    source: Path,
+    new_files: set[str],
+    changed: set[str],
+    encoded_sizes: dict[str, int],
+    disc_state: dict[str, str],
+    current_state: dict[str, str],
+    disc_info: DiscInfo,
+    backend: "BurnBackend",
+    crypto: "CryptoBackend",
+    session_n: int,
+    split_large: bool,
+    manifests: list[Manifest] | None = None,
+    volume_baseline: VolumeBaseline | None = None,
+    volume_marker: VolumeMarker | None = None,
+    volume_label: str = "",
+    deleted: list[str] | None = None,
+    bundle_bytes: int = 0,
+) -> list[PlannedVolume]:
+    """
+    Input: source paths, encoded sizes, disc capacity, and pack flags
+    Output: packed volumes using the same packer as a real burn
+    Details:
+        Uses file sizes and encoded-size bounds only. Does not encrypt,
+        copy, or write blob files.
+    """
+    deleted_paths = [] if deleted is None else deleted
+    changed_map = {path: current_state[path] for path in changed}
+    first_budget, _merge, _effective = _first_pack_budget(
+        disc_info, session_n, disc_state, bundle_bytes,
+    )
+    _full_medium, full_budget, image_costs = _full_pack_budget(
+        backend, crypto, volume_baseline, manifests, volume_marker,
+        volume_label, new_files, changed_map, deleted_paths, current_state,
+    )
+    oversized_jobs, new_paths, changed_paths, ordinary_first = (
+        _classify_staging_paths(
+            source, new_files, changed_map, crypto, image_costs, full_budget,
+            first_budget, split_large,
+        )
+    )
+    prepared = _plan_prepared_from_classify(
+        source, oversized_jobs, new_paths, changed_paths, encoded_sizes,
+        crypto, full_budget,
+    )
+    _stamp_on_disc_overhead(prepared, crypto, image_costs)
+    bins = _pack_blobs(
+        prepared, first_budget, full_budget, ordinary_first=ordinary_first,
+    )
+    bins, first_is_new = _skip_empty_current_bin(bins, session_n, False)
+    return _bins_to_planned_volumes(bins, session_n, first_is_new)
+
 
 
 
@@ -996,17 +1450,15 @@ def find_unfittable_paths(
             staging_root  - override staging root (default: _default_staging_root())
     Output: {path: reason} for every path --skip-large must leave out
     Details:
-        A path is unfittable when its encoded size reaches one full disc
-        budget (build_staging would split it across volumes) or when its
-        source size reaches the whole local staging budget
-        (partition_by_staging_budget would raise). Both tests match the
-        ones those two functions apply. A path whose checksum already has
+        A path is unfittable when its source size reaches the whole
+        local staging budget (partition_by_staging_budget would raise).
+        A path that is larger than one disc is not unfittable: staging
+        splits it into volume chunks. A path whose checksum already has
         a reusable full blob on the archive is never listed: it costs
         zero bytes as a dedup reference.
     """
     root = staging_root if staging_root is not None else _default_staging_root()
     staging_budget = _staging_budget_bytes(root)
-    full_budget = _volume_budget(_full_medium_bytes(backend))
     checksum_index = _build_checksum_index(disc_state, disc_origin, manifests)
 
     skipped: dict[str, str] = {}
@@ -1014,12 +1466,7 @@ def find_unfittable_paths(
         if current_state[rel_path] in checksum_index:
             continue
         size = (source / rel_path).stat().st_size
-        if _encoded_size_upper_bound(size, crypto) >= full_budget:
-            skipped[rel_path] = (
-                f"{size} bytes does not fit on one disc "
-                f"(budget {full_budget} bytes)"
-            )
-        elif size >= staging_budget:
+        if size >= staging_budget:
             skipped[rel_path] = (
                 f"{size} bytes exceeds the local staging budget "
                 f"({int(staging_budget)} bytes)"
@@ -1064,6 +1511,8 @@ def _write_dedup_entry(
         source_checksum=item.source_checksum,
         file=blob_file,
         blob_origin_session=origin_session,
+        codec=item.codec,
+        original_size=item.original_size,
     )
     written_blob_paths[item.rel_path] = blob_file
     written_blob_origins[item.rel_path] = origin_session
@@ -1093,7 +1542,12 @@ def _write_real_blob_entry(
     if item.kind == "delta":
         if item.cache_full_path is not None:
             sidecar = _sidecar_dir(staging.with_name(staging.name + ".cache_full"))
-            shutil.move(str(item.cache_full_path), str(sidecar / item.result_checksum))
+            dest_full = sidecar / item.result_checksum
+            if dest_full.exists():
+                item.cache_full_path.unlink(missing_ok=True)
+            else:
+                shutil.move(str(item.cache_full_path), str(dest_full))
+            item.cache_full_path = dest_full
         dest = deltas_dir / blob_id
     else:
         dest = full_dir / blob_id
@@ -1120,7 +1574,10 @@ def _write_real_blob_entry(
         streamed=item.streamed,
         volume_chunk=item.volume_chunk,
         volume_chunk_count=item.volume_chunk_count,
+        volume_chunk_size=item.volume_chunk_size,
         blob_origin_session=item.blob_origin_session,
+        codec=item.codec,
+        original_size=item.original_size,
     )
     if file_field:
         written_blob_paths[item.rel_path] = file_field
@@ -1180,6 +1637,8 @@ def _write_chunk(
     if _sigint_received:
         raise KeyboardInterrupt
 
+    _inherit_dedup_codec(blobs, entries)
+
     manifest = Manifest(
         version=MANIFEST_VERSION,
         session=session_n,
@@ -1194,6 +1653,96 @@ def _write_chunk(
     )
     write_manifest(session_dir, manifest, crypto=crypto)
 
+def _inherit_dedup_codec(
+    blobs: list[_PreparedBlob], entries: list[ManifestEntry],
+) -> None:
+    """
+    Input:  blobs - prepared blobs in write order; entries - their entries
+    Output: None; dedup entries copy the codec of the blob they reference
+    Details:
+        A dedup entry shares another path's stored bytes, so it must
+        declare that blob's codec to decode on restore. A same-run origin
+        may appear after the reference, so this runs after all entries
+        exist; archive origins already carry the codec on the target.
+    """
+    by_path = {blob.rel_path: blob for blob in blobs}
+    by_file = {entry.file: entry for entry in entries if entry.file}
+    for blob, entry in zip(blobs, entries):
+        if not (blob.dedup_origin_rel_path or blob.dedup_blob_path):
+            continue
+        origin = by_path.get(blob.dedup_origin_rel_path) if blob.dedup_origin_rel_path else None
+        if origin is not None:
+            entry.codec = origin.codec
+            entry.original_size = origin.original_size
+            continue
+        shared = by_file.get(entry.file)
+        if shared is not None and shared is not entry:
+            entry.codec = shared.codec
+            entry.original_size = shared.original_size
+
+
+def _copy_file_range(src: Path, dest: Path, offset: int, length: int) -> None:
+    """Input: source file, dest, byte offset, length. Output: dest holds that range."""
+    with src.open("rb") as inf, dest.open("wb") as outf:
+        if offset:
+            inf.seek(offset)
+        remaining = length
+        while remaining > 0:
+            chunk = inf.read(min(STREAM_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            outf.write(chunk)
+            remaining -= len(chunk)
+
+
+def _hash_into(path: Path, digest: object) -> int:
+    """
+    Input:  path - file to read; digest - object with update(bytes)
+    Output: byte count that the digest consumed
+    Details:
+        Used when a blob is stored raw: the encode pass reads the source
+        once, so the same read hashes it.
+    """
+    total = 0
+    with Path(path).open("rb") as inf:
+        while True:
+            chunk = inf.read(STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+    return total
+
+
+def _encrypt_payload_file(
+    payload: Path,
+    dest: Path,
+    crypto: "CryptoBackend | None",
+    session_n: int,
+    kind: str,
+    blob_id: str,
+    digest: object | None = None,
+) -> int:
+    """Input: payload path and encode destination. Output: encoded size."""
+    if crypto is None:
+        shutil.copyfile(payload, dest)
+        if digest is not None:
+            with payload.open("rb") as inf:
+                while True:
+                    chunk = inf.read(STREAM_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+    elif isinstance(crypto, NullCrypto):
+        crypto.encrypt_file(payload, dest, digest=digest)
+    else:
+        crypto.encrypt_file(
+            payload, dest, digest=digest,
+            aad=new_blob_aad(session_n, kind, blob_id),
+        )
+    return dest.stat().st_size
+
+
 def _prepare_encoded_blob(
     rel_path: str, kind: str, plaintext: bytes, scratch_dir: Path,
     session_n: int, result_checksum: str, full_size_bytes: int,
@@ -1202,29 +1751,33 @@ def _prepare_encoded_blob(
     crypto: "CryptoBackend | None" = None,
 ) -> _PreparedBlob:
     """
-    Input: rel_path, kind, encrypted, scratch_dir, session_n, checksums and sizes
+    Input: rel_path, kind, plaintext, scratch_dir, session_n, checksums and sizes
     Output: A prepared blob that keeps ciphertext on disk
-    Details: Store bytes immediately and keep only their path and size.
+    Details: Compress, then encrypt, and keep only the path and size.
     """
     blob_id = _blob_id(session_n, rel_path)
+    dest = scratch_dir / blob_id
+    codec, payload = encode_bytes(plaintext)
     if crypto is None:
-        encrypted = plaintext
+        encrypted = payload
     elif isinstance(crypto, NullCrypto):
-        encrypted = crypto.encrypt(plaintext)
+        encrypted = crypto.encrypt(payload)
     else:
         encrypted = crypto.encrypt(
-            plaintext, aad=new_blob_aad(session_n, kind, blob_id),
+            payload, aad=new_blob_aad(session_n, kind, blob_id),
         )
-    dest = scratch_dir / blob_id
     dest.write_bytes(encrypted)
+    encoded_size = len(encrypted)
     return _PreparedBlob(
         rel_path=rel_path, kind=kind, blob=b"",
         result_checksum=result_checksum, full_size_bytes=full_size_bytes,
-        encoded_size=len(encrypted), source_checksum=source_checksum,
+        encoded_size=encoded_size, source_checksum=source_checksum,
         delta_size_bytes=delta_size_bytes, blob_path=dest,
         cache_full_path=cache_full_path, blob_id=blob_id,
-        blob_origin_session=session_n,
+        blob_origin_session=session_n, codec=codec,
+        original_size=len(plaintext),
     )
+
 
 
 def remove_tree(path: Path, label: str = "") -> bool:
@@ -1279,8 +1832,13 @@ def _manifest_entry_size(rel_path: str, crypto: "CryptoBackend | None" = None) -
         streamed=True,
         volume_chunk=255,
         volume_chunk_count=255,
+        codec="lzma",
+        original_size=2**53 - 1,
     )
-    one = json.dumps({"entries": [dataclasses.asdict(sample)]}, indent=2).encode("utf-8")
+    sample_entry = dataclasses.asdict(sample)
+    # write_manifest drops an unset chunk size; keep the measurement as is.
+    sample_entry.pop("volume_chunk_size", None)
+    one = json.dumps({"entries": [sample_entry]}, indent=2).encode("utf-8")
     zero = json.dumps({"entries": []}, indent=2).encode("utf-8")
     plain = len(one) - len(zero)
     if crypto is None or isinstance(crypto, NullCrypto):
@@ -1478,36 +2036,150 @@ def _prepare_streamed_blob(
             source_checksum - manifest field for a changed file
     Output: _PreparedBlob with streamed=True and blob_path set
     Details:
-        Encrypts abs_path to a scratch file via encrypt_file. The same
-        read hashes each plaintext chunk. result_checksum and
-        full_size_bytes describe the bytes that the call encoded, which
-        can differ from the scan when the file changes. The caller
-        compares result_checksum with the scan checksum. blob stays
+        Compresses abs_path, then encrypts the payload via encrypt_file.
+        A digest receives the plaintext during compress. result_checksum
+        and full_size_bytes describe those plaintext bytes. blob stays
         empty. encoded_size is the on-disk ciphertext size.
     """
     blob_id = _blob_id(session_n, rel_path)
+    payload_path = scratch_dir / f"{blob_id}.payload"
     scratch_path = scratch_dir / blob_id
     digest = _CountingDigest()
-    if isinstance(crypto, NullCrypto):
-        crypto.encrypt_file(abs_path, scratch_path, digest=digest)
-    else:
-        crypto.encrypt_file(
-            abs_path, scratch_path, digest=digest,
-            aad=new_blob_aad(session_n, "full", blob_id),
+    if DEFAULT_CODEC == CODEC_NONE or (
+        abs_path.stat().st_size >= PROBE_MIN
+        and probe_file_incompressible(abs_path)
+    ):
+        codec = CODEC_NONE
+        encoded_size = _encrypt_payload_file(
+            abs_path, scratch_path, crypto, session_n, "full", blob_id,
+            digest=digest,
         )
+    else:
+        codec, _payload_size = compress_file(abs_path, payload_path, digest=digest)
+        try:
+            encoded_size = _encrypt_payload_file(
+                payload_path, scratch_path, crypto, session_n, "full", blob_id,
+            )
+        finally:
+            payload_path.unlink(missing_ok=True)
     return _PreparedBlob(
         rel_path=rel_path,
         kind="full",
         blob=b"",
         result_checksum=digest.hexdigest(),
         full_size_bytes=digest.size,
-        encoded_size=scratch_path.stat().st_size,
+        encoded_size=encoded_size,
         source_checksum=source_checksum,
         streamed=True,
         blob_path=scratch_path,
         blob_id=blob_id,
         blob_origin_session=session_n,
+        codec=codec,
+        original_size=digest.size,
     )
+
+def _build_split_payload(
+    abs_path: Path, scratch_dir: Path, base_id: str,
+) -> tuple[Path, Path | None, str, int, str, int]:
+    """
+    Input:  abs_path - source file
+            scratch_dir, base_id - payload location
+    Output: encrypt source, payload temp path to remove or None,
+            codec, encoded payload size, read checksum, and source size
+    Details:
+        An incompressible file is hashed in place and encrypted straight
+        from the source file. Otherwise the whole file is compressed to
+        one payload file that the chunk encoder slices. The digest covers
+        the source bytes, so its checksum is the scan checksum and its
+        size is the source size. The encoded payload size drives the
+        chunk boundaries.
+    """
+    payload_path = scratch_dir / f"{base_id}.payload"
+    digest = _CountingDigest()
+    incompressible = DEFAULT_CODEC == CODEC_NONE or (
+        abs_path.stat().st_size >= PROBE_MIN
+        and probe_file_incompressible(abs_path)
+    )
+    if incompressible:
+        payload_size = _hash_into(abs_path, digest)
+        return (
+            abs_path, None, CODEC_NONE, payload_size,
+            digest.hexdigest(), digest.size,
+        )
+    codec, payload_size = compress_file(abs_path, payload_path, digest=digest)
+    return (
+        payload_path, payload_path, codec, payload_size,
+        digest.hexdigest(), digest.size,
+    )
+
+
+def _encode_split_chunks(
+    rel_path: str,
+    encrypt_source: Path,
+    base_id: str,
+    crypto: "CryptoBackend",
+    scratch_dir: Path,
+    session_n: int,
+    source_checksum: str,
+    lengths: list[int],
+    start_chunk: int,
+    chunk_count: int,
+    offset: int,
+    read_checksum: str,
+    codec: str,
+    original_size: int,
+) -> list[_PreparedBlob]:
+    """
+    Input:  rel_path, encrypt_source, base_id - source and payload identity
+            crypto, scratch_dir, session_n - encode destination
+            source_checksum - whole-file manifest field for a changed file
+            lengths - payload slice length per chunk, in order
+            start_chunk, chunk_count, offset - chunk numbering and
+                                                payload offset of chunk 0
+            read_checksum, codec, original_size - whole-file manifest fields
+    Output: one streamed _PreparedBlob per slice
+    Details:
+        Encrypts each slice separately with the per-chunk AAD. Restore
+        decrypts each chunk and appends the plaintext slices, so the
+        format matches earlier archives whatever the start chunk is.
+    """
+    blobs: list[_PreparedBlob] = []
+    for index in range(start_chunk, start_chunk + len(lengths)):
+        if _sigint_received:
+            raise KeyboardInterrupt
+        length = lengths[index - start_chunk]
+        blob_id = f"{base_id}_{index}"
+        scratch_path = scratch_dir / blob_id
+        if isinstance(crypto, NullCrypto):
+            crypto.encrypt_file(
+                encrypt_source, scratch_path, offset=offset, length=length,
+            )
+        else:
+            crypto.encrypt_file(
+                encrypt_source, scratch_path, offset=offset, length=length,
+                aad=new_blob_aad(session_n, "full", blob_id),
+            )
+        blobs.append(_PreparedBlob(
+            rel_path=rel_path,
+            kind="full",
+            blob=b"",
+            result_checksum=read_checksum,
+            full_size_bytes=original_size,
+            encoded_size=scratch_path.stat().st_size,
+            source_checksum=source_checksum,
+            streamed=True,
+            blob_path=scratch_path,
+            volume_chunk=index,
+            volume_chunk_count=chunk_count,
+            volume_chunk_size=length,
+            blob_id=blob_id,
+            blob_origin_session=session_n,
+            codec=codec,
+            original_size=original_size,
+        ))
+        offset += length
+    return blobs
+
 
 def _prepare_volume_split_blobs(
     rel_path: str,
@@ -1523,61 +2195,99 @@ def _prepare_volume_split_blobs(
     Input:  rel_path, abs_path - source identity
             crypto, scratch_dir, session_n - encode destination
             source_checksum - whole-file manifest field for a changed file
-            first_chunk_budget, full_budget - plaintext split sizes
+            first_chunk_budget, full_budget - encoded split sizes
     Output: one streamed _PreparedBlob per volume chunk
     Details:
-        Range-encrypts abs_path once per chunk via encrypt_file(offset,
-        length). Each blob is independently decryptable. One digest
-        receives every range in order, so result_checksum and
-        full_size_bytes on every chunk describe the bytes that the
-        chunks hold together. The caller compares result_checksum with
-        the scan checksum.
+        Compresses abs_path to one payload, then cuts the payload into
+        encoded chunk lengths and encrypts each slice separately with the
+        per-chunk AAD. Restore decrypts each chunk and appends the
+        plaintext slices, so the format matches earlier archives.
+        result_checksum and full_size_bytes describe the whole plaintext.
     """
-    plaintext_size = abs_path.stat().st_size
-    lengths = _volume_split_lengths(
-        plaintext_size, first_chunk_budget, full_budget,
+    base_id = _blob_id(session_n, rel_path)
+    encrypt_source, payload_tmp, codec, payload_size, read_checksum, original = (
+        _build_split_payload(abs_path, scratch_dir, base_id)
     )
-    count = len(lengths)
-    blobs: list[_PreparedBlob] = []
-    digest = _CountingDigest()
-    offset = 0
-    for i, length in enumerate(lengths):
-        if _sigint_received:
-            raise KeyboardInterrupt
-        blob_id = f"{_blob_id(session_n, rel_path)}_{i}"
-        scratch_path = scratch_dir / blob_id
-        if isinstance(crypto, NullCrypto):
-            crypto.encrypt_file(
-                abs_path, scratch_path, offset=offset, length=length, digest=digest,
-            )
-        else:
-            crypto.encrypt_file(
-                abs_path, scratch_path, offset=offset, length=length, digest=digest,
-                aad=new_blob_aad(session_n, "full", blob_id),
-            )
-        blobs.append(_PreparedBlob(
-            rel_path=rel_path,
-            kind="full",
-            blob=b"",
-            result_checksum="",
-            full_size_bytes=0,
-            encoded_size=scratch_path.stat().st_size,
-            source_checksum=source_checksum,
-            streamed=True,
-            blob_path=scratch_path,
-            volume_chunk=i,
-            volume_chunk_count=count,
-            blob_id=blob_id,
-            blob_origin_session=session_n,
-        ))
-        offset += length
-    read_checksum = digest.hexdigest()
-    for blob in blobs:
-        blob.result_checksum = read_checksum
-        blob.full_size_bytes = digest.size
-    return blobs
+    try:
+        lengths = _volume_split_lengths(
+            payload_size, first_chunk_budget, full_budget,
+        )
+        return _encode_split_chunks(
+            rel_path, encrypt_source, base_id, crypto, scratch_dir, session_n,
+            source_checksum, lengths, 0, len(lengths), 0, read_checksum,
+            codec, original,
+        )
+    finally:
+        if payload_tmp is not None:
+            payload_tmp.unlink(missing_ok=True)
 
 
+def _prepare_tail_split_blobs(
+    rel_path: str,
+    abs_path: Path,
+    crypto: "CryptoBackend",
+    scratch_dir: Path,
+    session_n: int,
+    prefix: SplitPrefix,
+    first_chunk_budget: int,
+    full_budget: int,
+) -> list[_PreparedBlob]:
+    """
+    Input:  rel_path, abs_path - source identity
+            crypto, scratch_dir, session_n - encode destination
+            prefix - clean chunk prefix already burned for this file
+            first_chunk_budget, full_budget - encoded split sizes
+    Output: only the missing chunks k+1..n-1, at the recorded boundaries
+    Details:
+        Rebuilds the whole payload, then verifies that its checksum,
+        size, and codec match the burned prefix. On any difference the
+        source changed or the plan no longer matches, so the function
+        falls back to today's whole-file restage. Otherwise it slices
+        the payload from prefix.payload_offset and keeps chunk indices
+        and chunk_count, so restore assembles chunks 0..n-1 unchanged.
+    """
+    base_id = _blob_id(session_n, rel_path)
+    encrypt_source, payload_tmp, codec, payload_size, read_checksum, original = (
+        _build_split_payload(abs_path, scratch_dir, base_id)
+    )
+    try:
+        expected_tail = prefix.chunk_count - prefix.next_chunk
+        remaining = payload_size - prefix.payload_offset
+        matches = (
+            codec == prefix.codec
+            and read_checksum == prefix.result_checksum
+            and original == prefix.original_size
+            and remaining > 0
+        )
+        if matches:
+            lengths = _volume_split_lengths(remaining, 0, full_budget)
+            if len(lengths) == expected_tail:
+                _log.info(
+                    "resuming volume split %s at chunk %d of %d",
+                    rel_path, prefix.next_chunk, prefix.chunk_count,
+                )
+                return _encode_split_chunks(
+                    rel_path, encrypt_source, base_id, crypto, scratch_dir,
+                    session_n, "", lengths,
+                    prefix.next_chunk, prefix.chunk_count,
+                    prefix.payload_offset, read_checksum, codec, original,
+                )
+        _log.warning(
+            "Cannot extend the volume split for %s (source changed or the "
+            "chunk plan differs); restaging the whole file",
+            rel_path,
+        )
+        lengths = _volume_split_lengths(
+            payload_size, first_chunk_budget, full_budget,
+        )
+        return _encode_split_chunks(
+            rel_path, encrypt_source, base_id, crypto, scratch_dir, session_n,
+            "", lengths, 0, len(lengths), 0,
+            read_checksum, codec, original,
+        )
+    finally:
+        if payload_tmp is not None:
+            payload_tmp.unlink(missing_ok=True)
 
 
 def _open_staging_workspace(
@@ -1601,32 +2311,62 @@ def _open_staging_workspace(
     return staging, scratch_dir
 
 
+def _hash_source_files(
+    source: Path, source_files: list[Path], skipped: list[str], total_files: int,
+) -> dict[str, str]:
+    """Input: source root, files, skipped paths, and total count. Output: relative path to checksum."""
+    current_state: dict[str, str] = {}
+    done = 0
+    skipped_set = set(skipped)
+    for src_file in source_files:
+        if _sigint_received:
+            raise KeyboardInterrupt
+        rel = str(src_file.relative_to(source))
+        if rel in skipped_set:
+            continue
+        try:
+            current_state[rel] = hash_file(src_file, STREAM_CHUNK_SIZE).hexdigest()
+        except OSError as exc:
+            _log.warning("Scan skips unreadable file %s: %s", src_file, exc)
+            skipped_set.add(rel)
+            print(f"  warning: skipped {rel} (unreadable: {exc})", flush=True)
+            continue
+        done += 1
+        _print_bar(done, total_files, suffix=rel)
+    return current_state
+
+
 def _scan_staging_source(
     source: Path, staging: Path, precomputed: dict[str, str] | None,
 ) -> dict[str, str]:
     """
     Input: source and staging paths, and optional precomputed hashes.
     Output: source paths mapped to checksums.
+    Details: Warns per skipped path (dangling symlink, FIFO, socket,
+        unreadable file) and prints a skipped count.
     """
     if precomputed is not None:
-        current_state = precomputed
-    else:
-        print(f"Scanning {source} ...", flush=True)
-        source_files = sorted(
-            f for f in source.rglob("*")
-            if f.is_file() and not f.is_relative_to(staging)
+        return precomputed
+    from oddarchiver.cli import _scan_skips
+
+    print(f"Scanning {source} ...", flush=True)
+    source_files = sorted(
+        f for f in source.rglob("*")
+        if f.is_file() and not f.is_relative_to(staging)
+    )
+    skipped = _scan_skips(source, staging, sorted(source.rglob("*")))
+    for rel in skipped:
+        print(f"  warning: skipped {rel}", flush=True)
+    if skipped:
+        print(
+            f"  skipped {len(skipped)} path(s) that cannot be archived.",
+            flush=True,
         )
-        total_files = len(source_files)
-        print(f"  {total_files} file(s) found. Hashing...", flush=True)
-        current_state = {}
-        for i, src_file in enumerate(source_files, 1):
-            if _sigint_received:
-                raise KeyboardInterrupt
-            rel = str(src_file.relative_to(source))
-            current_state[rel] = hash_file(src_file, STREAM_CHUNK_SIZE).hexdigest()
-            _print_bar(i, total_files, suffix=rel)
-        if total_files:
-            print()
+    total_files = len(source_files)
+    print(f"  {total_files} file(s) found. Hashing...", flush=True)
+    current_state = _hash_source_files(source, source_files, skipped, total_files)
+    if total_files:
+        print()
     return current_state
 
 
@@ -1669,25 +2409,49 @@ def _check_staging_space(
             raise SystemExit(1)
 
 
+def _appendable_remaining(disc_info: DiscInfo) -> int:
+    """
+    Input:  disc snapshot
+    Output: bytes one growisofs -M session may add, or 0 when closed for -M
+    Details:
+        growisofs refuses a session that would cross the 4 GiB boundary
+        ("next session would cross 4GB boundary"), so an append may only
+        use the space below it. A blank disc (-Z) has no such limit.
+    """
+    # scbc ignore[is-true-false-strict] None means unknown; only False is closed
+    if disc_info.appendable is False:
+        return 0
+    if disc_info.session_count > 0 and disc_info.used_bytes:
+        from oddarchiver.disc import GROWISOFS_MERGE_LIMIT_BYTES
+
+        below_boundary = max(0, GROWISOFS_MERGE_LIMIT_BYTES - disc_info.used_bytes)
+        return min(disc_info.remaining_bytes, below_boundary)
+    return disc_info.remaining_bytes
+
+
 def _first_pack_budget(
     disc_info: DiscInfo, session_n: int, disc_state: dict[str, str],
-    bundle_bytes: int,
+    bundle_bytes: int, prior_file_count: int | None = None,
 ) -> tuple[int, int, int]:
     """
     Input: disc capacity, session number, prior paths, and bundle size.
     Output: first budget, merge overhead, and effective remaining bytes.
     """
+    remaining = _appendable_remaining(disc_info)
+    prior_files = (
+        len(disc_state) if prior_file_count is None else prior_file_count
+    )
     merge_overhead = (
-        len(disc_state) * MERGE_OVERHEAD_PER_PRIOR_FILE_BYTES
+        prior_files * MERGE_OVERHEAD_PER_PRIOR_FILE_BYTES
         if session_n > 0 else 0
     )
     # A medium that holds no image yet also pays the ISO scaffolding.
     first_scaffold = (
-        _iso_scaffold_bytes(disc_info.remaining_bytes)
+        _iso_scaffold_bytes(remaining)
         if disc_info.used_bytes == 0 else 0
     )
     effective_remaining = max(
-        0, disc_info.remaining_bytes - merge_overhead - first_scaffold
+        0, remaining - merge_overhead - first_scaffold
     )
     first_budget = _volume_budget(effective_remaining)
     if bundle_bytes:
@@ -1700,6 +2464,155 @@ def _first_pack_budget(
             raise SystemExit(1)
         first_budget -= bundle_bytes
     return first_budget, merge_overhead, effective_remaining
+
+
+def _real_pack_cost(items: list[_PreparedBlob]) -> int:
+    """Input: prepared blobs. Output: on-disc cost of blobs that occupy space."""
+    total = 0
+    for item in items:
+        if item.dedup_blob_path or item.dedup_origin_rel_path:
+            continue
+        total += _blob_pack_cost(item)
+    return total
+
+
+def _blobs_fit_first_budget(
+    items: list[_PreparedBlob], first_budget: int,
+) -> bool:
+    """Input: blobs and bin-0 budget. Output: True when they all fit one bin."""
+    if first_budget <= 0:
+        return False
+    return _real_pack_cost(items) < first_budget
+
+
+def _convert_foreign_prepared(
+    items: list[_PreparedBlob], source: Path, crypto: CryptoBackend,
+    scratch_dir: Path, session_n: int, full_budget: int,
+    current_state: dict[str, str],
+) -> list[_PreparedBlob]:
+    """
+    Input: prepared blobs and encoding context for a different existing volume.
+    Output: the same list with deltas and prior-disc refs turned into full blobs.
+    """
+    converted: list[_PreparedBlob] = []
+    for item in items:
+        if item.kind != "delta" and not item.dedup_blob_path:
+            converted.append(item)
+            continue
+        converted.extend(_replacement_for_moved_blob(
+            item, source, crypto, scratch_dir, session_n,
+            full_budget, current_state,
+        ))
+    return converted
+
+
+def _fill_target_budget(
+    target: FillTarget, session_n: int, bundle_bytes: int,
+) -> int:
+    """Input: fill candidate, session, bundle size. Output: bin-0 budget."""
+    first_budget, _merge, _effective = _first_pack_budget(
+        target.disc_info, session_n, {}, bundle_bytes,
+        prior_file_count=target.prior_file_count,
+    )
+    return first_budget
+
+
+def _choose_fill_target(
+    targets: list[FillTarget],
+    items: list[_PreparedBlob],
+    inserted_index: int,
+    session_n: int,
+    bundle_bytes: int,
+    source: Path,
+    crypto: CryptoBackend,
+    scratch_dir: Path,
+    full_budget: int,
+    current_state: dict[str, str],
+    image_costs: bool,
+) -> tuple[FillTarget | None, list[_PreparedBlob]]:
+    """
+    Input: oldest-first fill candidates, encoded blobs, and packing context.
+    Output: the oldest volume that can hold every blob, plus converted blobs.
+    """
+    _stamp_on_disc_overhead(items, crypto, image_costs)
+    for target in targets:
+        work = items
+        if target.volume_index != inserted_index:
+            work = _convert_foreign_prepared(
+                items, source, crypto, scratch_dir, session_n,
+                full_budget, current_state,
+            )
+            _stamp_on_disc_overhead(work, crypto, image_costs)
+        budget = _fill_target_budget(target, session_n, bundle_bytes)
+        if _blobs_fit_first_budget(work, budget):
+            _log.info(
+                "Fill packs session %03d onto volume %s (%d bytes, budget %d)",
+                session_n, target.volume_index, _real_pack_cost(work), budget,
+            )
+            return target, work
+    return None, items
+
+
+def _split_fill_work(
+    work: list[_PreparedBlob],
+) -> tuple[list[_PreparedBlob], list[_PreparedBlob], list[_PreparedBlob]]:
+    """Input: converted fill blobs. Output: ordinary, split, and this-run refs."""
+    split_blobs = [item for item in work if item.volume_chunk is not None]
+    this_run = [
+        item for item in work
+        if item.dedup_origin_rel_path and not item.dedup_blob_path
+    ]
+    prepared = [
+        item for item in work
+        if item.volume_chunk is None
+        and not (item.dedup_origin_rel_path and not item.dedup_blob_path)
+    ]
+    return prepared, split_blobs, this_run
+
+
+def _apply_fill_target_choice(
+    fill_targets: list[FillTarget] | None,
+    fill_chosen: list[int] | None,
+    inserted_index: int | None,
+    prepared: list[_PreparedBlob],
+    split_blobs: list[_PreparedBlob],
+    dedup_refs: list[_PreparedBlob],
+    session_n: int,
+    bundle_bytes: int,
+    source: Path,
+    crypto: CryptoBackend,
+    scratch_dir: Path,
+    full_budget: int,
+    current_state: dict[str, str],
+    image_costs: bool,
+    first_budget: int,
+) -> tuple[list[_PreparedBlob], list[_PreparedBlob], list[_PreparedBlob], int, bool]:
+    """
+    Input: fill candidates and encoded blobs.
+    Output: blobs, first-bin budget, and whether bin 0 is a different volume.
+    """
+    if not fill_targets or inserted_index is None:
+        return prepared, split_blobs, dedup_refs, first_budget, False
+    prior_refs = [item for item in dedup_refs if item.dedup_blob_path]
+    this_run = [
+        item for item in dedup_refs
+        if item.dedup_origin_rel_path and not item.dedup_blob_path
+    ]
+    items = prepared + split_blobs + prior_refs
+    chosen, work = _choose_fill_target(
+        fill_targets, items, inserted_index, session_n, bundle_bytes,
+        source, crypto, scratch_dir, full_budget, current_state, image_costs,
+    )
+    if chosen is None:
+        return prepared, split_blobs, dedup_refs, first_budget, False
+    if fill_chosen is not None:
+        fill_chosen.append(chosen.volume_index)
+    first_budget = _fill_target_budget(chosen, session_n, bundle_bytes)
+    prepared, split_blobs, converted_refs = _split_fill_work(work)
+    convert_first = chosen.volume_index != inserted_index
+    return prepared, split_blobs, this_run + converted_refs, first_budget, convert_first
+
+
 
 
 def _full_pack_budget(
@@ -1733,51 +2646,158 @@ def _full_pack_budget(
     return full_medium, full_budget, image_costs
 
 
+def _blob_exceeds_volume(encoded: int, cost: int, full_budget: int) -> bool:
+    """Input: encoded size, on-disc cost, full budget. Output: True if the file must split."""
+    return encoded >= BLOB_SIZE_CAP or cost >= full_budget
+
+
+def _max_encoded_for_budget(
+    rel_path: str, budget: int, crypto: CryptoBackend, image_costs: bool,
+) -> int:
+    """
+    Input: path, leftover pack budget, crypto, and image-cost flag
+    Output: largest encoded size whose on-disc cost stays under budget
+    """
+    if budget <= 0:
+        return 0
+    lo = 0
+    hi = budget
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _on_disk_cost(rel_path, mid, crypto, image_costs) < budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _first_bin_deferred(
+    records: list[tuple[str, int, int, str]], first_budget: int,
+) -> tuple[int, list[tuple[str, int, int, str]]]:
+    """
+    Input: (path, size, cost, group) records and bin 0 budget
+    Output: leftover in bin 0 and records that did not fit that bin
+    """
+    ordered = sorted(records, key=lambda rec: (-rec[2], rec[0]))
+    used = 0
+    deferred: list[tuple[str, int, int, str]] = []
+    for rec in ordered:
+        cost = rec[2]
+        if used + cost < first_budget:
+            used += cost
+        else:
+            deferred.append(rec)
+    return first_budget - used, deferred
+
+
+def _gap_fill_split_job(
+    records: list[tuple[str, int, int, str]], first_budget: int,
+    crypto: CryptoBackend, image_costs: bool,
+) -> tuple[tuple[str, int, int] | None, list[tuple[str, int, int, str]]]:
+    """
+    Input: whole-file records, current-medium budget, crypto, image costs
+    Output: one gap-fill split job or None, and the remaining whole records
+    """
+    leftover, deferred = _first_bin_deferred(records, first_budget)
+    if leftover <= 0 or not deferred:
+        return None, records
+    victim = deferred[0]
+    chunk0 = _max_encoded_for_budget(
+        victim[0], leftover, crypto, image_costs,
+    )
+    if chunk0 <= 0:
+        return None, records
+    rest = [rec for rec in records if rec[0] != victim[0]]
+    return (victim[0], victim[1], chunk0), rest
+
+
+def _must_split_jobs(
+    must: list[tuple[str, int]], first_budget: int, full_budget: int,
+) -> list[tuple[str, int, int]]:
+    """
+    Input: must-split (path, size) jobs and the two budgets
+    Output: jobs with a chunk-0 budget. The largest file uses
+            first_budget when that budget is positive.
+    """
+    must = sorted(must, key=lambda job: (-job[1], job[0]))
+    jobs: list[tuple[str, int, int]] = []
+    for i, (rel_path, size) in enumerate(must):
+        if i == 0 and first_budget > 0:
+            chunk0 = first_budget
+        else:
+            chunk0 = full_budget
+        jobs.append((rel_path, size, chunk0))
+    return jobs
+
+
+def _staging_path_records(
+    source: Path, new_files: set[str], changed: dict[str, str],
+    crypto: CryptoBackend, image_costs: bool, full_budget: int,
+) -> tuple[list[tuple[str, int]], list[tuple[str, int, int, str]]]:
+    """
+    Input: source paths, crypto, image costs, and full-medium budget
+    Output: must-split (path, size) jobs and whole-file records
+    """
+    must: list[tuple[str, int]] = []
+    records: list[tuple[str, int, int, str]] = []
+    for rel_path in [*sorted(new_files), *sorted(changed)]:
+        size = (source / rel_path).stat().st_size
+        encoded = _encoded_size_upper_bound(size, crypto)
+        cost = _on_disk_cost(rel_path, encoded, crypto, image_costs)
+        if _blob_exceeds_volume(encoded, cost, full_budget):
+            must.append((rel_path, size))
+        else:
+            group = "new" if rel_path in new_files else "changed"
+            records.append((rel_path, size, cost, group))
+    return must, records
+
+
 def _classify_staging_paths(
     source: Path, new_files: set[str], changed: dict[str, str],
     crypto: CryptoBackend, image_costs: bool, full_budget: int,
-) -> tuple[list[tuple[str, int]], list[str], list[str]]:
+    first_budget: int, split_large: bool,
+) -> tuple[list[tuple[str, int, int]], list[str], list[str], bool]:
     """
-    Input: source paths, crypto, image costs, and full disc budget.
-    Output: oversized jobs, new paths, and changed paths.
+    Input: source paths, crypto, image costs, budgets, and split_large
+    Output: split jobs (path, size, chunk0 budget), new paths, changed
+            paths, and whether packing must place whole blobs first
     """
-    oversized_jobs: list[tuple[str, int]] = []
-    new_paths: list[str] = []
-    changed_paths: list[str] = []
-    for rel_path in [*sorted(new_files), *sorted(changed)]:
-        size = (source / rel_path).stat().st_size
-        if _on_disk_cost(
-            rel_path, _encoded_size_upper_bound(size, crypto), crypto,
-            image_costs,
-        ) >= full_budget:
-            oversized_jobs.append((rel_path, size))
-        elif rel_path in new_files:
-            new_paths.append(rel_path)
-        else:
-            changed_paths.append(rel_path)
-    return oversized_jobs, new_paths, changed_paths
+    must, records = _staging_path_records(
+        source, new_files, changed, crypto, image_costs, full_budget,
+    )
+    oversized_jobs = _must_split_jobs(must, first_budget, full_budget)
+    ordinary_first = False
+    if split_large and not must:
+        extra, records = _gap_fill_split_job(
+            records, first_budget, crypto, image_costs,
+        )
+        if extra is not None:
+            oversized_jobs.append(extra)
+            ordinary_first = True
+    new_paths = [rec[0] for rec in records if rec[3] == "new"]
+    changed_paths = [rec[0] for rec in records if rec[3] == "changed"]
+    return oversized_jobs, new_paths, changed_paths, ordinary_first
 
 
 def _stage_split_jobs(
-    oversized_jobs: list[tuple[str, int]], source: Path,
+    oversized_jobs: list[tuple[str, int, int]], source: Path,
     current_state: dict[str, str], checksum_index: dict[str, _DedupTarget],
     this_run_origins: dict[str, str], changed: dict[str, str],
     disc_origin: dict[str, int], disc_state: dict[str, str],
     crypto: CryptoBackend, scratch_dir: Path, session_n: int,
-    first_budget: int, full_budget: int,
+    full_budget: int,
     split_blobs: list[_PreparedBlob], dedup_refs: list[_PreparedBlob],
 ) -> None:
     """
     Input: oversized jobs, source state, budgets, and staging collections.
     Output: split blobs and dedup references appended in job order.
     """
-    split_first_budget = first_budget
     if oversized_jobs:
         print(
             f"Staging {len(oversized_jobs)} volume-split file(s)...",
             flush=True,
         )
-    for idx, (rel_path, _size) in enumerate(oversized_jobs, 1):
+    for idx, (rel_path, _size, chunk0_budget) in enumerate(oversized_jobs, 1):
         if _sigint_received:
             raise KeyboardInterrupt
         abs_path = source / rel_path
@@ -1791,7 +2811,7 @@ def _stage_split_jobs(
             _print_bar(idx, len(oversized_jobs), suffix=f"[dedup] {rel_path}")
             continue
         _require_disc_origin(rel_path, changed, disc_origin)
-        budget0 = split_first_budget if split_first_budget > 0 else full_budget
+        budget0 = chunk0_budget if chunk0_budget > 0 else full_budget
         file_chunks = _prepare_volume_split_blobs(
             rel_path, abs_path, crypto, scratch_dir, session_n,
             disc_state.get(rel_path, ""), budget0, full_budget,
@@ -1801,7 +2821,6 @@ def _stage_split_jobs(
             current_state,
         )
         split_blobs.extend(file_chunks)
-        split_first_budget = 0
         _print_bar(
             idx, len(oversized_jobs),
             suffix=f"[split/{len(file_chunks)}] {rel_path}",
@@ -1812,6 +2831,64 @@ def _stage_split_jobs(
         )
     if oversized_jobs:
         print()
+
+
+def _resumable_split_prefixes(
+    prefixes: "dict[str, SplitPrefix] | None", new_files: set[str],
+) -> dict[str, SplitPrefix]:
+    """
+    Input: prefixes from the loaded manifests and this run's new paths.
+    Output: prefixes whose interrupted file this run should tail-resume.
+    Details:
+        Only a path the diff calls new can resume. build_disc_state()
+        drops an incomplete split from state, so the same path never
+        appears as unchanged. The payload check in
+        _prepare_tail_split_blobs() still guards a changed source.
+    """
+    if not prefixes:
+        return {}
+    return {path: prefixes[path] for path in new_files if path in prefixes}
+
+
+def _stage_split_tail_jobs(
+    prefixes: dict[str, SplitPrefix], source: Path,
+    current_state: dict[str, str], crypto: CryptoBackend,
+    scratch_dir: Path, session_n: int, first_budget: int, full_budget: int,
+    split_blobs: list[_PreparedBlob],
+) -> None:
+    """
+    Input: resumable prefixes, source state, budgets, and split collection.
+    Output: the missing tail chunks appended in path order.
+    """
+    if not prefixes:
+        return
+    print(
+        f"Resuming {len(prefixes)} interrupted volume split(s)...",
+        flush=True,
+    )
+    total = len(prefixes)
+    for idx, (rel_path, prefix) in enumerate(sorted(prefixes.items()), 1):
+        if _sigint_received:
+            raise KeyboardInterrupt
+        blobs = _prepare_tail_split_blobs(
+            rel_path, source / rel_path, crypto, scratch_dir, session_n,
+            prefix, first_budget, full_budget,
+        )
+        _report_read_checksum(
+            rel_path, current_state[rel_path], blobs[0].result_checksum,
+            current_state,
+        )
+        split_blobs.extend(blobs)
+        _print_bar(
+            idx, total,
+            suffix=f"[resume/{len(blobs)}] {rel_path}",
+        )
+        _log.info(
+            "resumed %s: staged chunks %d..%d of %d",
+            rel_path, blobs[0].volume_chunk, blobs[-1].volume_chunk,
+            prefix.chunk_count,
+        )
+    print()
 
 
 def _stage_new_files(
@@ -1970,8 +3047,11 @@ def _collect_delta_jobs(
         )
         if is_bound_ciphertext(encrypted_old) and prior_entry is None:
             raise ValueError(f"Cannot resolve authenticated blob for {rel_path!r}.")
-        old_bytes = crypto.decrypt(
-            encrypted_old, aad=blob_aad(prior_entry) if is_bound_ciphertext(encrypted_old) else None,
+        old_bytes = decode_payload(
+            crypto.decrypt(
+                encrypted_old, aad=blob_aad(prior_entry) if is_bound_ciphertext(encrypted_old) else None,
+            ),
+            prior_entry.codec if prior_entry is not None else CODEC_NONE,
         )
         if hashlib.sha256(old_bytes).hexdigest() != disc_state[rel_path]:
             _log.warning(
@@ -2008,7 +3088,9 @@ def _encode_delta_jobs(
                 kind, blob = "full", new_bytes
             cache_full_path = None
             if kind == "delta":
-                cache_full_path = scratch_dir / (read_checksum + ".cache_full")
+                cache_full_path = scratch_dir / (
+                    _blob_id(session_n, rel_path) + ".cache_full"
+                )
                 cache_full_path.write_bytes(crypto.encrypt(new_bytes))
             staged_changed[rel_path] = _prepare_encoded_blob(
                 rel_path, kind, blob, scratch_dir, session_n,
@@ -2089,7 +3171,8 @@ def _repack_moved_blobs(
     prepared: list[_PreparedBlob], bins: list[list[_PreparedBlob]],
     source: Path, crypto: CryptoBackend, scratch_dir: Path, session_n: int,
     full_budget: int, first_budget: int, current_state: dict[str, str],
-    image_costs: bool,
+    image_costs: bool, ordinary_first: bool = False,
+    convert_first_bin: bool = False,
 ) -> tuple[list[_PreparedBlob], list[list[_PreparedBlob]]]:
     """
     Input: prepared blobs, packed bins, encoding context, and budgets.
@@ -2098,7 +3181,7 @@ def _repack_moved_blobs(
     while True:
         conversions: dict[int, list[_PreparedBlob]] = {}
         for bin_index, bin_blobs in enumerate(bins):
-            if bin_index == 0:
+            if bin_index == 0 and not convert_first_bin:
                 continue
             for item in bin_blobs:
                 if item.kind != "delta" and not item.dedup_blob_path:
@@ -2116,26 +3199,64 @@ def _repack_moved_blobs(
             for replacement in conversions.get(id(item), [item])
         ]
         _stamp_on_disc_overhead(prepared, crypto, image_costs)
-        bins = _pack_blobs(prepared, first_budget, full_budget)
+        bins = _pack_blobs(
+            prepared, first_budget, full_budget, ordinary_first=ordinary_first,
+        )
     return prepared, bins
+
+
+
+def _skip_empty_current_bin(
+    bins: list[list[_PreparedBlob]], session_n: int, fill_pending: bool,
+) -> tuple[list[list[_PreparedBlob]], bool]:
+    """
+    Input:  packed bins, first session number, and whether a fill disc
+            was chosen for bin 0
+    Output: bins to write, and whether the new first bin is a new volume
+    Details:
+        A bin 0 with no blobs means nothing fits the loaded medium.
+        Burning it would append an empty session to that disc, so the
+        caller skips the medium and burns the first real bin on the next
+        one. Session numbers start over at session_n, so the archive has
+        no session gap. A fill run keeps its explicit disc choice.
+    """
+    if (
+        fill_pending or session_n <= 0 or len(bins) < 2 or bins[0]
+    ):
+        return bins, False
+    skipped = len(bins) - 1
+    _log.info(
+        "Nothing fits the loaded disc; skipping its empty session and "
+        "burning %d session(s) from %03d on the next volume",
+        skipped, session_n,
+    )
+    print(
+        "Nothing fits the inserted disc; skipping its empty session.",
+        flush=True,
+    )
+    return bins[1:], True
 
 
 def _write_staging_volumes(
     bins: list[list[_PreparedBlob]], staging: Path, root: Path,
     session_n: int, deleted: list[str], source: Path, crypto: CryptoBackend,
-    created: list[Path],
+    created: list[Path], first_is_new_volume: bool = False,
 ) -> list[tuple[Path, int, bool]]:
     """
     Input: packed bins, staging roots, deletions, source, crypto, and
            the caller's created-path list.
     Output: (staging_path, session_n, is_new_volume) for each bin.
+    Details:
+        Bins map to sessions in order. A non-empty first bin that must
+        skip the loaded medium passes first_is_new_volume=True, so its
+        session burns on the next disc after the swap.
     """
     result: list[tuple[Path, int, bool]] = []
     written_blob_paths: dict[str, str] = {}
     written_blob_origins: dict[str, int | None] = {}
     for i, bin_blobs in enumerate(bins):
         chunk_session = session_n + i
-        is_new_volume = i > 0
+        is_new_volume = i > 0 or first_is_new_volume
         if i == 0:
             chunk_staging = staging
         else:
@@ -2187,7 +3308,7 @@ def _report_staged_changes(
     Input: first session, staged volumes, change sets, and remaining bytes.
     Output: space and staged-session summaries printed and logged.
     """
-    if len(result) == 1:
+    if len(result) == 1 and not result[0][2]:
         used = _staging_bytes(result[0][0])
         pct = 100.0 * used / remaining_bytes if remaining_bytes else 0
         print(f"  OK: session is {pct:.1f}% of remaining space.", flush=True)
@@ -2244,6 +3365,7 @@ def _pack_staged_blobs(
     prepared: list[_PreparedBlob], split_blobs: list[_PreparedBlob],
     dedup_refs: list[_PreparedBlob], crypto: CryptoBackend,
     image_costs: bool, first_budget: int, full_budget: int,
+    ordinary_first: bool = False,
 ) -> tuple[list[_PreparedBlob], list[list[_PreparedBlob]]]:
     """
     Input: staged blobs, split blobs, dedup references, costs, and budgets.
@@ -2262,8 +3384,48 @@ def _pack_staged_blobs(
     prepared.sort(key=lambda item: item.rel_path)
     prepared = split_blobs + prepared
     _stamp_on_disc_overhead(prepared, crypto, image_costs)
-    bins = _pack_blobs(prepared, first_budget, full_budget)
+    bins = _pack_blobs(
+        prepared, first_budget, full_budget, ordinary_first=ordinary_first,
+    )
     return prepared, bins
+
+
+def _apply_fill_choice_to_staging(
+    fill_targets: "list[FillTarget] | None",
+    fill_chosen: "list[int] | None",
+    inserted_volume_index: int | None,
+    prepared: list,
+    split_blobs: list,
+    dedup_refs: list,
+    session_n: int,
+    bundle_bytes: int,
+    source: Path,
+    crypto: "CryptoBackend",
+    scratch_dir: Path,
+    full_budget: int,
+    current_state: dict[str, str],
+    image_costs: object,
+    first_budget: int,
+    disc_info: object,
+) -> tuple[list, list, list, int, bool, object]:
+    """Input: staging blobs and fill choice. Output: updated blobs and disc info."""
+    prepared, split_blobs, dedup_refs, first_budget, convert_first = (
+        _apply_fill_target_choice(
+            fill_targets, fill_chosen, inserted_volume_index,
+            prepared, split_blobs, dedup_refs, session_n, bundle_bytes,
+            source, crypto, scratch_dir, full_budget, current_state,
+            image_costs, first_budget,
+        )
+    )
+    if fill_chosen and fill_targets:
+        chosen_index = fill_chosen[-1]
+        for target in fill_targets:
+            if target.volume_index == chosen_index:
+                disc_info = target.disc_info
+                break
+    return (
+        prepared, split_blobs, dedup_refs, first_budget, convert_first, disc_info,
+    )
 
 
 def build_staging(
@@ -2282,6 +3444,11 @@ def build_staging(
     volume_baseline: VolumeBaseline | None = None,
     volume_marker: VolumeMarker | None = None,
     volume_label: str = "",
+    split_large: bool = False,
+    fill_targets: list[FillTarget] | None = None,
+    fill_chosen: list[int] | None = None,
+    inserted_volume_index: int | None = None,
+    split_prefixes: "dict[str, SplitPrefix] | None" = None,
 ) -> list[tuple[Path, int, bool]]:
     """
     Input:  session_n      - first session number to build (e.g. 1 for first sync)
@@ -2305,6 +3472,16 @@ def build_staging(
             volume_baseline, volume_marker, volume_label - closing disc
                               identity used to reserve baseline space on
                               each new disc
+            split_large    - True splits a file that fits one medium so
+                              leftover space on the current disc is filled
+            fill_targets   - measured appendable volumes, oldest first
+            fill_chosen    - receives the volume_index selected for bin 0
+            inserted_volume_index - volume currently in the backend
+            split_prefixes - {path: SplitPrefix} from
+                              manifest.build_split_prefixes(). Each entry
+                              is a clean chunk prefix already burned, so
+                              the run stages only the missing tail. None
+                              restages every oversized file whole.
     Output: list of (staging_path, session_n, is_new_volume) tuples
     Details:
         Encodes each changed or new file before packing it. A path can
@@ -2342,12 +3519,26 @@ def build_staging(
         that fits returns exactly one tuple with is_new_volume=False. A
         split returns 2+ tuples. The first tuple has is_new_volume=False.
         Every later tuple has True, with contiguous session numbers.
-        Combined file content covers each changed/new file exactly
-        once. The code range-encrypts a file whose encoded size would
-        exceed full_budget into dedicated-bin volume chunks (volume_chunk /
-        volume_chunk_count on each ManifestEntry) instead of raising.
-        The code computes the disc budgets before any encrypt_file call,
-        so the code chunks an oversized file in one pass.
+        Combined file content covers each changed/new file exactly once.
+        A file splits only when its encoded payload exceeds
+        full_budget or BLOB_SIZE_CAP. With split_large, a file that
+        fits one medium can still split to fill leftover space on the
+        current disc. The code range-encrypts a split file into volume
+        chunks (volume_chunk / volume_chunk_count on each ManifestEntry)
+        instead of raising. The code computes the disc budgets before
+        any encrypt_file call, so the code chunks an oversized file in
+        one pass.
+        When split_prefixes names a file whose chunks 0..k already sit
+        on disc, the code rebuilds the payload, checks it against the
+        recorded result checksum, original size, and codec, and stages
+        only chunks k+1..n-1 from the summed offset of the burned
+        chunks. A changed source falls back to the whole-file restage.
+        An incomplete split is never reported as up to date.
+        When packing places nothing on the loaded medium, the code
+        drops that empty bin, renumbers the remaining sessions from
+        session_n, and marks the first one as a new volume. The burn
+        then swaps media before its first session instead of appending
+        an empty one.
         Uses a deterministic named staging dir so the next run can
         detect and remove a dir left by a crash. Before removing an existing
         dir, checks a PID lockfile via _check_staging_lock(): if the PID
@@ -2400,6 +3591,12 @@ def build_staging(
         checksum_index = _build_checksum_index(
             disc_state, disc_origin, manifests, volume_first_session,
         )
+
+        # A path whose newest entries are chunks 0..k of an interrupted
+        # volume split is absent from disc_state. Stage only the missing
+        # tail so the burned chunks are never re-encoded or abandoned.
+        resumable = _resumable_split_prefixes(split_prefixes, new_files)
+        staged_new = new_files - set(resumable)
 
         if _current_state is None:
             # Only reprint the summary when the caller has not already shown it.
@@ -2458,15 +3655,23 @@ def build_staging(
         # {read checksum: rel_path} for each complete full blob of a new file
         # in this run. Only the bytes that staging read give a key.
         this_run_origins: dict[str, str] = {}
-        oversized_jobs, new_paths, changed_paths = _classify_staging_paths(
-            source, new_files, changed, crypto, image_costs, full_budget,
+        oversized_jobs, new_paths, changed_paths, ordinary_first = (
+            _classify_staging_paths(
+                source, staged_new, changed, crypto, image_costs, full_budget,
+                first_budget, split_large,
+            )
+        )
+
+        _stage_split_tail_jobs(
+            resumable, source, current_state, crypto, scratch_dir, session_n,
+            first_budget, full_budget, split_blobs,
         )
 
         oversized_jobs.sort(key=lambda job: (-job[1], job[0]))
         _stage_split_jobs(
             oversized_jobs, source, current_state, checksum_index,
             this_run_origins, changed, disc_origin, disc_state, crypto,
-            scratch_dir, session_n, first_budget, full_budget, split_blobs,
+            scratch_dir, session_n, full_budget, split_blobs,
             dedup_refs,
         )
 
@@ -2505,17 +3710,35 @@ def build_staging(
             changed_paths, staged_changed, prepared, dedup_refs,
         )
 
+        (
+            prepared, split_blobs, dedup_refs, first_budget, convert_first,
+            disc_info,
+        ) = _apply_fill_choice_to_staging(
+            fill_targets, fill_chosen, inserted_volume_index,
+            prepared, split_blobs, dedup_refs, session_n, bundle_bytes,
+            source, crypto, scratch_dir, full_budget, current_state,
+            image_costs, first_budget, disc_info,
+        )
         prepared, bins = _pack_staged_blobs(
             prepared, split_blobs, dedup_refs, crypto, image_costs,
-            first_budget, full_budget,
+            first_budget, full_budget, ordinary_first=ordinary_first,
         )
         # A converted full blob can move other blobs to the next disc.
         # Pack again until each new disc holds its own blobs and delta bases.
         prepared, bins = _repack_moved_blobs(
             prepared, bins, source, crypto, scratch_dir, session_n,
             full_budget, first_budget, current_state, image_costs,
+            ordinary_first=ordinary_first,
+            convert_first_bin=convert_first,
         )
 
+
+        # A pack that places nothing on the loaded disc would append an
+        # empty session there. Skip that disc instead and burn the first
+        # real session on the next volume.
+        bins, first_is_new_volume = _skip_empty_current_bin(
+            bins, session_n, bool(fill_chosen),
+        )
 
         if len(bins) > 1:
             _log.info(
@@ -2526,10 +3749,11 @@ def build_staging(
 
         result = _write_staging_volumes(
             bins, staging, root, session_n, deleted, source, crypto, created,
+            first_is_new_volume=first_is_new_volume,
         )
 
         _report_staged_changes(
-            session_n, result, new_files, changed, deleted,
+            session_n, result, staged_new, changed, deleted,
             disc_info.remaining_bytes,
         )
         remove_tree(scratch_dir, "staging scratch")

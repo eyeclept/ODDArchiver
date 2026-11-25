@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import base64
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,6 +32,19 @@ logger = logging.getLogger(__name__)
 _log = logger
 
 _BLOB_SESSION_RE = re.compile(r"^session_(\d{3})/")
+FILL_STUB_BLOCKS = 8144
+FILL_STUB_BYTES = FILL_STUB_BLOCKS * 2048
+FILL_OUTCOME_STATUSES = frozenset({"landed", "failed", "not_confirmed"})
+
+
+
+def _known_fields(cls, data: dict) -> dict:
+    names = {item.name for item in dataclasses.fields(cls)}
+    extra = [key for key in data if key not in names]
+    if extra:
+        logger.debug("Ignoring unknown %s keys: %s", cls.__name__, extra)
+    return {key: value for key, value in data.items() if key in names}
+
 
 
 class BaselineReadError(ValueError):
@@ -47,6 +61,71 @@ def parse_blob_session(blob_path: str) -> int:
     if match is None:
         raise ValueError(f"Invalid manifest blob path {blob_path!r}.")
     return int(match.group(1))
+
+
+def compact_session_ranges(sessions: set[int]) -> list[list[int]]:
+    """
+    Input:  sessions - session numbers on one disc
+    Output: inclusive [first, last] pairs in order
+    """
+    if not sessions:
+        return []
+    ordered = sorted(sessions)
+    ranges: list[list[int]] = []
+    start = prev = ordered[0]
+    for number in ordered[1:]:
+        if number == prev + 1:
+            prev = number
+            continue
+        ranges.append([start, prev])
+        start = prev = number
+    ranges.append([start, prev])
+    return ranges
+
+
+def session_ranges_of(
+    first_session: int | None,
+    last_session: int | None,
+    session_ranges: list[list[int]] | None = None,
+) -> list[tuple[int, int]]:
+    """
+    Input:  first_session, last_session - bounds from an old record
+            session_ranges - explicit inclusive pairs, if present
+    Output: inclusive (first, last) pairs
+    Details:
+        A missing session_ranges field becomes one pair when both bounds
+        exist.
+    """
+    if session_ranges:
+        return [(pair[0], pair[1]) for pair in session_ranges]
+    if first_session is not None and last_session is not None:
+        return [(first_session, last_session)]
+    return []
+
+
+def _parse_session_range_pair(item: object) -> list[int]:
+    """Input: one JSON session_ranges entry. Output: [first, last]."""
+    if not isinstance(item, (list, tuple)) or len(item) != 2:
+        raise ValueError("session_ranges entries must be [first, last] pairs")
+    first, last = item
+    # scbc ignore[type-equality] Reject bool as a session bound
+    if type(first) is not int or type(last) is not int or first < 0 or last < first:
+        raise ValueError("session_ranges bounds must be ordered non-negative integers")
+    return [first, last]
+
+
+def parse_session_ranges(raw: object) -> list[list[int]] | None:
+    """
+    Input:  raw - JSON session_ranges value
+    Output: inclusive pairs, or None when the field is absent
+    """
+    # scbc boundary: Reject malformed disc or record fields before using them.
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("session_ranges must be a non-empty list of pairs")
+    return [_parse_session_range_pair(item) for item in raw]
+
 
 
 def _nonnegative(value: object, field: str, nullable: bool = False) -> int | None:
@@ -67,26 +146,60 @@ def _text(value: object, field: str) -> str:
     return value
 
 
+def _optional_bool(value: object, field: str) -> bool | None:
+    """Input: JSON value and field name. Output: bool or None."""
+    if value is None:
+        return None
+    # scbc ignore[type-equality] Require a JSON boolean
+    if type(value) is not bool:
+        raise ValueError(f"{field} must be a boolean")
+    return value
+
+
+def _optional_text(value: object, field: str) -> str | None:
+    """Input: JSON value and field name. Output: string or None."""
+    if value is None:
+        return None
+    return _text(value, field)
+
+
+def _optional_dict(value: object) -> dict | None:
+    """Input: JSON value. Output: object or None."""
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+
 def _record(raw: object) -> VolumeRecord:
     """Decode and check an earlier disc record."""
     # scbc boundary: Reject malformed disc or record fields before using them.
     if not isinstance(raw, dict):
         raise ValueError("volume record must be an object")
+    raw = _known_fields(VolumeRecord, raw)
     encrypted_raw = raw.get("encrypted")
     # scbc ignore[type-equality] Require a JSON boolean
     if encrypted_raw is not None and type(encrypted_raw) is not bool:
         raise ValueError("encrypted must be a boolean")
+    ranges = parse_session_ranges(raw["session_ranges"]) if "session_ranges" in raw else None
     record = VolumeRecord(
         _nonnegative(raw["volume_index"], "volume_index", True),
         _text(raw["label"], "label"),
         _nonnegative(raw["first_session"], "first_session", True),
         _nonnegative(raw["last_session"], "last_session", True),
         encrypted_raw,
+        ranges,
+        _nonnegative(raw.get("used_bytes"), "used_bytes", True),
+        _nonnegative(raw.get("remaining_bytes"), "remaining_bytes", True),
+        _optional_bool(raw.get("appendable"), "appendable"),
+        _optional_text(raw.get("measured_at"), "measured_at"),
+        _nonnegative(raw.get("file_count"), "file_count", True),
     )
     if (record.first_session is not None and record.last_session is not None
             and record.last_session < record.first_session):
         raise ValueError("last_session must not precede first_session")
     return record
+
 
 
 def _version(raw: object) -> PathVersion:
@@ -131,11 +244,18 @@ class VolumeMarker:
     # New markers are format 2. read_volume_marker maps an absent
     # field in an old volume.json to 1 for backward compatibility.
     format: int = 2
+    session_ranges: list[list[int]] | None = None
+    catalog_snapshot: dict | None = field(default=None, compare=False)
+    catalog_snapshot_enc: str | None = field(default=None, compare=False)
+    fill_intent: dict | None = field(default=None, compare=False)
+    fill_intent_enc: str | None = field(default=None, compare=False)
+    fill_outcome: dict | None = field(default=None, compare=False)
+    fill_outcome_enc: str | None = field(default=None, compare=False)
 
 
 @dataclass
 class VolumeRecord:
-    """Identify one earlier disc."""
+    """Identify one earlier disc and its last measured free space."""
 
     volume_index: int | None
     label: str
@@ -143,6 +263,12 @@ class VolumeRecord:
     last_session: int | None
     # Missing on old baselines. True or False after format 2 disc close.
     encrypted: bool | None = field(default=None, compare=False)
+    session_ranges: list[list[int]] | None = None
+    used_bytes: int | None = field(default=None, compare=False)
+    remaining_bytes: int | None = field(default=None, compare=False)
+    appendable: bool | None = field(default=None, compare=False)
+    measured_at: str | None = field(default=None, compare=False)
+    file_count: int | None = field(default=None, compare=False)
 
 @dataclass
 class PathVersion:
@@ -161,6 +287,16 @@ class PathVersion:
 
 
 @dataclass
+class ArchiveLayout:
+    """Record the archive layout after a fill or layout stub."""
+
+    highest_session: int
+    highest_session_volume: int
+    session_ranges: dict[str, list[list[int]]]
+    not_stubbed: list[int]
+
+
+@dataclass
 class VolumeBaseline:
     """Store earlier discs and the current live path state."""
 
@@ -169,6 +305,40 @@ class VolumeBaseline:
     history: dict[str, list[PathVersion]]
     state: dict[str, str]
     origin: dict[str, int]
+    layout: ArchiveLayout | None = None
+
+@dataclass
+class FillFile:
+    """One planned or landed fill path and its checksum."""
+
+    path: str
+    checksum: str
+
+
+@dataclass
+class FillIntent:
+    """Record a fill attempt on the newest disc before the target burn."""
+
+    target_volume_index: int
+    target_label: str
+    session: int
+    files: list[FillFile]
+    time: str
+    attempted: bool = True
+
+
+@dataclass
+class FillOutcome:
+    """Record whether a fill session landed, failed, or was not confirmed."""
+
+    target_volume_index: int
+    session: int
+    status: str
+    files: list[FillFile]
+    time: str
+    layout: ArchiveLayout | None = None
+
+
 
 
 # Functions
@@ -186,39 +356,48 @@ def write_volume_marker(staging: Path, marker: VolumeMarker) -> None:
     """
     dest = staging / "volume.json"
     tmp = staging / "volume.json.tmp"
-    payload = json.dumps(dataclasses.asdict(marker), indent=2).encode("utf-8")
+    data = dataclasses.asdict(marker)
+    if data.get("session_ranges") is None:
+        del data["session_ranges"]
+    for key in (
+        "catalog_snapshot", "catalog_snapshot_enc",
+        "fill_intent", "fill_intent_enc",
+        "fill_outcome", "fill_outcome_enc",
+    ):
+        if data.get(key) is None:
+            del data[key]
+    payload = json.dumps(data, indent=2).encode("utf-8")
     tmp.write_bytes(payload)
     os.replace(tmp, dest)
 
 
-def parse_volume_marker_bytes(data: bytes | None) -> VolumeMarker | None:
-    """
-    Input:  data - volume.json bytes, or None when the file is absent
-    Output: VolumeMarker, or None when the bytes are missing or unusable
-    Details:
-        Shared by read_volume_marker and the control-file batch parser.
-        An absent format field maps to 1. Out-of-range indices raise.
-    """
-    # scbc boundary: Reject malformed disc or record fields before using them.
-    if data is None:
-        return None
+def _parse_marker_object(raw: dict) -> VolumeMarker | None:
+    """Input: decoded volume.json object. Output: VolumeMarker or None."""
     try:
-        raw = json.loads(data.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        _log.warning("Ignoring unreadable volume.json: %s", exc)
-        return None
-    if not isinstance(raw, dict):
-        _log.warning("Ignoring unreadable volume.json: not an object")
-        return None
-    try:
+        raw = _known_fields(VolumeMarker, raw)
         marker = VolumeMarker(
             archive_id=_text(raw["archive_id"], "archive_id"),
             volume_index=_nonnegative(raw["volume_index"], "volume_index"),
             first_session=_nonnegative(raw["first_session"], "first_session"),
             created_at=_text(raw["created_at"], "created_at"),
-            previous_volume_label=_text(raw["previous_volume_label"], "previous_volume_label"),
+            previous_volume_label=_text(
+                raw["previous_volume_label"], "previous_volume_label",
+            ),
             # scbc ignore[dict-get-default-inside-keyerror-try] Missing format means legacy format 1
             format=raw.get("format", 1),
+            session_ranges=parse_session_ranges(raw.get("session_ranges")),
+            catalog_snapshot=_optional_dict(raw.get("catalog_snapshot")),
+            catalog_snapshot_enc=_optional_text(
+                raw.get("catalog_snapshot_enc"), "catalog_snapshot_enc",
+            ),
+            fill_intent=_optional_dict(raw.get("fill_intent")),
+            fill_intent_enc=_optional_text(
+                raw.get("fill_intent_enc"), "fill_intent_enc",
+            ),
+            fill_outcome=_optional_dict(raw.get("fill_outcome")),
+            fill_outcome_enc=_optional_text(
+                raw.get("fill_outcome_enc"), "fill_outcome_enc",
+            ),
         )
         # scbc ignore[type-equality] Reject bool as a marker format
         if type(marker.format) is not int or marker.format not in (1, 2):
@@ -234,6 +413,31 @@ def parse_volume_marker_bytes(data: bytes | None) -> VolumeMarker | None:
     except OverflowError as exc:
         _log.warning("Invalid volume.json: %s", exc)
         raise ValueError(f"Invalid volume.json: {exc}") from exc
+
+
+def parse_volume_marker_bytes(data: bytes | None) -> VolumeMarker | None:
+    """
+    Input:  data - volume.json bytes, or None when the file is absent
+    Output: VolumeMarker, or None when the bytes are missing or unusable
+    Details:
+        Shared by read_volume_marker and the control-file batch parser.
+        An absent format field maps to 1. Out-of-range indices raise.
+    """
+    # scbc boundary: Reject malformed disc or record fields before using them.
+    if data is None:
+        return None
+    if not isinstance(data, (bytes, bytearray)):
+        _log.warning("Ignoring unreadable volume.json: not bytes")
+        return None
+    try:
+        raw = json.loads(bytes(data).decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        _log.warning("Ignoring unreadable volume.json: %s", exc)
+        return None
+    if not isinstance(raw, dict):
+        _log.warning("Ignoring unreadable volume.json: not an object")
+        return None
+    return _parse_marker_object(raw)
 
 
 def read_volume_marker(backend: "BurnBackend") -> VolumeMarker | None:
@@ -374,6 +578,54 @@ def build_volume_baseline(
     )
 
 
+def _drop_null_volume_fields(vol: dict) -> None:
+    """Input: volume record dict. Output: None. Details: Drop unused optional keys."""
+    for key in (
+        "session_ranges", "used_bytes", "remaining_bytes",
+        "appendable", "measured_at", "file_count",
+    ):
+        if vol.get(key) is None:
+            vol.pop(key, None)
+
+
+def _baseline_json_bytes(
+    baseline: VolumeBaseline, crypto: "CryptoBackend | None",
+    marker: VolumeMarker | None,
+) -> tuple[bytes, bool]:
+    """Input: baseline, crypto, marker. Output: payload bytes and encrypted flag."""
+    from oddarchiver.crypto import NullCrypto
+
+    encrypted = crypto is not None and not isinstance(crypto, NullCrypto)
+    data = dataclasses.asdict(baseline)
+    for vol in data["volumes"]:
+        if vol.get("encrypted") is None:
+            vol["encrypted"] = encrypted
+        _drop_null_volume_fields(vol)
+    if data.get("layout") is None:
+        data.pop("layout", None)
+    if marker is not None:
+        data["archive_id"] = marker.archive_id
+        data["volume_index"] = marker.volume_index
+    payload = json.dumps(data, indent=2).encode("utf-8")
+    if encrypted:
+        from oddarchiver.crypto import baseline_aad
+        payload = crypto.encrypt(
+            payload,
+            aad=baseline_aad(marker.archive_id, marker.volume_index) if marker else None,
+        )
+    return payload, encrypted
+
+
+def _write_named_baseline(
+    staging: Path, name: str, other: str, payload: bytes,
+) -> None:
+    """Input: staging root, filenames, payload. Output: None."""
+    tmp = staging / f"{name}.tmp"
+    tmp.write_bytes(payload)
+    os.replace(tmp, staging / name)
+    (staging / other).unlink(missing_ok=True)
+
+
 def write_volume_baseline(
     staging: Path, baseline: VolumeBaseline, crypto: "CryptoBackend | None",
     marker: VolumeMarker | None = None,
@@ -388,29 +640,289 @@ def write_volume_baseline(
         one format atomically and removes the other format. A missing
         encrypted field on a volume record is filled from this crypto.
     """
-    from oddarchiver.crypto import NullCrypto
-
-    encrypted = crypto is not None and not isinstance(crypto, NullCrypto)
+    payload, encrypted = _baseline_json_bytes(baseline, crypto, marker)
     name = "volume_baseline.enc" if encrypted else "volume_baseline.json"
     other = "volume_baseline.json" if encrypted else "volume_baseline.enc"
-    data = dataclasses.asdict(baseline)
-    for vol in data["volumes"]:
-        if vol.get("encrypted") is None:
-            vol["encrypted"] = encrypted
-    if marker is not None:
-        data["archive_id"] = marker.archive_id
-        data["volume_index"] = marker.volume_index
-    payload = json.dumps(data, indent=2).encode("utf-8")
+    _write_named_baseline(staging, name, other, payload)
+
+
+def _marker_with_snapshot(
+    marker: VolumeMarker, snapshot: VolumeBaseline, crypto: "CryptoBackend | None",
+) -> VolumeMarker:
+    """Input: marker and catalog snapshot. Output: marker with snapshot fields set."""
+    payload, encrypted = _baseline_json_bytes(snapshot, crypto, marker)
     if encrypted:
-        from oddarchiver.crypto import baseline_aad
-        payload = crypto.encrypt(
-            payload,
-            aad=baseline_aad(marker.archive_id, marker.volume_index) if marker else None,
+        return dataclasses.replace(
+            marker,
+            catalog_snapshot=None,
+            catalog_snapshot_enc=base64.b64encode(payload).decode("ascii"),
         )
-    tmp = staging / f"{name}.tmp"
-    tmp.write_bytes(payload)
-    os.replace(tmp, staging / name)
-    (staging / other).unlink(missing_ok=True)
+    return dataclasses.replace(
+        marker,
+        catalog_snapshot=json.loads(payload.decode("utf-8")),
+        catalog_snapshot_enc=None,
+    )
+
+
+def write_layout_stub(
+    staging: Path, baseline: VolumeBaseline, crypto: "CryptoBackend | None",
+    marker: VolumeMarker | None = None,
+) -> None:
+    """
+    Input:  staging, baseline, crypto, marker
+    Output: None
+    Details:
+        Stores the catalog snapshot in volume.json. That path is already
+        a permitted disc read. It does not replace volume_baseline on a
+        later volume, so the first-session checksum still matches.
+    """
+    if marker is None:
+        raise ValueError("A layout stub needs volume.json identity.")
+    write_volume_marker(staging, _marker_with_snapshot(marker, baseline, crypto))
+
+
+
+def _parse_fill_file(item: object) -> FillFile:
+    """Input: one files list entry. Output: FillFile."""
+    if not isinstance(item, dict):
+        raise ValueError("files entry must be an object")
+    return FillFile(
+        path=_text(item["path"], "path"),
+        checksum=_text(item["checksum"], "checksum"),
+    )
+
+
+def _parse_fill_files(raw: object) -> list[FillFile]:
+    """Input: files list from a fill stub. Output: FillFile list."""
+    # scbc boundary: Reject malformed disc fill file lists before use.
+    if not isinstance(raw, list):
+        raise ValueError("files must be a list")
+    return [_parse_fill_file(item) for item in raw]
+
+
+def fill_files_payload(files: list[FillFile]) -> list[dict[str, str]]:
+    """Input: FillFile list. Output: JSON objects with path and checksum."""
+    return [{"path": item.path, "checksum": item.checksum} for item in files]
+
+
+def _b64_payload(encoded: str, name: str) -> bytes:
+    """Input: base64 blob and field name. Output: decoded bytes."""
+    try:
+        return base64.b64decode(encoded)
+    except (ValueError, TypeError) as exc:
+        _log.warning("Cannot decode %s: %s", name, exc)
+        raise BaselineReadError(f"Cannot decode {name}.") from exc
+
+
+def _decode_fill_blob(
+    plain: dict | None, encoded: str | None, crypto: "CryptoBackend | None",
+    marker: VolumeMarker, name: str,
+) -> dict | None:
+    """Input: plaintext or encoded fill blob. Output: decoded object or None."""
+    if encoded:
+        data, _bound = _decrypt_baseline(
+            _b64_payload(encoded, name), name, crypto, marker,
+        )
+        try:
+            raw = json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            _log.warning("Cannot parse %s: %s", name, exc)
+            raise BaselineReadError(f"Cannot parse {name}.") from exc
+        if not isinstance(raw, dict):
+            raise BaselineReadError(f"{name} must be an object.")
+        return raw
+    if plain is None:
+        return None
+    if not isinstance(plain, dict):
+        raise ValueError(f"{name} must be an object")
+    return plain
+
+
+
+def parse_fill_intent(raw: dict) -> FillIntent:
+    """Input: decoded fill_intent object. Output: FillIntent."""
+    # scbc boundary: Reject malformed fill intent fields before use.
+    attempted = raw.get("attempted", True)
+    if type(attempted) is not bool:  # scbc ignore[type-equality] JSON bool only
+        raise ValueError("attempted must be a bool")
+
+    return FillIntent(
+        target_volume_index=_nonnegative(
+            raw["target_volume_index"], "target_volume_index",
+        ),
+        target_label=_text(raw["target_label"], "target_label"),
+        session=_nonnegative(raw["session"], "session"),
+        files=_parse_fill_files(raw["files"]),
+        time=_text(raw["time"], "time"),
+        attempted=attempted,
+    )
+
+
+def parse_fill_outcome(raw: dict) -> FillOutcome:
+    """Input: decoded fill_outcome object. Output: FillOutcome."""
+    # scbc boundary: Reject malformed fill outcome fields before use.
+    status = _text(raw["status"], "status")
+    if status not in FILL_OUTCOME_STATUSES:
+        raise ValueError("invalid fill outcome status")
+    layout = _parse_layout(raw.get("layout"))
+    return FillOutcome(
+        target_volume_index=_nonnegative(
+            raw["target_volume_index"], "target_volume_index",
+        ),
+        session=_nonnegative(raw["session"], "session"),
+        status=status,
+        files=_parse_fill_files(raw["files"]),
+        time=_text(raw["time"], "time"),
+        layout=layout,
+    )
+
+
+def fill_intent_payload(intent: FillIntent) -> dict:
+    """Input: FillIntent. Output: JSON object stored on volume.json."""
+    return {
+        "kind": "fill_intent",
+        "attempted": intent.attempted,
+        "target_volume_index": intent.target_volume_index,
+        "target_label": intent.target_label,
+        "session": intent.session,
+        "files": fill_files_payload(intent.files),
+        "time": intent.time,
+    }
+
+
+def fill_outcome_payload(outcome: FillOutcome) -> dict:
+    """Input: FillOutcome. Output: JSON object stored on volume.json."""
+    data: dict = {
+        "kind": "fill_outcome",
+        "target_volume_index": outcome.target_volume_index,
+        "session": outcome.session,
+        "status": outcome.status,
+        "files": fill_files_payload(outcome.files),
+        "time": outcome.time,
+    }
+    if outcome.layout is not None:
+        data["layout"] = dataclasses.asdict(outcome.layout)
+    return data
+
+
+def _marker_with_fill_blob(
+    marker: VolumeMarker, crypto: "CryptoBackend | None", payload: dict,
+    plain_field: str, enc_field: str,
+) -> VolumeMarker:
+    """Input: marker and fill payload. Output: marker with that blob set."""
+    from oddarchiver.crypto import NullCrypto, baseline_aad
+
+    data = json.dumps(payload, indent=2).encode("utf-8")
+    encrypted = crypto is not None and not isinstance(crypto, NullCrypto)
+    if not encrypted:
+        return dataclasses.replace(
+            marker, **{plain_field: payload, enc_field: None},
+        )
+    blob = crypto.encrypt(
+        data, aad=baseline_aad(marker.archive_id, marker.volume_index),
+    )
+    return dataclasses.replace(
+        marker,
+        **{
+            plain_field: None,
+            enc_field: base64.b64encode(blob).decode("ascii"),
+        },
+    )
+
+
+def write_fill_stub(
+    staging: Path,
+    marker: VolumeMarker,
+    crypto: "CryptoBackend | None",
+    *,
+    intent: FillIntent | None = None,
+    outcome: FillOutcome | None = None,
+    snapshot: VolumeBaseline | None = None,
+) -> None:
+    """
+    Input: staging, marker, crypto, optional intent, outcome, snapshot
+    Output: None
+    Details: Writes volume.json. Intent and outcome live next to identity.
+    """
+    updated = marker
+    if snapshot is not None:
+        updated = _marker_with_snapshot(updated, snapshot, crypto)
+    if intent is not None:
+        updated = _marker_with_fill_blob(
+            updated, crypto, fill_intent_payload(intent),
+            "fill_intent", "fill_intent_enc",
+        )
+    if outcome is not None:
+        updated = _marker_with_fill_blob(
+            updated, crypto, fill_outcome_payload(outcome),
+            "fill_outcome", "fill_outcome_enc",
+        )
+    write_volume_marker(staging, updated)
+
+
+def _read_fill_record(
+    backend: "BurnBackend", crypto: "CryptoBackend | None",
+    marker: VolumeMarker | None, plain_field: str, enc_field: str, name: str,
+    parser,
+) -> FillIntent | FillOutcome | None:
+    """Input: disc context and fill blob names. Output: parsed fill record or None."""
+    # scbc boundary: Reject malformed fill records from disc before use.
+    if marker is None:
+        marker = read_volume_marker(backend)
+    if marker is None:
+        return None
+    try:
+        raw = _decode_fill_blob(
+            getattr(marker, plain_field, None),
+            getattr(marker, enc_field, None), crypto, marker, name,
+        )
+        if raw is None:
+            return None
+        return parser(raw)
+    except (ValueError, TypeError, KeyError, BaselineReadError) as exc:
+        _log.warning("Cannot read %s: %s", name, exc)
+        return None
+
+
+def read_fill_intent(
+    backend: "BurnBackend", crypto: "CryptoBackend | None",
+    marker: VolumeMarker | None = None,
+) -> FillIntent | None:
+    """Input: backend, crypto, marker. Output: unmatched-ready FillIntent or None."""
+    # scbc boundary: Reject malformed fill intent from disc before use.
+    return _read_fill_record(
+        backend, crypto, marker, "fill_intent", "fill_intent_enc",
+        "fill_intent", parse_fill_intent,
+    )
+
+
+def read_fill_outcome(
+    backend: "BurnBackend", crypto: "CryptoBackend | None",
+    marker: VolumeMarker | None = None,
+) -> FillOutcome | None:
+    """Input: backend, crypto, marker. Output: FillOutcome or None."""
+    # scbc boundary: Reject malformed fill outcome from disc before use.
+    return _read_fill_record(
+        backend, crypto, marker, "fill_outcome", "fill_outcome_enc",
+        "fill_outcome", parse_fill_outcome,
+    )
+
+
+def unmatched_fill_intent(
+    backend: "BurnBackend", crypto: "CryptoBackend | None",
+    marker: VolumeMarker | None = None,
+) -> FillIntent | None:
+    """Input: disc context. Output: intent with no matching outcome, or None."""
+    intent = read_fill_intent(backend, crypto, marker)
+    if intent is None:
+        return None
+    outcome = read_fill_outcome(backend, crypto, marker)
+    if outcome is not None and outcome.session == intent.session:
+        return None
+    return intent
+
+
+
 
 def _check_plaintext_baseline(
     backend: BurnBackend, crypto: CryptoBackend | None, found: dict[str, bytes],
@@ -575,6 +1087,104 @@ def _baseline_header_version(
     return version
 
 
+def _layout_session_ranges(raw: object) -> dict[str, list[list[int]]]:
+    """Input: layout session_ranges object. Output: volume to range pairs."""
+    if not isinstance(raw, dict):
+        raise ValueError("session_ranges must be an object")
+    session_ranges: dict[str, list[list[int]]] = {}
+    for key, value in raw.items():
+        parsed = parse_session_ranges(value)
+        if parsed is None:
+            raise ValueError("invalid layout session_ranges")
+        session_ranges[_text(str(key), "layout volume")] = parsed
+    return session_ranges
+
+
+def _not_stubbed_volumes(raw: object) -> list[int]:
+    """Input: not_stubbed list. Output: volume indexes."""
+    if not isinstance(raw, list):
+        raise ValueError("not_stubbed must be a list")
+    return [_nonnegative(item, "not_stubbed volume") for item in raw]
+
+
+def _parse_layout(raw: object) -> ArchiveLayout | None:
+    """Input: layout object or None. Output: ArchiveLayout or None."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("layout must be an object")
+    session_ranges = _layout_session_ranges(raw["session_ranges"])
+    stubbed = _not_stubbed_volumes(raw["not_stubbed"])
+    return ArchiveLayout(
+        highest_session=_nonnegative(raw["highest_session"], "highest_session"),
+        highest_session_volume=_nonnegative(
+            raw["highest_session_volume"], "highest_session_volume",
+        ),
+        session_ranges=session_ranges,
+        not_stubbed=stubbed,
+    )
+
+
+
+def layout_covered_sessions(layout: ArchiveLayout | None) -> set[int]:
+    """Input: layout or None. Output: sessions named by the layout ranges."""
+    found: set[int] = set()
+    if layout is None:
+        return found
+    for ranges in layout.session_ranges.values():
+        for first, last in ranges:
+            found.update(range(first, last + 1))
+    found.add(layout.highest_session)
+    return found
+
+
+def baseline_covered_sessions(baseline: VolumeBaseline | None) -> set[int]:
+    """Input: volume baseline or None. Output: sessions in origin, history, layout."""
+    if baseline is None:
+        return set()
+    found: set[int] = set()
+    origin = baseline.origin or {}
+    found.update(origin.values())
+    history = baseline.history or {}
+    for versions in history.values():
+        for version in versions:
+            found.add(version.session)
+    found |= layout_covered_sessions(baseline.layout)
+    return found
+
+
+def build_catalog_snapshot(
+    prior: VolumeBaseline | None,
+    manifests_by_volume: dict[int, list[Manifest]],
+    volume_records: list[VolumeRecord],
+    layout: ArchiveLayout,
+) -> VolumeBaseline:
+    """
+    Input: prior baseline, manifests grouped by volume, volume records, layout
+    Output: catalog snapshot with full change-set state
+    """
+    _volumes, history = _seed_baseline_history(prior)
+    state = dict(prior.state) if prior else {}
+    origin = dict(prior.origin) if prior else {}
+    for index in sorted(manifests_by_volume):
+        usable = [m for m in manifests_by_volume[index] if not m.suspect]
+        _append_manifest_history(
+            history,
+            usable,
+            VolumeMarker(
+                archive_id="", volume_index=index, first_session=0,
+                created_at="", previous_volume_label="",
+            ),
+        )
+        state = build_disc_state(usable, seed=state)
+        origin = build_disc_origin(usable, seed=origin)
+    return VolumeBaseline(
+        version=2, volumes=list(volume_records), history=history,
+        state=state, origin=origin, layout=layout,
+    )
+
+
+
 def _decode_baseline_payload(
     data: bytes, name: str, marker: VolumeMarker | None, encrypted: bool, bound: bool,
 ) -> VolumeBaseline:
@@ -598,7 +1208,8 @@ def _decode_baseline_payload(
         origin = {_text(k, "origin path"): _nonnegative(v, "origin session")
                   for k, v in raw_origin.items()}
         volumes, history = _decode_baseline_history(raw, version)
-        return VolumeBaseline(version, volumes, history, state, origin)
+        layout = _parse_layout(raw.get("layout")) if version == 2 else None
+        return VolumeBaseline(version, volumes, history, state, origin, layout)
     except (ValueError, TypeError, KeyError, UnicodeDecodeError, AttributeError) as exc:
         _log.warning("Cannot read %s: %s", name, exc)
         raise BaselineReadError(
@@ -647,6 +1258,36 @@ def read_volume_baseline(
     if name.endswith(".enc"):
         data, bound = _decrypt_baseline(data, name, crypto, marker)
     return _decode_baseline_payload(data, name, marker, encrypted, bound)
+
+
+def read_layout_stub(
+    backend: "BurnBackend", crypto: "CryptoBackend | None",
+    marker: VolumeMarker | None = None,
+) -> VolumeBaseline | None:
+    """
+    Input:  backend, crypto, marker
+    Output: catalog snapshot from volume.json, or None when absent
+    """
+    # scbc boundary: Reject malformed disc or record fields before using them.
+    from oddarchiver.crypto import NullCrypto
+
+    if marker is None:
+        marker = read_volume_marker(backend)
+    if marker is None:
+        return None
+    encrypted = crypto is not None and not isinstance(crypto, NullCrypto)
+    if marker.catalog_snapshot_enc:
+        data, bound = _decrypt_baseline(
+            _b64_payload(marker.catalog_snapshot_enc, "catalog_snapshot_enc"),
+            "volume.json", crypto, marker,
+        )
+        return _decode_baseline_payload(data, "volume.json", marker, encrypted, bound)
+
+    if marker.catalog_snapshot is None:
+        return None
+    data = json.dumps(marker.catalog_snapshot).encode("utf-8")
+    return _decode_baseline_payload(data, "volume.json", marker, False, False)
+
 
 
 if __name__ == "__main__":

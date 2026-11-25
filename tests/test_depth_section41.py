@@ -22,6 +22,7 @@ import pytest
 from oddarchiver.cache import CacheManager
 from oddarchiver.catalog import build_archive_catalog, remember_encryption_mode
 from oddarchiver.cli import _run_restore, dispatch
+from tests.helpers import fill
 from oddarchiver.crypto import KeyfileCrypto, NullCrypto, generate_keyfile
 from oddarchiver.delta import compute_delta
 from oddarchiver.disc import ISOBackend
@@ -102,6 +103,8 @@ def _make_args(**kwargs) -> argparse.Namespace:
         "slow": False,
         "read_mode": "sequential",
         "all_files": False,
+        "yubikey": False,
+        "yubikey_slot": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -472,7 +475,8 @@ def test_browse_all_disks_restores_disc0_only_path(tmp_path, monkeypatch):
     Details:
         browse --all-disks on the latest disc of a real 3-disc init
         archive. Select the path that lives only on disc 0. Restored
-        bytes match the source. Blob reads hit disc 0 only.
+        bytes match the source. Blob reads hit disc 0 only. Manifest
+        checks still open the other known volumes.
     """
     _source_dir, isos, _key, files = _three_volume_cli_archive(tmp_path, monkeypatch)
     crypto = None
@@ -498,7 +502,7 @@ def test_browse_all_disks_restores_disc0_only_path(tmp_path, monkeypatch):
     assert blob_names == ["archive.iso"]
     assert "archive.iso" in loaded
     assert "archive.vol2.iso" in loaded
-    assert "archive.vol1.iso" not in loaded
+    assert "archive.vol1.iso" in loaded
 
 
 def _build_scripted_prompt(drive: SwappableDrive, script: list[tuple[str, Path | None]]):
@@ -568,7 +572,7 @@ def test_disc_acquisition_prompt_rejects_fallback_and_restores(tmp_path, capsys)
     ]
     _assert_acquisition_state(dest)
     assert "at most six digits" in err
-    assert "another archive or is not needed" in err
+    assert "another archive" in err
     assert "Traceback" not in err
 
 
@@ -721,8 +725,8 @@ def test_old_format_delta_chain_reverse_restore(tmp_path):
         then acquire 1 then 0. Final bytes match v2. The spool holds
         ciphertext and is removed at the end.
     """
-    crypto = KeyfileCrypto.from_kek(b"K" * 32)
-    original = b"V0-PLAINTEXT-MARKER-" + b"A" * 4000
+    crypto = KeyfileCrypto.from_kek(fill(b"K", 32))
+    original = b"V0-PLAINTEXT-MARKER-" + fill(b"A", 4000)
     updated = original[:-8] + b"V1-TAIL!"
     latest = updated[:-8] + b"V2-TAIL!"
     iso0, state0, origin0 = _stage(tmp_path, 0, {"changed.txt": original}, crypto)
@@ -765,8 +769,8 @@ def test_format1_learn_replan_through_swappable_drive(tmp_path):
         version 1. The drive serves disc 1 then disc 0. The plan learns
         the full base on disc 0 and restores the newer delta on disc 1.
     """
-    crypto = KeyfileCrypto.from_kek(b"K" * 32)
-    original = b"format-one-base" + b"A" * 1000
+    crypto = KeyfileCrypto.from_kek(fill(b"K", 32))
+    original = b"format-one-base" + fill(b"A", 1000)
     latest = original[:-8] + b"V1-TAIL!"
     iso0, state, origin = _stage(tmp_path, 0, {"changed.txt": original}, crypto)
     iso1, _state, _origin = _stage(
